@@ -1,6 +1,10 @@
-# Merch POD Production
+# MerchFlow — Durable AI Commerce Workflows
 
-An automated, single-business print-on-demand production system. Each daily workflow researches exactly ten concepts, ranks them, creates one print-ready product package, validates it, then publishes enabled channels independently through Printify. Manual release approval, IP screening and attestation, and the Etsy production-partner confirmation check can each be enabled when needed.
+MerchFlow turns product research into print-ready artwork and verified Etsy listings through durable Temporal workflows. Built with Python, FastAPI, and PostgreSQL, it combines structured AI generation, deterministic and visual QA, marketplace integrations, and immutable artifact storage in an automated print-on-demand production system.
+
+The engineering focus is recovery and correctness across external APIs: checkpoints preserve completed model calls, bounded revisions recover from artwork defects, uncertain publication requests require reconciliation before replay, and pixel comparisons verify the photos actually served by Etsy. Audit artifacts, Prometheus metrics, and optional OpenTelemetry tracing make the workflow inspectable.
+
+Each daily workflow researches ten concepts, ranks them, creates and validates one product package, then publishes enabled channels independently through Printify. Manual release approval, IP screening and attestation, and the Etsy production-partner confirmation check can each be enabled when needed.
 
 The safe default uses fake model/provider responses and `MERCH_PUBLISH_MODE=dry_run`. Scheduled and manual runs can complete automatically in dry-run mode. Live marketplace mutation requires an explicit `MERCH_PUBLISH_MODE=live` setting; QA, catalog, price, variant, and storefront verification still gate publication.
 
