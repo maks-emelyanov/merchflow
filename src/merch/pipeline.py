@@ -4,9 +4,11 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
+from uuid import uuid4
 
 import httpx
 from pydantic import SecretStr
@@ -16,6 +18,14 @@ from merch.config import Settings, get_settings
 from merch.copy_refresh import effective_approved_listing
 from merch.database import session_scope
 from merch.defaults import fixture_product_template
+from merch.domain.artwork_recovery import (
+    ArtworkFailure,
+    RecoveryStrategy,
+    build_recovery_context,
+    normalize_issue_family,
+    structural_rewrite_is_material,
+    unsupported_brief_requirement_codes,
+)
 from merch.domain.featured_color import (
     color_candidates,
     render_color_preview,
@@ -32,7 +42,14 @@ from merch.domain.product_options import (
     full_color_publication_template,
     publication_template,
 )
-from merch.models import ArtifactRecord, OrderRecord, ProductTemplateRecord, PublishRecord
+from merch.models import (
+    ArtifactRecord,
+    AuditEvent,
+    OrderRecord,
+    ProductTemplateRecord,
+    PublishRecord,
+    RunRecord,
+)
 from merch.repository import ConfigurationRepository, MetricsRepository, RunRepository
 from merch.schemas import (
     ApprovalSignal,
@@ -63,6 +80,12 @@ from merch.services.analytics import (
 from merch.services.credentials import CredentialCipher, CredentialStore
 from merch.services.etsy_auth import etsy_access_token
 from merch.services.etsy_publisher import publish_direct_etsy
+from merch.services.mockup_selection import mockup_plan
+from merch.services.mockup_verification import (
+    PreparedMockup,
+    prepare_mockups,
+    verify_etsy_mockups,
+)
 from merch.services.openai_service import ModelResult, OpenAIService
 from merch.services.printify import (
     AmbiguousCreateError,
@@ -75,7 +98,6 @@ from merch.services.storefront import (
     EtsyStorefrontClient,
     StorefrontVerificationError,
     build_etsy_selector_inventory,
-    download_mockup,
     plan_etsy_variation_images,
     printify_listing_id,
     remap_etsy_variation_images,
@@ -84,7 +106,6 @@ from merch.services.storefront import (
     verify_etsy_listing,
     verify_etsy_selector_labels,
     verify_etsy_variation_images,
-    verify_featured_image,
     verify_printify_product,
 )
 
@@ -740,7 +761,11 @@ async def generate_package_run(
                         for issue in adjusted_visual.issues
                         if issue.severity == "error"
                     }
-                    repeated_visual_defects = previous_codes & current_codes
+                    previous_families = {normalize_issue_family(code) for code in previous_codes}
+                    repeated_visual_defects = {
+                        code for code in current_codes
+                        if normalize_issue_family(code) in previous_families
+                    }
             object_key, digest = storage.put(
                 prepared.data, suffix=f"{run_id}-production-v{version}-r{revision}.png"
             )
@@ -786,6 +811,8 @@ async def generate_package_run(
             break
         if _effect_failures(final_qa):
             break
+        if unsupported_brief_requirement_codes(final_qa.issues):
+            break
         if color_shortfall:
             break
         elif repeated_visual_defects:
@@ -803,6 +830,13 @@ async def generate_package_run(
                 RunStatus.AWAITING_BRIEF_REVISION,
                 "Artwork effects failed QA (" + ", ".join(sorted(effect_failures))
                 + "); simplify typography or distress in the creative brief",
+            )
+        elif contract_failures := unsupported_brief_requirement_codes(final_qa.issues):
+            set_status(
+                run_id,
+                RunStatus.AWAITING_BRIEF_REVISION,
+                "Unsupported creative brief requirements (" + ", ".join(sorted(contract_failures))
+                + "); rewrite the brief for the raster artwork and configured catalog",
             )
         elif color_shortfall:
             set_status(
@@ -929,98 +963,183 @@ async def generate_package_run(
 
 
 async def rewrite_failed_brief_run(run_id: str, settings: Settings | None = None) -> str:
-    """Advance a failed artwork run to the next brief version, or return its terminal status."""
+    """Rewrite within a durable budget; rejected proposals never buy new artwork."""
     settings = settings or get_settings()
-    with session_scope() as session:
-        repo = RunRepository(session)
-        run = repo.get(run_id, full=True)
-        if run.status == RunStatus.PENDING.value and run.error == "Automatic brief rewrite ready":
-            return RunStatus.PENDING.value
-        if run.status not in {RunStatus.FAILED.value, RunStatus.AWAITING_BRIEF_REVISION.value}:
-            return run.status
-        if run.version > settings.max_brief_rewrites or not run.selected_concept or not run.creative_brief:
-            return run.status
-        if run.qa_report is not None or run.approvals or run.publishes:
-            return run.status
-        artifacts = [item for item in run.artifacts if item.kind == f"production-v{run.version}"]
-        if not artifacts:
-            return run.status
-        latest = max(artifacts, key=lambda item: item.revision)
-        qa = QAReport.model_validate(latest.metadata_json["qa"])
-        if qa.passed or not any(issue.severity == "error" for issue in qa.issues):
-            return run.status
-        concept = CandidateConcept.model_validate(run.selected_concept)
-        brief = CreativeBrief.model_validate(run.creative_brief)
-        allowed_colors = sorted({
-            item.color for item in ConfigurationRepository(session).get_template().variants
-            if item.enabled
-        })
-        version = run.version
-        effects = latest.metadata_json.get("artwork_effects")
-        typography_spec = latest.metadata_json.get("typography_spec") or run.typography_spec
-    rewrite_issues = qa.issues
-    if effects or typography_spec:
-        effect_context = json.dumps({
-            "artwork_effects": effects,
-            "typography_spec": typography_spec,
-        }, sort_keys=True)
-        rewrite_issues = [
-            issue.model_copy(update={
-                "recommended_fix": (
-                    (issue.recommended_fix or "Revise the brief to resolve this finding.")
-                    + " Saved rendering settings: " + effect_context
-                    + (
-                        " Simplify the requested arch or distress; illustration edits cannot fix "
-                        "effects applied during prepress."
-                        if issue.code.upper() in EFFECT_RECOVERY_CODES else ""
-                    )
-                ),
+    while True:
+        with session_scope() as session:
+            session.scalar(select(RunRecord.id).where(RunRecord.id == run_id).with_for_update())
+            repo = RunRepository(session)
+            run = repo.get(run_id, full=True)
+            if run.status == RunStatus.PENDING.value and run.error == "Automatic brief rewrite ready":
+                return RunStatus.PENDING.value
+            if run.status not in {RunStatus.FAILED.value, RunStatus.AWAITING_BRIEF_REVISION.value}:
+                return run.status
+            if not run.selected_concept or not run.creative_brief:
+                return run.status
+            if run.qa_report is not None or run.approvals or run.publishes:
+                return run.status
+            artifacts = [item for item in run.artifacts if item.kind == f"production-v{run.version}"]
+            if not artifacts:
+                return run.status
+            latest = max(artifacts, key=lambda item: item.revision)
+            qa = QAReport.model_validate(latest.metadata_json["qa"])
+            if qa.passed or not any(issue.severity == "error" for issue in qa.issues):
+                return run.status
+            events = list(session.scalars(select(AuditEvent).where(
+                AuditEvent.run_id == run_id,
+                AuditEvent.action.in_(["artwork.brief_rewrite_attempt", "artwork.brief_rewritten"]),
+            ).order_by(AuditEvent.created_at, AuditEvent.id)))
+            attempts = [event for event in events if event.action == "artwork.brief_rewrite_attempt"]
+            legacy_count = sum(
+                event.action == "artwork.brief_rewritten" and not event.detail.get("attempt_id")
+                for event in events
+            )
+            # Subtract new accepted attempts from the version floor before adding all
+            # reserved calls, so rejected calls on legacy runs also consume the budget.
+            accepted_attempts = sum(event.detail.get("outcome") == "accepted" for event in attempts)
+            legacy_floor = max(run.version - 1 - accepted_attempts, legacy_count)
+            used_attempts = legacy_floor + len(attempts)
+            for prior_attempt in attempts:
+                if prior_attempt.detail.get("outcome") == "started":
+                    prior_attempt.detail = {**prior_attempt.detail, "outcome": "interrupted"}
+            if used_attempts >= settings.max_brief_rewrites:
+                repo.status(
+                    run_id, RunStatus.AWAITING_BRIEF_REVISION,
+                    f"Automatic brief rewrite budget exhausted ({settings.max_brief_rewrites} attempts); "
+                    "artwork still requires a passing brief and QA",
+                )
+                return RunStatus.AWAITING_BRIEF_REVISION.value
+            previous_strategy: RecoveryStrategy | None = (
+                "structural_simplification" if any(
+                    event.detail.get("recovery_context", {}).get("strategy") == "structural_simplification"
+                    for event in events
+                ) else None
+            )
+            failures = [
+                ArtworkFailure(
+                    version=int(item.kind.removeprefix("production-v")),
+                    revision=item.revision,
+                    issues=tuple(QAReport.model_validate(item.metadata_json["qa"]).issues),
+                )
+                for item in run.artifacts
+                if item.kind.startswith("production-v") and item.metadata_json.get("qa")
+            ]
+            context = build_recovery_context(
+                failures, attempt=used_attempts + 1, previous_strategy=previous_strategy,
+            )
+            concept = CandidateConcept.model_validate(run.selected_concept)
+            brief = CreativeBrief.model_validate(run.creative_brief)
+            allowed_colors = sorted({
+                item.color for item in ConfigurationRepository(session).get_template().variants
+                if item.enabled
             })
-            for issue in qa.issues
-        ]
-    result = await OpenAIService(settings).revise_brief(
-        concept, brief, rewrite_issues, allowed_colors
-    )
-    revised = result.value
-    fixed = {
-        "concept_name": brief.concept_name,
-        "target_customer": brief.target_customer,
-        "customer_motivation": brief.customer_motivation,
-        "slogan": brief.slogan,
-        "design_mode": brief.design_mode,
-        "shirt_colors": allowed_colors,
-    }
-    revised = CreativeBrief.model_validate({**revised.model_dump(mode="json"), **fixed})
-    if revised.model_dump(mode="json") == brief.model_dump(mode="json"):
-        set_status(run_id, RunStatus.AWAITING_BRIEF_REVISION, "Automatic brief rewrite made no change")
-        return RunStatus.AWAITING_BRIEF_REVISION.value
-    with session_scope() as session:
-        repo = RunRepository(session)
-        run = repo.get(run_id, full=True)
-        if run.version != version or run.status not in {
-            RunStatus.FAILED.value, RunStatus.AWAITING_BRIEF_REVISION.value,
-        }:
-            return run.status
-        run.version += 1
-        run.creative_brief = revised.model_dump(mode="json")
-        run.typography_spec = None
-        run.qa_report = None
-        run.listings = None
-        run.listing_generation_state = None
-        run.price_quotes = None
-        run.template_snapshot = None
-        run.excluded_shirt_colors = None
-        run.publication_template_snapshot = None
-        repo.provider_call(run_id, "brief_rewrite", result.metadata)
-        repo.status(run_id, RunStatus.PENDING, "Automatic brief rewrite ready")
-        repo.audit(run_id, "worker", "artwork.brief_rewritten", {
-            "from_version": version, "to_version": run.version,
-            "previous_brief": brief.model_dump(mode="json"),
-            "issues": [issue.model_dump(mode="json") for issue in qa.issues],
-            "artwork_effects": effects,
-            "typography_spec": typography_spec,
-        })
-    return RunStatus.PENDING.value
+            version = run.version
+            effects = latest.metadata_json.get("artwork_effects")
+            typography_spec = latest.metadata_json.get("typography_spec") or run.typography_spec
+            rewrite_issues = list(qa.issues)
+            if attempts and attempts[-1].detail.get("rejection_reason"):
+                rewrite_issues.append(QAIssue(
+                    code="BRIEF_REWRITE_UNCHANGED", severity="error",
+                    message=str(attempts[-1].detail["rejection_reason"]),
+                    recommended_fix="Replace the composition and generation instructions; do not append the old brief.",
+                ))
+            attempt_id = str(uuid4())
+            session.add(AuditEvent(
+                id=attempt_id, run_id=run_id, actor="worker", action="artwork.brief_rewrite_attempt",
+                detail={
+                    "from_version": version, "outcome": "started",
+                    "recovery_context": context.to_dict(),
+                },
+            ))
+        if effects or typography_spec:
+            effect_context = json.dumps({
+                "artwork_effects": effects, "typography_spec": typography_spec,
+            }, sort_keys=True)
+            rewrite_issues = [
+                issue.model_copy(update={
+                    "recommended_fix": (
+                        (issue.recommended_fix or "Revise the brief to resolve this finding.")
+                        + " Saved rendering settings: " + effect_context
+                        + (
+                            " Simplify the requested arch or distress; illustration edits cannot fix "
+                            "effects applied during prepress."
+                            if issue.code.upper() in EFFECT_RECOVERY_CODES else ""
+                        )
+                    ),
+                }) for issue in rewrite_issues
+            ]
+        try:
+            result = await OpenAIService(settings).revise_brief(
+                concept, brief, rewrite_issues, allowed_colors, recovery_context=context,
+            )
+        except Exception as exc:
+            with session_scope() as session:
+                event = session.get(AuditEvent, attempt_id)
+                if event is not None and event.detail.get("outcome") == "started":
+                    event.detail = {
+                        **event.detail, "outcome": "provider_error", "error_type": type(exc).__name__,
+                    }
+            raise
+        fixed = {
+            "concept_name": brief.concept_name,
+            "target_customer": brief.target_customer,
+            "customer_motivation": brief.customer_motivation,
+            "slogan": brief.slogan,
+            "design_mode": brief.design_mode,
+            "shirt_colors": allowed_colors,
+        }
+        revised = CreativeBrief.model_validate({**result.value.model_dump(mode="json"), **fixed})
+        rejection = None
+        if revised.model_dump(mode="json") == brief.model_dump(mode="json"):
+            rejection = "Automatic brief rewrite made no change"
+        elif context.strategy == "structural_simplification" and not structural_rewrite_is_material(brief, revised):
+            rejection = "Structural recovery must replace both composition and generation instructions"
+        with session_scope() as session:
+            session.scalar(select(RunRecord.id).where(RunRecord.id == run_id).with_for_update())
+            repo = RunRepository(session)
+            run = repo.get(run_id, full=True)
+            event = session.get(AuditEvent, attempt_id)
+            assert event is not None
+            # A timed-out activity may finish after its retry or an operator has moved on.
+            superseded = (
+                event.detail.get("outcome") != "started" or run.version != version
+                or run.status not in {RunStatus.FAILED.value, RunStatus.AWAITING_BRIEF_REVISION.value}
+                or run.creative_brief != brief.model_dump(mode="json")
+                or run.qa_report is not None or run.approvals or run.publishes
+            )
+            repo.provider_call(run_id, "brief_rewrite", {
+                **result.metadata, "attempt_id": attempt_id, "recovery_context": context.to_dict(),
+                "outcome": "superseded" if superseded else "rejected" if rejection else "accepted",
+            })
+            if superseded:
+                event.detail = {**event.detail, "outcome": "superseded"}
+                return run.status
+            event.detail = {
+                **event.detail, "outcome": "rejected" if rejection else "accepted",
+                "rejection_reason": rejection, "candidate_brief": revised.model_dump(mode="json"),
+            }
+            if rejection:
+                # Persist the rejected call before requesting another proposal in this budget.
+                continue
+            run.version += 1
+            run.creative_brief = revised.model_dump(mode="json")
+            run.typography_spec = None
+            run.qa_report = None
+            run.listings = None
+            run.listing_generation_state = None
+            run.price_quotes = None
+            run.template_snapshot = None
+            run.excluded_shirt_colors = None
+            run.publication_template_snapshot = None
+            repo.status(run_id, RunStatus.PENDING, "Automatic brief rewrite ready")
+            repo.audit(run_id, "worker", "artwork.brief_rewritten", {
+                "from_version": version, "to_version": run.version, "attempt_id": attempt_id,
+                "recovery_context": context.to_dict(),
+                "previous_brief": brief.model_dump(mode="json"),
+                "issues": [issue.model_dump(mode="json") for issue in qa.issues],
+                "artwork_effects": effects, "typography_spec": typography_spec,
+            })
+        return RunStatus.PENDING.value
 
 
 def record_approval(run_id: str, signal: ApprovalSignal, settings: Settings | None = None) -> None:
@@ -1225,7 +1344,10 @@ async def revalidate_approval_run(run_id: str, settings: Settings | None = None)
 
 def record_publish_failure(run_id: str, channel: Channel, error: str) -> None:
     with session_scope() as session:
+        session.scalar(select(RunRecord.id).where(RunRecord.id == run_id).with_for_update())
         record = RunRepository(session).publish_record(run_id, channel.value, "pending")
+        if record.status in {PublishStatus.SUCCEEDED.value, PublishStatus.DRY_RUN.value}:
+            return
         record.status = PublishStatus.FAILED.value
         record.error = error[:4000]
         RunRepository(session).audit(
@@ -1236,11 +1358,57 @@ def record_publish_failure(run_id: str, channel: Channel, error: str) -> None:
         )
 
 
-def _checkpoint_etsy_publish(run_id: str, **updates: Any) -> None:
+def _checkpoint_etsy_publish(
+    run_id: str, *, allow_completed: bool = False, **updates: Any,
+) -> None:
     with session_scope() as session:
+        session.scalar(select(RunRecord.id).where(RunRecord.id == run_id).with_for_update())
         publish = RunRepository(session).publish_record(run_id, Channel.ETSY.value, "pending")
+        if not allow_completed and publish.status in {
+            PublishStatus.SUCCEEDED.value, PublishStatus.DRY_RUN.value,
+        }:
+            # Stop stale workers before a checkpoint can authorize another remote upload.
+            raise StorefrontVerificationError("Etsy publication already completed; stale attempt stopped")
         data = dict(publish.response_data or {})
+        previous = data.get("mockup_verification") or {}
+        incoming = updates.get("mockup_verification")
+        if previous.get("status") == "failed" and incoming and incoming != previous:
+            history = list(data.get("mockup_verification_history") or [])
+            history.append({
+                "manifest": data.get("mockup_manifest") or [], "verification": previous,
+            })
+            data["mockup_verification_history"] = history[-10:]
+        if updates.get("draft_create_started") and data.get("draft_create_started"):
+            raise StorefrontVerificationError("Etsy draft creation is already reserved; reconcile its outcome")
+        color = updates.get("image_upload_started_color")
+        if color and (
+            data.get("image_upload_started_color")
+            or color in data.get("etsy_color_image_ids", {})
+        ):
+            raise StorefrontVerificationError("Etsy image upload is already reserved; reconcile its outcome")
+        pending_color = data.get("image_upload_started_color")
+        if (
+            "image_upload_started_color" in updates and color is None and pending_color
+            and pending_color not in updates.get("etsy_color_image_ids", {})
+        ):
+            # An overlapping retry completing another color cannot release this reservation.
+            updates.pop("image_upload_started_color")
+        if "etsy_color_image_ids" in updates:
+            updates["etsy_color_image_ids"] = {
+                **data.get("etsy_color_image_ids", {}), **updates["etsy_color_image_ids"],
+            }
         data.update(updates)
+        publish.response_data = data
+
+
+def _clear_rejected_publish_intent(run_id: str, channel: Channel, *keys: str) -> None:
+    """A definitive rejection permits a later corrected request, unlike a lost response."""
+    with session_scope() as session:
+        session.scalar(select(RunRecord.id).where(RunRecord.id == run_id).with_for_update())
+        publish = RunRepository(session).publish_record(run_id, channel.value, "pending")
+        data = dict(publish.response_data or {})
+        for key in keys:
+            data.pop(key, None)
         publish.response_data = data
 
 
@@ -1264,10 +1432,24 @@ async def _wait_for_native_etsy_link(
         await asyncio.sleep(min(10, remaining))
 
 
+def _mockup_evidence_writer(run_id: str, settings: Settings) -> Callable[[bytes, str], str]:
+    storage = ArtifactStorage(settings)
+
+    def write(data: bytes, content_type: str) -> str:
+        extension = "png" if content_type == "image/png" else "jpg"
+        key, _ = storage.put(
+            data, suffix=f"{run_id}-mockup.{extension}", content_type=content_type,
+        )
+        return key
+
+    return write
+
+
 async def _direct_etsy_fallback(
     run_id: str, printify: PrintifyClient, settings: Settings, shop_id: str,
     product_id: str, product: dict[str, Any], template: ProductTemplate,
     listing: MarketplaceListing, quotes: list[PriceQuote],
+    *, prepared_mockups: list[PreparedMockup] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if product.get("is_locked", True):
         raise StorefrontVerificationError("Printify is still publishing; Etsy fallback is unsafe")
@@ -1292,16 +1474,22 @@ async def _direct_etsy_fallback(
         linked, featured_id, image_ids = await publish_direct_etsy(
             etsy, printify, shop_id, product_id, product, template, listing, quotes,
             defaults, progress, checkpoint,
+            prepared_mockups=prepared_mockups,
+            evidence_writer=_mockup_evidence_writer(run_id, settings),
         )
         verified_product, verification = await _verify_etsy_publish(
             run_id, printify, settings, shop_id, product_id, template, listing,
             quotes, featured_id or None,
+            prepared_mockups=prepared_mockups,
         )
         listing_id = int((linked.get("external") or {})["id"])
         if int(verification["listing_id"]) != listing_id:
             raise StorefrontVerificationError("Etsy verification changed the Printify listing link")
         verification.update({
-            "publication_mode": "direct_etsy_fallback" if image_ids else "adopted_etsy_listing",
+            "publication_mode": (
+                "direct_etsy_fallback" if progress.get("etsy_listing_owned")
+                else "adopted_etsy_listing"
+            ),
             "photo_count": len(image_ids),
             "color_photo_links": len(image_ids),
         })
@@ -1321,6 +1509,8 @@ async def _verify_etsy_publish(
     listing: MarketplaceListing,
     quotes: list[PriceQuote],
     prior_image_id: int | None,
+    *, prepared_mockups: list[PreparedMockup] | None = None,
+    allow_completed_checkpoint: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         token = await etsy_access_token(settings)
@@ -1335,11 +1525,10 @@ async def _verify_etsy_publish(
         last_error: Exception | None = None
         product: dict[str, Any] = {}
         listing_id = 0
-        mockup_url = ""
         for attempt in range(6):
             try:
                 product = await printify.product(shop_id, product_id)
-                mockup_url = verify_printify_product(product, template, quotes)
+                verify_printify_product(product, template, quotes)
                 listing_id = printify_listing_id(product)
                 live_listing = await etsy.listing(listing_id)
                 verify_etsy_listing(
@@ -1397,45 +1586,42 @@ async def _verify_etsy_publish(
                         raise
                     await asyncio.sleep(2)
 
-        images = await etsy.images(listing_id)
-        image_id = prior_image_id
-        if image_id is not None:
-            try:
-                verify_featured_image(images, image_id)
-            except StorefrontVerificationError:
-                image_id = None
-        if image_id is None:
-            if len(images) >= 20:
-                raise StorefrontVerificationError(
-                    "Etsy has 20 photos; reorder the approved mockup manually"
-                )
-            image, content_type = await download_mockup(mockup_url)
-            color = template.featured_variant().color
-            image_id = await etsy.upload_featured(
-                listing_id, image, content_type, f"{listing.alt_text} on {color} shirt"
+        def checkpoint(**updates: Any) -> None:
+            _checkpoint_etsy_publish(
+                run_id, allow_completed=allow_completed_checkpoint, **updates,
             )
-            with session_scope() as session:
-                publish = RunRepository(session).publish_record(
-                    run_id, Channel.ETSY.value, "pending"
-                )
-                response_data = dict(publish.response_data or {})
-                response_data["featured_image_id"] = image_id
-                publish.response_data = response_data
-        for attempt in range(6):
-            images = await etsy.images(listing_id)
-            try:
-                verify_featured_image(images, image_id)
-                break
-            except StorefrontVerificationError:
-                if attempt == 5:
-                    raise
-                await asyncio.sleep(2)
+
+        evidence_writer = _mockup_evidence_writer(run_id, settings)
+        if prepared_mockups is None:
+            prepared_mockups = await prepare_mockups(
+                product, template, evidence_writer=evidence_writer, checkpoint=checkpoint,
+            )
+        if mockup_plan(product, template) != [
+            (item.color, item.source) for item in prepared_mockups
+        ]:
+            checkpoint(mockup_verification={
+                "status": "failed", "error": "Printify mockup plan changed after validation",
+            })
+            raise StorefrontVerificationError("Printify mockup plan changed after validation")
+        # Saved IDs and alt text are hints, never proof that Etsy serves the right pixels.
+        gallery = await verify_etsy_mockups(
+            etsy, listing_id, template, prepared_mockups, inventory,
+            evidence_writer=evidence_writer, checkpoint=checkpoint,
+        )
+        image_id = int(gallery["featured_image_id"])
+        checkpoint(
+            stage="mockups_verified", featured_image_id=image_id,
+            etsy_color_image_ids=gallery["image_ids"],
+        )
         return product, {
             "listing_id": listing_id,
             "featured_variant_id": template.featured_variant().variant_id,
             "featured_image_id": image_id,
             "variant_count": len(quotes),
             "selector_labels": ["Size", "Color"],
+            "photo_count": gallery["photo_count"],
+            "color_photo_links": gallery["color_photo_links"],
+            "mockup_verification": gallery,
             "verified_at": datetime.now(UTC).isoformat(),
         }
     finally:
@@ -1487,6 +1673,7 @@ async def repair_published_etsy_listing(run_id: str, settings: Settings | None =
             listing,
             quotes,
             int(prior_image_id) if prior_image_id else None,
+            allow_completed_checkpoint=True,
         )
     finally:
         await printify.close()
@@ -1568,6 +1755,27 @@ async def import_etsy_listing_defaults(
             "source_listing_id": listing_id, "template_version": version,
         })
         return version
+
+
+def _require_publish_verification(
+    run_id: str, channel: Channel, fingerprint: str, product_id: str,
+    response_data: dict[str, Any], mapping_data: dict[str, Any], error: Exception,
+) -> PublishStatus:
+    with session_scope() as session:
+        session.scalar(select(RunRecord.id).where(RunRecord.id == run_id).with_for_update())
+        repository = RunRepository(session)
+        publish = repository.publish_record(run_id, channel.value, fingerprint)
+        if publish.status in {PublishStatus.SUCCEEDED.value, PublishStatus.DRY_RUN.value}:
+            return PublishStatus(publish.status)
+        publish.status = PublishStatus.RECONCILIATION_REQUIRED.value
+        publish.error = str(error)[:4000]
+        publish.response_data = {**response_data, **dict(publish.response_data or {})}
+        repository.save_product_mapping(run_id, channel.value, product_id, mapping_data)
+        repository.audit(
+            run_id, "worker", "channel.verification_required",
+            {"channel": channel.value, "reason": publish.error},
+        )
+    return PublishStatus.RECONCILIATION_REQUIRED
 
 
 async def publish_channel_run(
@@ -1657,7 +1865,21 @@ async def publish_channel_run(
             upload_id = str(upload["id"])
         fingerprint = printify.product_fingerprint(template, listing, quotes, upload_id)
         with session_scope() as session:
+            session.scalar(select(RunRecord.id).where(RunRecord.id == run_id).with_for_update())
             publish = RunRepository(session).publish_record(run_id, channel.value, fingerprint)
+            if publish.status in {PublishStatus.SUCCEEDED.value, PublishStatus.DRY_RUN.value}:
+                return PublishStatus(publish.status)
+            # A retry may have progressed while validation or upload was in flight.
+            upload_id = publish.artwork_upload_id or upload_id
+            existing_product_id = publish.printify_product_id
+            existing_status = publish.status
+            existing_response = dict(publish.response_data or {})
+            create_reserved = not (
+                existing_product_id or existing_response.get("product_create_started")
+                or existing_status == PublishStatus.RECONCILIATION_REQUIRED.value
+            )
+            if create_reserved:
+                publish.response_data = {**existing_response, "product_create_started": True}
             publish.artwork_upload_id = upload_id
             publish.status = PublishStatus.CREATING.value
             publish.error = None
@@ -1665,27 +1887,41 @@ async def publish_channel_run(
         product: dict[str, Any]
         if existing_product_id:
             product = {"id": existing_product_id}
-        elif existing_status == PublishStatus.RECONCILIATION_REQUIRED.value:
+        elif (
+            existing_status == PublishStatus.RECONCILIATION_REQUIRED.value
+            or existing_response.get("product_create_started")
+        ):
             matches = await printify.reconcile_product(shop_id, upload_id, listing.title)
             if len(matches) != 1:
                 with session_scope() as session:
+                    session.scalar(select(RunRecord.id).where(RunRecord.id == run_id).with_for_update())
                     publish = RunRepository(session).publish_record(
                         run_id, channel.value, fingerprint
                     )
+                    if publish.status in {PublishStatus.SUCCEEDED.value, PublishStatus.DRY_RUN.value}:
+                        return PublishStatus(publish.status)
                     publish.status = PublishStatus.RECONCILIATION_REQUIRED.value
                     publish.error = "Ambiguous product creation still requires reconciliation"
                 return PublishStatus.RECONCILIATION_REQUIRED
             product = matches[0]
         else:
+            assert create_reserved
             payload = printify.product_payload(template, listing, quotes, upload_id)
             try:
                 product = await printify.create_product(shop_id, payload)
+            except (ProviderConfigurationError, httpx.HTTPStatusError) as exc:
+                if isinstance(exc, ProviderConfigurationError) or 400 <= exc.response.status_code < 500:
+                    _clear_rejected_publish_intent(run_id, channel, "product_create_started")
+                raise
             except AmbiguousCreateError as exc:
                 matches = await printify.reconcile_product(shop_id, upload_id, listing.title)
                 with session_scope() as session:
+                    session.scalar(select(RunRecord.id).where(RunRecord.id == run_id).with_for_update())
                     publish = RunRepository(session).publish_record(
                         run_id, channel.value, fingerprint
                     )
+                    if publish.status in {PublishStatus.SUCCEEDED.value, PublishStatus.DRY_RUN.value}:
+                        return PublishStatus(publish.status)
                     if len(matches) == 1:
                         publish.printify_product_id = matches[0]["id"]
                         product = matches[0]
@@ -1694,22 +1930,74 @@ async def publish_channel_run(
                         publish.error = str(exc)
                         return PublishStatus.RECONCILIATION_REQUIRED
         with session_scope() as session:
+            session.scalar(select(RunRecord.id).where(RunRecord.id == run_id).with_for_update())
             publish = RunRepository(session).publish_record(run_id, channel.value, fingerprint)
+            if publish.status in {PublishStatus.SUCCEEDED.value, PublishStatus.DRY_RUN.value}:
+                return PublishStatus(publish.status)
             publish.printify_product_id = product["id"]
             publish.status = PublishStatus.PUBLISHING.value
-            publish.response_data = product
+            # Keep draft IDs and uploaded-image checkpoints even if this activity stops here.
+            publish.response_data = {**product, **dict(publish.response_data or {})}
+            existing_response = dict(publish.response_data)
+        prepared_mockups: list[PreparedMockup] | None = None
+        if settings.publish_mode == "live" and channel == Channel.ETSY:
+            # Validate actual source photos before reserving or submitting a publish request.
+            # Run again on retries: neither saved image IDs nor cached URLs prove content.
+            mockup_product = product
+            try:
+                mockup_product = await printify.product(shop_id, product["id"])
+                verify_printify_product(mockup_product, template, quotes)
+                prepared_mockups = await prepare_mockups(
+                    mockup_product, template,
+                    evidence_writer=_mockup_evidence_writer(run_id, settings),
+                    checkpoint=lambda **updates: _checkpoint_etsy_publish(run_id, **updates),
+                )
+            except (StorefrontVerificationError, httpx.HTTPError, KeyError, ValueError) as exc:
+                return _require_publish_verification(
+                    run_id, channel, fingerprint, str(product["id"]),
+                    existing_response, mockup_product, exc,
+                )
         response = existing_response.get("publish_response")
+        if response is None and existing_response.get("publish_started"):
+            # A missing response after a recorded request is ambiguous. Reconcile by readback.
+            response = {"status": "reconciling_previous_publish"}
         if existing_status == PublishStatus.RECONCILIATION_REQUIRED.value and response is None:
             remote_product = await printify.product(shop_id, product["id"])
             external = remote_product.get("external") or {}
             if isinstance(external, dict) and external.get("id"):
                 response = {"status": "already_published", "listing_id": external["id"]}
-        if response is None or existing_status != PublishStatus.RECONCILIATION_REQUIRED.value:
-            response = await printify.publish(shop_id, product["id"])
+        with session_scope() as session:
+            session.scalar(select(RunRecord.id).where(RunRecord.id == run_id).with_for_update())
+            publish = RunRepository(session).publish_record(run_id, channel.value, fingerprint)
+            if publish.status in {PublishStatus.SUCCEEDED.value, PublishStatus.DRY_RUN.value}:
+                return PublishStatus(publish.status)
+            existing_response = dict(publish.response_data or {})
+            response = existing_response.get("publish_response") or (
+                {"status": "reconciling_previous_publish"}
+                if existing_response.get("publish_started") else response
+            )
+            publish_reserved = response is None
+            if publish_reserved:
+                existing_response["publish_started"] = True
+                if channel == Channel.ETSY:
+                    existing_response.setdefault("native_poll_started", datetime.now(UTC).isoformat())
+                publish.response_data = existing_response
+        if publish_reserved:
+            try:
+                response = await printify.publish(shop_id, product["id"])
+            except (ProviderConfigurationError, httpx.HTTPStatusError) as exc:
+                if isinstance(exc, ProviderConfigurationError) or 400 <= exc.response.status_code < 500:
+                    _clear_rejected_publish_intent(run_id, channel, "publish_started", "native_poll_started")
+                raise
         response_data: dict[str, Any] = {**existing_response, "publish_response": response}
         with session_scope() as session:
+            session.scalar(select(RunRecord.id).where(RunRecord.id == run_id).with_for_update())
             publish = RunRepository(session).publish_record(run_id, channel.value, fingerprint)
+            response_data = {**response_data, **dict(publish.response_data or {})}
+            if publish_reserved or "publish_response" not in response_data:
+                response_data["publish_response"] = response
             publish.response_data = response_data
+            response = response_data["publish_response"]
         mapping_data = product
         verification: dict[str, Any] | None = None
         if settings.publish_mode == "live":
@@ -1724,37 +2012,34 @@ async def publish_channel_run(
                             run_id, printify, settings, shop_id, product["id"],
                             template, listing, quotes,
                             int(prior_image_id) if prior_image_id else None,
+                            prepared_mockups=prepared_mockups,
                         )
                     else:
                         mapping_data = remote_product
                         mapping_data, verification = await _direct_etsy_fallback(
                             run_id, printify, settings, shop_id, product["id"],
                             remote_product, template, listing, quotes,
+                            prepared_mockups=prepared_mockups,
                         )
                 else:
                     mapping_data = await printify.product(shop_id, product["id"])
+                    if response.get("status") == "reconciling_previous_publish" and not (
+                        mapping_data.get("external") or {}
+                    ).get("id"):
+                        raise StorefrontVerificationError(
+                            "Printify publish outcome is unknown; storefront publication requires reconciliation"
+                        )
                     verify_printify_product(mapping_data, template, quotes)
             except (StorefrontVerificationError, httpx.HTTPError, KeyError, ValueError) as exc:
-                with session_scope() as session:
-                    repository = RunRepository(session)
-                    publish = repository.publish_record(run_id, channel.value, fingerprint)
-                    publish.status = PublishStatus.RECONCILIATION_REQUIRED.value
-                    publish.error = str(exc)[:4000]
-                    publish.response_data = {**response_data, **dict(publish.response_data or {})}
-                    repository.save_product_mapping(
-                        run_id, channel.value, product["id"], mapping_data
-                    )
-                    repository.audit(
-                        run_id,
-                        "worker",
-                        "channel.verification_required",
-                        {"channel": channel.value, "reason": publish.error},
-                    )
-                return PublishStatus.RECONCILIATION_REQUIRED
+                return _require_publish_verification(
+                    run_id, channel, fingerprint, str(product["id"]),
+                    response_data, mapping_data, exc,
+                )
         final = (
             PublishStatus.DRY_RUN if settings.publish_mode == "dry_run" else PublishStatus.SUCCEEDED
         )
         with session_scope() as session:
+            session.scalar(select(RunRecord.id).where(RunRecord.id == run_id).with_for_update())
             publish = RunRepository(session).publish_record(run_id, channel.value, fingerprint)
             publish.status = final.value
             response_data = {**response_data, **dict(publish.response_data or {})}
@@ -1786,14 +2071,14 @@ def finish_publishing(run_id: str, results: list[PublishStatus]) -> None:
     success = {PublishStatus.SUCCEEDED, PublishStatus.DRY_RUN}
     if results and all(item in success for item in results):
         set_status(run_id, RunStatus.PUBLISHED)
-    elif any(item in success for item in results):
-        set_status(run_id, RunStatus.PARTIALLY_PUBLISHED)
     elif PublishStatus.RECONCILIATION_REQUIRED in results:
         set_status(
             run_id,
             RunStatus.VERIFICATION_REQUIRED,
             "At least one storefront publication needs verification or reconciliation",
         )
+    elif any(item in success for item in results):
+        set_status(run_id, RunStatus.PARTIALLY_PUBLISHED)
     else:
         set_status(run_id, RunStatus.FAILED, "No selected channel published successfully")
 

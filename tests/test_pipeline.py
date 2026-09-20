@@ -99,11 +99,14 @@ async def test_automatic_brief_rewrites_stop_after_eight_and_keep_concept(
         slogan = original.creative_brief["slogan"]
     calls = 0
 
-    async def rewrite(self, concept, brief, issues, colors):  # type: ignore[no-untyped-def]
+    async def rewrite(self, concept, brief, issues, colors, *, recovery_context=None):  # type: ignore[no-untyped-def]
         nonlocal calls
         calls += 1
         return ModelResult(
-            brief.model_copy(update={"generation_brief": brief.generation_brief + f" pass {calls}"}),
+            brief.model_copy(update={
+                "composition": f"Detached primary motifs with generous open space, layout {calls}",
+                "generation_brief": f"Draw broad independent flat motifs, arrangement {calls}",
+            }),
             {"model": "fixture", "estimated_cost_usd": 0.25},
         )
 
@@ -265,7 +268,7 @@ def test_swiftpod_etsy_template_has_98_real_catalog_combinations() -> None:
                             readiness_state_id=3, production_partner_ids=[4]),
     )
     assert len(inventory_payload["products"]) == 98
-    assert inventory_payload["price_on_property"] == [513]
+    assert inventory_payload["price_on_property"] == [513, 514]
     assert len({item["sku"] for item in inventory_payload["products"]}) == 98
     with pytest.raises(ValueError, match="does not offer"):
         build_template({"variants": catalog["variants"][:-1]}, channel)
@@ -936,7 +939,7 @@ async def test_effect_failure_resumes_brief_rewrite_without_illustration_edits(
         assert run.provider_calls == original_calls
         assert len([item for item in run.artifacts if item.kind == "production-v1"]) == 1
 
-    async def rewrite(self, concept, brief, issues, colors):  # type: ignore[no-untyped-def]
+    async def rewrite(self, concept, brief, issues, colors, *, recovery_context=None):  # type: ignore[no-untyped-def]
         failed = next(item for item in issues if item.code == code)
         assert "Saved rendering settings" in failed.recommended_fix
         assert "renderer_version" in failed.recommended_fix
@@ -1063,8 +1066,9 @@ async def test_effected_artwork_reaches_approval_and_retries_reuse_it(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("defect_code", ["FINE_DETAIL", "ANATOMY", "READABILITY", "CONTRAST"])
 async def test_repeated_visual_defect_pauses_for_revised_brief(
-    isolated_app, monkeypatch: pytest.MonkeyPatch
+    isolated_app, monkeypatch: pytest.MonkeyPatch, defect_code: str
 ) -> None:
     monkeypatch.setattr("merch.domain.prepress.MAX_GENERATION_EDGE", 512)
     monkeypatch.setattr("merch.domain.prepress.MAX_GENERATION_PIXELS", 262_144)
@@ -1088,7 +1092,7 @@ async def test_repeated_visual_defect_pauses_for_revised_brief(
             update={
                 "passed": False,
                 "issues": [
-                    QAIssue(code="FINE_DETAIL", severity="error", message="Too fine")
+                    QAIssue(code=defect_code, severity="error", message="Visible production defect")
                 ],
             }
         )
@@ -1106,7 +1110,9 @@ async def test_repeated_visual_defect_pauses_for_revised_brief(
     with session_scope() as session:
         run = RunRepository(session).get(run_id, full=True)
         assert run.status == RunStatus.AWAITING_BRIEF_REVISION.value
-        assert "FINE_DETAIL" in (run.error or "")
+        assert defect_code in (run.error or "")
+        assert run.qa_report is None
+        assert not run.approvals and not run.publishes
         assert len([item for item in run.artifacts if item.kind == "production-v1"]) == 2
         from merch.schemas import CreativeBrief
 
@@ -1232,6 +1238,13 @@ async def test_contrast_excludes_color_from_only_this_runs_publication(
 async def test_live_etsy_publish_waits_for_storefront_verification_and_retries_without_republishing(
     isolated_app, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    async def prepared(*args, **kwargs):  # type: ignore[no-untyped-def]
+        return []
+
+    # This test isolates storefront handoff/retry state; content gates have
+    # full real-image integration coverage in test_mockup_pipeline.
+    monkeypatch.setattr("merch.pipeline.prepare_mockups", prepared)
+    monkeypatch.setattr("merch.pipeline.verify_printify_product", lambda *args: "mockup")
     monkeypatch.setattr("merch.domain.prepress.MAX_GENERATION_EDGE", 512)
     monkeypatch.setattr("merch.domain.prepress.MAX_GENERATION_PIXELS", 262_144)
     settings = get_settings().model_copy(
@@ -1347,6 +1360,11 @@ async def test_live_etsy_publish_waits_for_storefront_verification_and_retries_w
 async def test_direct_etsy_fallback_marks_run_published_only_after_verified_link(
     isolated_app, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    async def prepared(*args, **kwargs):  # type: ignore[no-untyped-def]
+        return []
+
+    monkeypatch.setattr("merch.pipeline.prepare_mockups", prepared)
+    monkeypatch.setattr("merch.pipeline.verify_printify_product", lambda *args: "mockup")
     monkeypatch.setattr("merch.domain.prepress.MAX_GENERATION_EDGE", 512)
     monkeypatch.setattr("merch.domain.prepress.MAX_GENERATION_PIXELS", 262_144)
     settings = get_settings().model_copy(update={

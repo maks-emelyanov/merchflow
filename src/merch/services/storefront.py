@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
+import re
+from decimal import Decimal, InvalidOperation
 from typing import Any, cast
 from urllib.parse import urlparse
 
@@ -10,6 +11,7 @@ import httpx
 
 from merch.config import Settings
 from merch.schemas import PriceQuote, ProductTemplate
+from merch.services.credentials import redact
 
 
 class StorefrontVerificationError(RuntimeError):
@@ -47,15 +49,14 @@ def verify_printify_product(
     featured_id = template.featured_variant().variant_id
     if {variant_id for variant_id, item in enabled.items() if item.get("is_default")} != {featured_id}:
         raise StorefrontVerificationError("Printify default variant is not the featured variant")
-    images = [
-        item
-        for item in product.get("images", [])
-        if f"_{featured_id}_" in str(item.get("mockup_id") or "")
-        and item.get("position") == "front"
-    ]
-    if not images:
-        raise StorefrontVerificationError("Printify has no front mockup for the featured variant")
-    source = str(images[0].get("src") or "")
+    # Import at call time because selection uses this module's verification error.
+    from merch.services.mockup_selection import mockup_plan
+
+    # This verifier also serves Shopify and Amazon. Their product validation only
+    # needs the featured variant; Etsy's complete gallery policy belongs to its
+    # prepare/readback gates and must not impose its photo limit on other channels.
+    featured_template = template.model_copy(update={"variants": [template.featured_variant()]})
+    source = mockup_plan(product, featured_template)[0][1]
     parsed = urlparse(source)
     if parsed.scheme != "https" or not parsed.hostname:
         raise StorefrontVerificationError("Printify supplied an invalid featured mockup URL")
@@ -151,6 +152,70 @@ def verify_etsy_inventory(
 
 
 SELECTOR_IDS = {"Size": 513, "Color": 514}
+INVENTORY_DEPENDENCIES = (
+    "price_on_property",
+    "quantity_on_property",
+    "sku_on_property",
+    "readiness_state_on_property",
+)
+
+
+def normalize_etsy_inventory_dependencies(payload: dict[str, Any]) -> dict[str, Any]:
+    """Derive price dependencies from offerings and keep other dependencies compatible."""
+    selector_ids = set(SELECTOR_IDS.values())
+    dependencies = {
+        key: {int(value) for value in payload.get(key) or []}
+        for key in INVENTORY_DEPENDENCIES
+    }
+    if any(values - selector_ids for values in dependencies.values()):
+        raise StorefrontVerificationError("Etsy inventory dependency uses an unknown variation")
+    prices = _enabled_inventory_prices(payload)
+    if prices is not None:
+        dependencies["price_on_property"] = selector_ids if len(prices) > 1 else set()
+    use_both = any(values == selector_ids for values in dependencies.values())
+    return {
+        **payload,
+        **{
+            key: [value for value in SELECTOR_IDS.values() if use_both or value in values]
+            if values else []
+            for key, values in dependencies.items()
+        },
+    }
+
+
+def _enabled_inventory_prices(payload: dict[str, Any]) -> set[Decimal] | None:
+    """Infer only from complete enabled offerings; retain metadata on partial inputs."""
+    prices: set[Decimal] = set()
+    products = payload.get("products")
+    if not isinstance(products, list):
+        return None
+    for product in products:
+        if not isinstance(product, dict):
+            return None
+        if product.get("is_deleted"):
+            continue
+        offerings = product.get("offerings")
+        if not isinstance(offerings, list) or not offerings:
+            return None
+        for offering in offerings:
+            if not isinstance(offering, dict):
+                return None
+            if offering.get("is_deleted") or offering.get("is_enabled") is False:
+                continue
+            if offering.get("is_enabled") is not True or offering.get("price") is None:
+                return None
+            raw_price = offering["price"]
+            try:
+                price = (
+                    Decimal(_money_cents(raw_price)) / 100 if isinstance(raw_price, dict)
+                    else Decimal(str(raw_price))
+                )
+            except (InvalidOperation, StorefrontVerificationError, ValueError):
+                return None
+            if not price.is_finite() or price < 0:
+                return None
+            prices.add(price)
+    return prices or None
 
 
 def _inventory_products(inventory: dict[str, Any]) -> list[dict[str, Any]]:
@@ -240,18 +305,13 @@ def build_etsy_selector_inventory(
     if len(set(old_to_new.values())) != 2:
         raise StorefrontVerificationError("Etsy inventory lacks size or color variation IDs")
     payload: dict[str, Any] = {"products": products}
-    for key in (
-        "price_on_property",
-        "quantity_on_property",
-        "sku_on_property",
-        "readiness_state_on_property",
-    ):
+    for key in INVENTORY_DEPENDENCIES:
         old_ids = inventory.get(key) or []
         if any(int(old_id) not in old_to_new for old_id in old_ids):
             raise StorefrontVerificationError(f"Etsy {key} uses an unknown variation")
         mapped_ids = {old_to_new[int(old_id)] for old_id in old_ids}
         payload[key] = [new_id for new_id in SELECTOR_IDS.values() if new_id in mapped_ids]
-    return payload, old_to_new
+    return normalize_etsy_inventory_dependencies(payload), old_to_new
 
 
 def plan_etsy_variation_images(
@@ -350,13 +410,57 @@ class EtsyStorefrontClient:
             "Authorization": f"Bearer {self.access_token}",
         }
 
-    async def _get(self, path: str) -> dict[str, Any]:
+    def _raise_for_status(self, response: httpx.Response, operation: str) -> None:
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            # Capture only structured API error messages, never the response body,
+            # request payload, URL query, or authentication headers.
+            messages: list[str] = []
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            if isinstance(body, dict):
+                for key in ("error", "error_description", "message"):
+                    value = body.get(key)
+                    if isinstance(value, str):
+                        messages.append(value)
+                errors = body.get("errors")
+                if isinstance(errors, list):
+                    for item in errors[:5]:
+                        if isinstance(item, dict) and isinstance(item.get("message"), str):
+                            messages.append(item["message"])
+            detail = redact("; ".join(messages), sorted([
+                self.settings.etsy_api_key.get_secret_value(),
+                self.settings.etsy_shared_secret.get_secret_value(),
+                self.access_token,
+                self.settings.etsy_access_token.get_secret_value(),
+                self.settings.etsy_refresh_token.get_secret_value(),
+            ], key=len, reverse=True))
+            detail = re.sub(
+                r'''(?ix)(\b(?:authorization|x-api-key|access[_-]?token|refresh[_-]?token|client[_-]?secret|api[_-]?key)["']?\s*[:=]\s*)(?:(?:Bearer|Basic)\s+)?(?:"[^"]*"|'[^']*'|[^\s,;]+)''',
+                r"\1[REDACTED]", detail,
+            )
+            detail = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]", detail)
+            detail = re.sub(r"https?://\S+", "[URL REDACTED]", detail)
+            detail = " ".join("".join(char if char.isprintable() else " " for char in detail).split())
+            if len(detail) > 1000:
+                detail = detail[:997] + "..."
+            message = f"Etsy {operation} failed (HTTP {response.status_code})"
+            if detail:
+                message += f": {detail}"
+            raise httpx.HTTPStatusError(
+                message, request=response.request, response=response
+            ) from None
+
+    async def _get(self, path: str, operation: str) -> dict[str, Any]:
         response = await self.client.get(path, headers=self._headers())
-        response.raise_for_status()
+        self._raise_for_status(response, operation)
         return cast(dict[str, Any], response.json())
 
     async def listing(self, listing_id: int) -> dict[str, Any]:
-        return await self._get(f"/application/listings/{listing_id}")
+        return await self._get(f"/application/listings/{listing_id}", "read listing")
 
     async def shop_listings(self, state: str) -> list[dict[str, Any]]:
         if state not in {"active", "draft", "inactive", "sold_out", "expired"}:
@@ -366,7 +470,7 @@ class EtsyStorefrontClient:
         while True:
             result = await self._get(
                 f"/application/shops/{self.settings.etsy_shop_id}/listings"
-                f"?state={state}&limit=100&offset={offset}"
+                f"?state={state}&limit=100&offset={offset}", "list shop listings",
             )
             page = result.get("results") or []
             found.extend(page)
@@ -379,7 +483,7 @@ class EtsyStorefrontClient:
             f"/application/shops/{self.settings.etsy_shop_id}/listings",
             headers=self._headers(), data=payload,
         )
-        response.raise_for_status()
+        self._raise_for_status(response, "create draft")
         return cast(dict[str, Any], response.json())
 
     async def update_listing(self, listing_id: int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -387,11 +491,11 @@ class EtsyStorefrontClient:
             f"/application/shops/{self.settings.etsy_shop_id}/listings/{listing_id}",
             headers=self._headers(), data=payload,
         )
-        response.raise_for_status()
+        self._raise_for_status(response, "update listing")
         return cast(dict[str, Any], response.json())
 
     async def inventory(self, listing_id: int) -> dict[str, Any]:
-        return await self._get(f"/application/listings/{listing_id}/inventory")
+        return await self._get(f"/application/listings/{listing_id}/inventory", "read inventory")
 
     async def update_inventory(self, listing_id: int, payload: dict[str, Any]) -> None:
         response = await self.client.put(
@@ -399,11 +503,12 @@ class EtsyStorefrontClient:
             headers=self._headers(),
             json=payload,
         )
-        response.raise_for_status()
+        self._raise_for_status(response, "update inventory")
 
     async def variation_images(self, listing_id: int) -> list[dict[str, Any]]:
         result = await self._get(
-            f"/application/shops/{self.settings.etsy_shop_id}/listings/{listing_id}/variation-images"
+            f"/application/shops/{self.settings.etsy_shop_id}/listings/{listing_id}/variation-images",
+            "read variation images",
         )
         return cast(list[dict[str, Any]], result.get("results", []))
 
@@ -415,10 +520,10 @@ class EtsyStorefrontClient:
             headers=self._headers(),
             json={"variation_images": images},
         )
-        response.raise_for_status()
+        self._raise_for_status(response, "update variation images")
 
     async def images(self, listing_id: int) -> list[dict[str, Any]]:
-        result = await self._get(f"/application/listings/{listing_id}/images")
+        result = await self._get(f"/application/listings/{listing_id}/images", "read listing images")
         return cast(list[dict[str, Any]], result.get("results", []))
 
     async def upload_featured(
@@ -431,7 +536,7 @@ class EtsyStorefrontClient:
             data={"rank": "1", "overwrite": "false", "alt_text": alt_text[:500]},
             files={"image": (f"featured-mockup.{extension}", image, content_type)},
         )
-        response.raise_for_status()
+        self._raise_for_status(response, "upload featured image")
         return int(response.json()["listing_image_id"])
 
     async def upload_mockup(
@@ -444,7 +549,7 @@ class EtsyStorefrontClient:
             data={"rank": str(rank), "overwrite": "false", "alt_text": alt_text[:500]},
             files={"image": (f"mockup-{rank}.{extension}", image, content_type)},
         )
-        response.raise_for_status()
+        self._raise_for_status(response, "upload mockup")
         return int(response.json()["listing_image_id"])
 
 

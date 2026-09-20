@@ -75,7 +75,37 @@
 <section class="panel"><h2>Automatic release</h2><p>The package passed QA. The worker is validating the current catalog and enabled channels before publication.</p></section>
 {% endif %}
 
-{% if run.publishes %}<section class="panel"><h2>Publishing status</h2><div class="listing-grid">{% for item in run.publishes %}<article><h3>{{ item.channel|replace('_',' ')|title }}</h3><span class="status status-{{ item.status }}">{{ item.status|replace('_',' ') }}</span><p>{{ item.printify_product_id or 'Product ID pending' }}</p>{% if item.response_data and item.response_data.stage %}<p>Recovery: {{ item.response_data.stage|replace('_',' ') }}</p>{% endif %}{% if item.response_data and item.response_data.etsy_listing_id %}<p>Etsy listing {{ item.response_data.etsy_listing_id }}</p>{% endif %}{% if item.error %}<p class="warning">{{ item.error }}</p>{% endif %}{% if item.status in ('failed', 'reconciliation_required') and run.status in ('failed', 'partially_published', 'verification_required') %}<button type="button" class="retry-channel" data-run-id="{{ run.id }}" data-channel="{{ item.channel }}" data-csrf="{{ csrf_token }}">Retry verification</button>{% endif %}</article>{% endfor %}</div></section>{% endif %}
+{% if run.publishes %}
+<section class="panel"><h2>Publishing status</h2><div class="listing-grid">
+  {% for item in run.publishes %}
+  <article><h3>{{ item.channel|replace('_',' ')|title }}</h3>
+    <span class="status status-{{ item.status }}">{{ item.status|replace('_',' ') }}</span>
+    <p>{{ item.printify_product_id or 'Product ID pending' }}</p>
+    {% if item.response_data and item.response_data.stage %}<p>Recovery: {{ item.response_data.stage|replace('_',' ') }}</p>{% endif %}
+    {% if item.response_data and item.response_data.etsy_listing_id %}<p>Etsy listing {{ item.response_data.etsy_listing_id }}</p>{% endif %}
+    {% if item.error %}<p class="warning">{{ item.error }}</p>{% endif %}
+    {% set report = (item.response_data or {}).get('mockup_verification', {}) %}
+    {% set evidence = mockup_evidence.get(item.channel, []) %}
+    {% if report or evidence %}
+    <h4>Mockup verification</h4>
+    <p>{{ report.get('status', 'pending')|replace('_', ' ')|capitalize }}</p>
+    {% if report.error %}<p class="warning">{{ report.error }}</p>{% endif %}
+    {% if evidence %}
+    <table><thead><tr><th>Shirt color</th><th>Expected photo</th><th>Etsy photo</th></tr></thead><tbody>
+      {% for photo in evidence %}
+      <tr><td>{{ photo.color }}</td>
+        <td>{% if photo.source_object_key %}<a href="/api/runs/{{ run.id }}/mockup-evidence/source?color={{ photo.color|urlencode }}" target="_blank" rel="noopener">Expected</a>{% else %}Unavailable{% endif %}</td>
+        <td>{% if photo.actual_object_key %}<a href="/api/runs/{{ run.id }}/mockup-evidence/actual?color={{ photo.color|urlencode }}" target="_blank" rel="noopener">Etsy</a>{% else %}Not captured{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody></table>
+    {% endif %}
+    {% endif %}
+    {% if item.status in ('failed', 'reconciliation_required') and run.status in ('failed', 'partially_published', 'verification_required') %}<button type="button" class="retry-channel" data-run-id="{{ run.id }}" data-channel="{{ item.channel }}" data-csrf="{{ csrf_token }}">Retry verification</button>{% endif %}
+  </article>
+  {% endfor %}
+</div></section>
+{% endif %}
 
 <details class="panel"><summary>Raw audit package</summary><pre>{{ payload|tojson(indent=2) }}</pre></details>
 {% endblock %}

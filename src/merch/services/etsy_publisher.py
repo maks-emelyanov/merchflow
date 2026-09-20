@@ -6,11 +6,19 @@ from collections.abc import Callable
 from typing import Any
 
 from merch.schemas import EtsyListingDefaults, MarketplaceListing, PriceQuote, ProductTemplate
+from merch.services.mockup_selection import mockup_plan as mockup_plan
+from merch.services.mockup_verification import (
+    PreparedMockup,
+    download_etsy_image,
+    prepare_mockups,
+    verify_etsy_mockups,
+)
 from merch.services.printify import PrintifyClient
 from merch.services.storefront import (
     EtsyStorefrontClient,
     StorefrontVerificationError,
     download_mockup,
+    normalize_etsy_inventory_dependencies,
     selector_labels_are_exact,
     verify_etsy_inventory,
     verify_etsy_listing,
@@ -53,50 +61,19 @@ def direct_inventory(
         })
     if len(products) > 100:
         raise StorefrontVerificationError("Etsy supports at most 100 variants for this product")
-    by_color: dict[str, set[int]] = {}
-    by_size: dict[str, set[int]] = {}
-    for variant in template.variants:
-        if variant.enabled:
-            by_color.setdefault(variant.color, set()).add(prices[variant.variant_id])
-            by_size.setdefault(variant.size, set()).add(prices[variant.variant_id])
-    price_properties = []
-    if any(len(values) > 1 for values in by_color.values()):
-        price_properties.append(513)
-    if any(len(values) > 1 for values in by_size.values()):
-        price_properties.append(514)
-    if len(set(prices.values())) > 1 and not price_properties:
-        price_properties = [513, 514]
-    return {
+    enabled_prices = {
+        prices[variant.variant_id] for variant in template.variants if variant.enabled
+    }
+    # SKUs depend on both variations, so Etsy requires each nonempty property
+    # dependency to include both, even when prices vary only by size or color.
+    price_properties = [513, 514] if len(enabled_prices) > 1 else []
+    return normalize_etsy_inventory_dependencies({
         "products": products,
         "price_on_property": price_properties,
         "quantity_on_property": [],
         "sku_on_property": [513, 514],
         "readiness_state_on_property": [],
-    }
-
-
-def mockup_plan(product: dict[str, Any], template: ProductTemplate) -> list[tuple[str, str]]:
-    featured = template.featured_variant()
-    colors = sorted({item.color for item in template.variants if item.enabled})
-    colors.remove(featured.color)
-    colors.insert(0, featured.color)
-    if len(colors) > 20:
-        raise StorefrontVerificationError("Etsy supports at most 20 listing photos")
-    result: list[tuple[str, str]] = []
-    for color in colors:
-        variants = [item for item in template.variants if item.enabled and item.color == color]
-        variants.sort(key=lambda item: (item.size != featured.size, item.variant_id))
-        image = next((
-            image for variant in variants for image in product.get("images", [])
-            if image.get("position") == "front"
-            and (variant.variant_id in (image.get("variant_ids") or [])
-                 or f"_{variant.variant_id}_" in str(image.get("mockup_id") or ""))
-            and image.get("src")
-        ), None)
-        if image is None:
-            raise StorefrontVerificationError(f"Printify has no front mockup for {color}")
-        result.append((color, str(image["src"])))
-    return result
+    })
 
 
 async def _exact_title_listings(
@@ -158,10 +135,20 @@ async def publish_direct_etsy(
     defaults: EtsyListingDefaults,
     progress: dict[str, Any],
     checkpoint: Callable[..., None],
+    *,
+    prepared_mockups: list[PreparedMockup] | None = None,
+    evidence_writer: Callable[[bytes, str], str] | None = None,
 ) -> tuple[dict[str, Any], int, dict[str, int]]:
     """Publish or resume a run-owned Etsy listing, then confirm its Printify link."""
     inventory_payload = direct_inventory(product, template, quotes, defaults)
-    images_to_upload = mockup_plan(product, template)
+    images_to_upload = prepared_mockups
+    if images_to_upload is None:
+        images_to_upload = await prepare_mockups(
+            product, template, downloader=download_mockup,
+            evidence_writer=evidence_writer, checkpoint=checkpoint,
+        )
+    if [(item.color, item.source) for item in images_to_upload] != mockup_plan(product, template):
+        raise StorefrontVerificationError("Prepared mockups no longer match the approved product")
     listing_id = int(progress.get("etsy_listing_id") or 0)
     owned = bool(progress.get("etsy_listing_owned"))
     if listing_id:
@@ -197,15 +184,29 @@ async def publish_direct_etsy(
         progress.update(etsy_listing_id=listing_id, etsy_listing_owned=owned)
 
     remote = await etsy.listing(listing_id)
-    if not owned and remote.get("state") == "active":
+    if remote.get("state") == "active":
         verify_etsy_listing(
             remote, listing_id, int(etsy.settings.etsy_shop_id or 0), listing.title
+        )
+        inventory = await etsy.inventory(listing_id)
+        verify_etsy_inventory(inventory, product, template, quotes)
+        if not selector_labels_are_exact(inventory):
+            raise StorefrontVerificationError("Existing Etsy selectors differ from Size and Color")
+        verified = await verify_etsy_mockups(
+            etsy, listing_id, template, images_to_upload, inventory,
+            downloader=download_etsy_image, evidence_writer=evidence_writer,
+            checkpoint=checkpoint,
         )
         linked = await _link_printify_listing(
             etsy, printify, shop_id, product_id, listing_id, owned, checkpoint
         )
-        checkpoint(stage="adopted_existing_listing")
-        return linked, 0, {}
+        await verify_etsy_mockups(
+            etsy, listing_id, template, images_to_upload, await etsy.inventory(listing_id),
+            image_ids=verified["image_ids"], downloader=download_etsy_image,
+            evidence_writer=evidence_writer, checkpoint=checkpoint,
+        )
+        checkpoint(stage="active_listing_verified" if owned else "adopted_existing_listing")
+        return linked, verified["featured_image_id"], verified["image_ids"]
 
     if sorted(remote.get("tags") or []) != sorted(listing.tags):
         await etsy.update_listing(listing_id, {"tags": ",".join(listing.tags)})
@@ -227,7 +228,8 @@ async def publish_direct_etsy(
         str(color): int(image_id)
         for color, image_id in (progress.get("etsy_color_image_ids") or {}).items()
     }
-    for rank, (color, source) in enumerate(images_to_upload, start=1):
+    for rank, mockup in enumerate(images_to_upload, start=1):
+        color = mockup.color
         images = await etsy.images(listing_id)
         saved = image_ids.get(color)
         if saved and any(int(item.get("listing_image_id") or 0) == saved for item in images):
@@ -245,28 +247,17 @@ async def publish_direct_etsy(
                 raise StorefrontVerificationError(
                     f"Etsy {color} image upload outcome is unknown; do not upload a duplicate"
                 )
-            image, content_type = await download_mockup(source)
             checkpoint(stage="uploading_images", image_upload_started_color=color)
-            image_id = await etsy.upload_mockup(listing_id, image, content_type, alt_text, rank)
+            image_id = await etsy.upload_mockup(
+                listing_id, mockup.image, mockup.content_type, alt_text, rank,
+            )
         image_ids[color] = image_id
         checkpoint(
             stage="uploading_images", etsy_color_image_ids=image_ids.copy(),
             image_upload_started_color=None,
         )
-    images = await etsy.images(listing_id)
-    if len(set(image_ids.values())) != len(images_to_upload) or not all(
-        any(int(item.get("listing_image_id") or 0) == image_id for item in images)
-        for image_id in image_ids.values()
-    ):
-        raise StorefrontVerificationError("Etsy gallery is missing an approved mockup")
-    featured_color = images_to_upload[0][0]
+    featured_color = images_to_upload[0].color
     featured_id = image_ids[featured_color]
-    if not any(
-        int(item.get("listing_image_id") or 0) == featured_id
-        and int(item.get("rank") or 0) == 1 for item in images
-    ):
-        raise StorefrontVerificationError("Etsy has not placed the featured color first")
-    checkpoint(stage="images_verified", featured_image_id=featured_id)
 
     color_value_ids: dict[str, int] = {}
     for item in inventory.get("products", []):
@@ -287,6 +278,12 @@ async def publish_direct_etsy(
     except StorefrontVerificationError:
         await etsy.update_variation_images(listing_id, expected_links)
         verify_etsy_variation_images(await etsy.variation_images(listing_id), expected_links)
+    await verify_etsy_mockups(
+        etsy, listing_id, template, images_to_upload, inventory,
+        image_ids=image_ids, downloader=download_etsy_image,
+        evidence_writer=evidence_writer, checkpoint=checkpoint,
+    )
+    checkpoint(stage="images_verified", featured_image_id=featured_id)
     checkpoint(stage="draft_verified")
 
     try:
@@ -310,6 +307,11 @@ async def publish_direct_etsy(
 
     linked = await _link_printify_listing(
         etsy, printify, shop_id, product_id, listing_id, owned, checkpoint
+    )
+    await verify_etsy_mockups(
+        etsy, listing_id, template, images_to_upload, await etsy.inventory(listing_id),
+        image_ids=image_ids, downloader=download_etsy_image,
+        evidence_writer=evidence_writer, checkpoint=checkpoint,
     )
     matching = await _exact_title_listings(etsy, listing.title)
     if len([item for item in matching if item.get("state") == "active"]) != 1:

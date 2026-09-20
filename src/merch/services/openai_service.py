@@ -12,6 +12,7 @@ from PIL import Image
 from pydantic import BaseModel
 
 from merch.config import Settings
+from merch.domain.artwork_recovery import RecoveryContext
 from merch.domain.ip_screening import weighted_concept_score
 from merch.domain.prepress import make_fixture_art
 from merch.prompts import (
@@ -300,25 +301,73 @@ class OpenAIService:
     async def revise_brief(
         self, concept: CandidateConcept, brief: CreativeBrief, issues: list[QAIssue],
         shirt_colors: list[str],
+        *, recovery_context: RecoveryContext | None = None,
     ) -> ModelResult[CreativeBrief]:
+        context = recovery_context or RecoveryContext(attempt=1, strategy="targeted")
         prompt = BRIEF_REWRITE_PROMPT.format(
             concept=concept.model_dump_json(indent=2),
             brief=brief.model_dump_json(indent=2),
             issues=json.dumps([issue.model_dump(mode="json") for issue in issues]),
             shirt_colors=json.dumps(shirt_colors),
+            recovery_context=json.dumps(context.to_dict()),
         )
         if self.client:
-            return await self._parse(
+            result = await self._parse(
                 prompt, CreativeBrief,
                 reasoning_effort=self.settings.openai_creative_reasoning_effort,
             )
-        revised = brief.model_copy(update={
-            "generation_brief": (
-                brief.generation_brief + " Simplify the silhouette and eliminate: "
-                + "; ".join(issue.message for issue in issues)
-            ),
-        })
-        return ModelResult(revised, self._fake_metadata("brief_rewrite", prompt))
+            return ModelResult(
+                result.value, {**result.metadata, "recovery_context": context.to_dict()}
+            )
+        if context.strategy == "structural_simplification":
+            composition = (
+                "Open centered arrangement with a clear primary motif and separate supporting "
+                "motifs. Remove enclosing frames and rings, optional repeated elements, and "
+                "decorative marks. Keep wide printable gaps and clear anatomy."
+            )
+            visual_concept = (
+                f"An unframed illustration of the {concept.concept_name} theme for "
+                f"{concept.target_customer}, with distinct primary motifs and restrained detail."
+            )
+            generation_brief = (
+                f"Create an original {concept.graphic_style} illustration of the "
+                f"{concept.concept_name} theme. Use one clear primary motif with separate "
+                "supporting shapes, open spacing, and plausible anatomy where relevant. "
+                "Omit enclosing frames, optional repeats, and extra decoration. "
+                "Use clean opaque colors on a transparent background, without text or texture."
+            )
+        else:
+            composition = (
+                "Balanced centered arrangement of the selected theme's primary motifs. "
+                "Separate subjects and limbs with open printable gaps; correct overlaps "
+                "and unclear anatomy while retaining the recognizable visual idea."
+            )
+            visual_concept = concept.visual_concept
+            generation_brief = (
+                f"Create an original illustration of: {concept.visual_concept}. "
+                "Resolve overlaps and unclear anatomy through clean, distinct shapes with "
+                "printable strokes and gaps. Use opaque colors on a transparent background, "
+                "without text, texture, or extra outlines."
+            )
+        updates: dict[str, Any] = {
+            "composition": composition,
+            "visual_concept": visual_concept,
+            "generation_brief": generation_brief,
+            "shirt_colors": list(shirt_colors),
+        }
+        effect_codes = {issue.code.upper() for issue in issues}
+        if effect_codes & {"TYPOGRAPHY_LAYOUT", "TYPOGRAPHY_READABILITY"}:
+            updates["typography_style"] = "bold readable straight lettering with generous spacing"
+        if "DISTRESS_PRINTABILITY" in effect_codes:
+            updates["artwork_distress_level"] = 0
+        revised = brief.model_copy(update=updates)
+        return ModelResult(
+            revised,
+            {
+                **self._fake_metadata("brief_rewrite", prompt),
+                "recovery_context": context.to_dict(),
+            },
+        )
 
     async def typography(self, slogan: str, brief: CreativeBrief) -> ModelResult[TypographySpec]:
         prompt = TYPOGRAPHY_PROMPT.format(slogan=slogan, brief=brief.model_dump_json(indent=2))
@@ -428,10 +477,7 @@ class OpenAIService:
             slogan=brief.slogan or "",
             effects=json.dumps(effects or {}),
             shirt_colors=brief.shirt_colors,
-            width=deterministic.width,
-            height=deterministic.height,
-            revision=deterministic.revision,
-            has_alpha=deterministic.has_alpha,
+            deterministic=deterministic.model_dump_json(indent=2),
         )
         if self.client:
             return await self._parse(prompt, QAReport, image=image)

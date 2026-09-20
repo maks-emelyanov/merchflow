@@ -1,6 +1,25 @@
 from __future__ import annotations
 
-PROMPT_VERSION = "2026-09-18.5"
+PROMPT_VERSION = "2026-09-19.1"
+
+PIPELINE_CAPABILITIES = """
+Production capabilities and responsibilities:
+- The illustration deliverable is a transparent raster PNG, not a vector master.
+  Do not require vector paths, exact path coordinates, physical print proofs, or
+  unavailable production evidence. Describe visible shapes and spacing instead.
+- Application prepress owns final print dimensions, resolution, color profile,
+  exact slogan typesetting, and any selected distress effects. Request clean
+  source illustration, without lettering or baked-in distress.
+- The product catalog owns garment variants and the final approved shirt-color
+  assortment. Artwork palette colors are distinct from garment colors: a limited
+  ink palette must never become a three-color product or another garment limit.
+- Original illustrated people are allowed when the concept calls for them.
+  Do not generate a photographed wearer, shirt mockup, or product model scene.
+  Preserve plausible anatomy and visibly separate limbs and separate subjects.
+- Use clean opaque shapes with printable strokes and open gaps. Separate motifs
+  may remain separate; do not merge all subjects into a single silhouette.
+  Outlines are optional and justified by a visible contrast need, never mandatory.
+"""
 
 RESEARCH_PROMPT = """
 You are the market research and product strategy agent for a US print-on-demand
@@ -62,7 +81,7 @@ Concept:
 {concept}
 """
 
-CREATIVE_PROMPT = """
+CREATIVE_PROMPT = PIPELINE_CAPABILITIES + """
 Act as an apparel creative director. Convert this selected original concept into a
 precise professional creative brief. The design must read in one second, work in
 DTG, avoid tiny detail, avoid identifiable styles or protected properties, and use
@@ -97,18 +116,18 @@ Slogan: {slogan}
 Creative brief: {brief}
 """
 
-ARTWORK_PROMPT = """
+ARTWORK_PROMPT = PIPELINE_CAPABILITIES + """
 Create only the isolated illustration component for a premium, commercially viable
-DTG T-shirt graphic. Do not show a shirt, person, model, room, mockup, poster
+DTG T-shirt graphic. Do not show a shirt, photographed wearer, room, mockup, poster
 background, scenery, words, letters, pseudo-writing, signature, logo, or watermark.
 The artwork must fill about 75-80% of the canvas width while keeping at least 6%
-transparent padding on every side. Make one strong centered silhouette with bold,
-clean, opaque shapes, crisp edges, and the supplied limited palette. Use no canvas
+transparent padding on every side. Make a balanced centered composition with bold,
+clean, opaque shapes, crisp edges, clear separation, and the supplied limited palette. Use no canvas
 texture, mottled fills, speckles, stray pixels, gradients, translucent shading,
 thin hatch marks, or hairline details. Important strokes and gaps must remain
-thick and open at T-shirt print size. Give dark colored elements both a light
-outer keyline and a dark inner edge so the graphic reads on light and dark shirt
-colors. Create an original work without imitating an artist, brand, character,
+thick and open at T-shirt print size. Use the palette and open space to maintain
+readability on the approved shirt colors; add an outline only where necessary.
+Create an original work without imitating an artist, brand, character,
 franchise, or existing shirt. Background genuinely transparent.
 Even if the brief requests distress, render a clean illustration: prepress adds
 the selected worn-print effect afterward.
@@ -117,18 +136,26 @@ Creative brief:
 {brief}
 """
 
-QA_PROMPT = """
+QA_PROMPT = PIPELINE_CAPABILITIES + """
 Perform prepress visual QA for this T-shirt artwork. Check immediate readability,
 coherence, apparel suitability, exact visible slogan, artifacts, pseudo-text, fine
 detail, contrast, muddy colors, negative space, protected content, and brief match.
-Pass only if production ready. Dimensions and color-profile facts are supplied and
-must be copied accurately.
+Pass only if production ready. Check plausible anatomy for illustrated people.
+Judge visible defects in the supplied artwork, not hypothetical defects or
+unavailable vector masters or physical proofs. If the brief demands unsupported
+deliverables, exact path coordinates, or a conflicting garment-variant limit,
+report an error with code BRIEF_CONTRACT and recommend correcting the brief.
+Do not turn such a conflict into an illustration defect or waive any real defect.
+Report actual anatomy, readability, contrast, and printability failures separately.
+The complete deterministic report below is authoritative for width, height,
+revision, has_alpha, and color_profile: copy those facts accurately and retain
+its error findings. Do not invent missing-profile errors when it reports sRGB.
 
 Creative brief: {brief}
 Exact slogan: {slogan}
 Applied print effects: {effects}
 Shirt colors: {shirt_colors}
-Width: {width}; height: {height}; revision: {revision}; has alpha: {has_alpha}
+Deterministic QA report: {deterministic}
 For a contrast error limited to specific shirt colors, use code GARMENT_CONTRAST
 and put each affected color's exact name from the shirt-color list in
 affected_shirt_colors. Set affected_shirt_colors to [] for every other issue.
@@ -215,26 +242,41 @@ Creative brief: {brief}
 Draft listings: {drafts}
 """
 
-REVISION_PROMPT = """
+REVISION_PROMPT = PIPELINE_CAPABILITIES + """
 Edit only the illustration layer to resolve the listed QA issues while preserving
-the original concept, palette, transparency, and centered composition. Fill about
+the selected theme, audience, design mode, exact slogan, palette, and transparency.
+Preserve identity, not defective geometry: reposition or separate motifs and
+repair anatomy, overlaps, or spacing as needed. Keep a balanced centered layout.
+Fill about
 75-80% of the canvas width with at least 6% transparent padding. Use only crisp,
 opaque, flat-color shapes with thick printable features and clean separation;
-remove texture, fringes, speckles, gradients and translucent shading. Add a light
-outer keyline and dark inner edge where needed to read on both light and dark
-garments. Include no text, letters, pseudo-writing, logo, signature, or watermark.
+remove texture, fringes, speckles, gradients and translucent shading. Use outlines
+only to correct an identified contrast defect. Include no text, letters,
+pseudo-writing, logo, signature, or watermark.
 
 Creative brief: {brief}
 Issues: {issues}
 """
 
-BRIEF_REWRITE_PROMPT = """
+BRIEF_REWRITE_PROMPT = PIPELINE_CAPABILITIES + """
 Rewrite the apparel creative brief to solve the failed print and visual QA issues.
 Keep the selected concept, audience, motivation, exact slogan, and design mode.
-Change the composition and generation instructions materially; simplify shapes,
-remove overlaps and fine detail, and retain a strong centered original silhouette.
+Treat these as immutable identity; optional details, motif counts, frames, and
+layout geometry may change. The recovery context provides the strategy and prior
+failed artwork versions; use that history rather than repeating failed fixes.
+For targeted recovery, replace contradictory requirements and make concrete edits
+to solve the findings while retaining the workable parts of the visual idea.
+For structural_simplification, write a fresh compact replacement brief for new
+artwork generation. Replace BOTH composition and generation_brief, removing their
+old layout instructions completely; appending a repair paragraph is unacceptable.
+Remove enclosing frames and rings, give primary motifs separate open space,
+reduce optional repeated elements, and eliminate unnecessary decoration. Simplify
+visual_concept too when it contains the defective layout or an optional count.
+State the new arrangement directly, with a clear visual hierarchy and printable
+gaps. Never preserve failed geometry merely because it appears in the old brief.
 Do not introduce new characters, brands, text, or protected imagery. Use only the
-listed garment colors and keep the art suitable for DTG printing.
+listed garment colors and keep the art suitable for DTG printing. Remove all
+unsupported production requirements and arbitrary garment-color restrictions.
 When the findings identify TYPOGRAPHY_LAYOUT, TYPOGRAPHY_READABILITY, or
 DISTRESS_PRINTABILITY, simplify typography_style and reduce or disable the
 relevant distress. Preserve the exact slogan. Keep the illustration source clean;
@@ -244,4 +286,5 @@ Selected concept: {concept}
 Current brief: {brief}
 Failed QA issues: {issues}
 Allowed garment colors: {shirt_colors}
+Recovery context: {recovery_context}
 """

@@ -11,10 +11,12 @@ from merch.config import Settings
 from merch.defaults import fixture_product_template
 from merch.schemas import Channel, PriceQuote
 from merch.services.etsy_publisher import mockup_plan
+from merch.services.mockup_verification import prepare_mockups
 from merch.services.storefront import (
     EtsyStorefrontClient,
     StorefrontVerificationError,
     build_etsy_selector_inventory,
+    normalize_etsy_inventory_dependencies,
     plan_etsy_variation_images,
     printify_listing_id,
     remap_etsy_variation_images,
@@ -118,6 +120,60 @@ def test_selected_variant_controls_printify_default_and_native_featured_photo() 
         verify_featured_image([{"listing_image_id": 22, "rank": 2}], 22)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gallery", ["over_etsy_limit", "missing_nonfeatured"])
+async def test_general_product_verification_does_not_require_an_etsy_gallery(gallery: str) -> None:
+    template, quotes, product, _ = _fixtures()
+    if gallery == "over_etsy_limit":
+        template = template.model_copy(update={
+            "variants": [
+                template.variants[0].model_copy(update={
+                    "variant_id": 1001 + index, "color": f"Color {index}",
+                })
+                for index in range(21)
+            ],
+        })
+        quotes = [
+            quotes[0].model_copy(update={"channel": Channel.SHOPIFY, "variant_id": variant.variant_id})
+            for variant in template.variants
+        ]
+        product["variants"] = [
+            {"id": variant.variant_id, "is_enabled": True,
+             "is_default": variant.variant_id == 1001, "price": 2599}
+            for variant in template.variants
+        ]
+        product["images"] = [
+            {"mockup_id": f"product_{variant.variant_id}_front", "position": "front",
+             "src": f"https://images.printify.com/{variant.variant_id}.jpg"}
+            for variant in template.variants
+        ]
+        expected_error = "at most 20"
+    else:
+        quotes = [quote.model_copy(update={"channel": Channel.SHOPIFY}) for quote in quotes]
+        product["images"] = [image for image in product["images"]
+                             if image["mockup_id"] == "product_1001_front"]
+        expected_error = "no unambiguous front mockup"
+    template = template.model_copy(update={"channels": [template.channels[0]]})
+    assert verify_printify_product(product, template, quotes) == next(
+        image["src"] for image in product["images"] if image["mockup_id"] == "product_1001_front"
+    )
+
+    async def unexpected_download(url: str) -> tuple[bytes, str]:
+        pytest.fail(f"Etsy gallery selection must reject before downloading {url}")
+
+    with pytest.raises(StorefrontVerificationError, match=expected_error):
+        await prepare_mockups(product, template, downloader=unexpected_download)
+
+
+def test_general_product_verification_requires_the_rendered_featured_variant() -> None:
+    template, quotes, product, _ = _fixtures()
+    product["images"] = [{
+        **product["images"][0], "variant_ids": [variant.variant_id for variant in template.variants],
+    }]
+    with pytest.raises(StorefrontVerificationError, match="no unambiguous front mockup"):
+        verify_printify_product(product, template, quotes)
+
+
 def test_storefront_falls_back_to_color_and_size_when_skus_are_absent() -> None:
     template, quotes, product, inventory = _fixtures()
     for variant in product["variants"]:
@@ -219,6 +275,164 @@ def test_etsy_selector_update_rejects_unknown_variations() -> None:
         build_etsy_selector_inventory(inventory)
     with pytest.raises(StorefrontVerificationError, match="selectors must be named"):
         verify_etsy_selector_labels(inventory)
+
+
+@pytest.mark.parametrize("price_properties", [[400], []])
+def test_selector_normalization_expands_dependencies_without_changing_offerings(
+    price_properties: list[int],
+) -> None:
+    _, _, _, inventory = _inventory_with_printify_labels()
+    inventory.update(
+        price_on_property=price_properties,
+        quantity_on_property=[300],
+        readiness_state_on_property=[],
+    )
+    if not price_properties:
+        for product in inventory["products"]:
+            product["offerings"][0]["price"]["amount"] = 2599
+    before = deepcopy(inventory)
+
+    payload, mapping = build_etsy_selector_inventory(inventory)
+
+    assert mapping == {300: 514, 400: 513}
+    assert payload["price_on_property"] == ([513, 514] if price_properties else [])
+    assert payload["quantity_on_property"] == payload["sku_on_property"] == [513, 514]
+    assert payload["readiness_state_on_property"] == []
+    assert inventory == before
+    for original, normalized in zip(before["products"], payload["products"], strict=True):
+        assert normalized["sku"] == original["sku"]
+        old_offer = original["offerings"][0]
+        assert normalized["offerings"] == [{
+            "price": old_offer["price"]["amount"] / 100,
+            "quantity": old_offer["quantity"],
+            "is_enabled": old_offer["is_enabled"],
+            "readiness_state_id": old_offer["readiness_state_id"],
+        }]
+
+
+@pytest.mark.parametrize("variable", [True, False])
+def test_selector_normalization_derives_price_dependency_from_enabled_offerings(variable: bool) -> None:
+    _, _, _, inventory = _inventory_with_printify_labels()
+    # Deliberately supply stale metadata opposite to the actual enabled prices.
+    inventory["price_on_property"] = [] if variable else [300, 400]
+    if not variable:
+        for product in inventory["products"]:
+            product["offerings"][0]["price"]["amount"] = 2599
+    disabled = deepcopy(inventory["products"][0])
+    disabled["sku"] = "disabled-variant"
+    disabled["offerings"][0].update({"is_enabled": False, "price": {
+        "amount": 9999, "divisor": 100, "currency_code": "USD",
+    }})
+    inventory["products"].append(disabled)
+    before = deepcopy(inventory)
+
+    payload, _ = build_etsy_selector_inventory(inventory)
+
+    assert payload["price_on_property"] == ([513, 514] if variable else [])
+    assert inventory == before
+    assert {
+        item["sku"]: round(item["offerings"][0]["price"] * 100)
+        for item in payload["products"]
+    } == {
+        item["sku"]: item["offerings"][0]["price"]["amount"]
+        for item in before["products"]
+    }
+
+
+@pytest.mark.parametrize("products", [
+    None, [], [{}], [{"offerings": []}],
+    [{"offerings": [{"is_enabled": True}]}],
+    [{"offerings": [{"is_enabled": True, "price": "unavailable"}]}],
+])
+def test_partial_inventory_retains_declared_dependencies(products) -> None:  # type: ignore[no-untyped-def]
+    payload = {"products": products, "price_on_property": [513], "sku_on_property": [513, 514]}
+    normalized = normalize_etsy_inventory_dependencies(payload)
+    assert normalized["price_on_property"] == [513, 514]
+    assert normalized["products"] == products
+
+
+@pytest.mark.asyncio
+async def test_etsy_inventory_error_preserves_validation_detail_and_http_compatibility() -> None:
+    api_error = (
+        "price_on_property: unsupported number of property IDs. Supports only zero or all 2 "
+        "variation properties, as at least one *_on_property field is linked to all 2 properties."
+    )
+    settings = Settings(
+        etsy_api_key="private-key", etsy_shared_secret="private-secret",
+        etsy_access_token="private-token", etsy_shop_id=42,
+    )
+    response: httpx.Response | None = None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal response
+        response = httpx.Response(400, json={
+            "error": api_error,
+            "request_body": "PRIVATE INVENTORY BODY",
+            "authorization": request.headers["Authorization"],
+        }, request=request)
+        return response
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.etsy.com/v3"
+    ) as http:
+        client = EtsyStorefrontClient(settings, client=http)
+        with pytest.raises(httpx.HTTPStatusError) as raised:
+            await client.update_inventory(7, {"products": []})
+    assert raised.value.response is response
+    assert raised.value.request.method == "PUT"
+    assert str(raised.value) == f"Etsy update inventory failed (HTTP 400): {api_error}"
+    assert "PRIVATE INVENTORY BODY" not in str(raised.value)
+    assert "private-token" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("structured", [True, False])
+async def test_etsy_api_errors_are_bounded_and_redact_secrets(structured: bool) -> None:
+    settings = Settings(
+        etsy_api_key="private-key", etsy_shared_secret="private-secret",
+        etsy_access_token="private-token", etsy_refresh_token="private-refresh",
+        etsy_shop_id=42,
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if not structured:
+            return httpx.Response(502, text="<html>PRIVATE PROXY BODY</html>", request=request)
+        return httpx.Response(400, json={
+            "error": "Invalid request\nprivate-key private-secret private-token private-refresh",
+            "error_description": "Bearer unrecognized-secret https://example.invalid/?key=other-secret",
+            "errors": [
+                {"message": "access_token=rotated-example refresh_token='other-example' "
+                 '"client_secret": "unconfigured-secret" Authorization: Basic encoded-example '
+                 "X-API-Key=unconfigured-key"},
+                {"message": "Invalid variation " + "x" * 2000},
+            ],
+            "debug": "PRIVATE DEBUG BODY",
+        }, request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.etsy.com/v3"
+    ) as http:
+        client = EtsyStorefrontClient(settings, client=http)
+        with pytest.raises(httpx.HTTPStatusError) as raised:
+            await client.create_draft({"title": "PRIVATE REQUEST TITLE"})
+    message = str(raised.value)
+    assert "Etsy create draft failed (HTTP " in message
+    assert len(message) <= 1100
+    assert "\n" not in message
+    for secret in (
+        "private-key", "private-secret", "private-token", "private-refresh",
+        "unrecognized-secret", "other-secret", "PRIVATE", "<html>",
+        "rotated-example", "other-example", "unconfigured-secret", "encoded-example",
+        "unconfigured-key",
+    ):
+        assert secret not in message
+    if structured:
+        assert "Invalid request" in message
+        assert "Invalid variation" in message
+        assert "[REDACTED]" in message
+        assert message.endswith("...")
+    else:
+        assert message == "Etsy create draft failed (HTTP 502)"
 
 
 @pytest.mark.asyncio
@@ -338,6 +552,25 @@ async def test_publish_verification_repairs_selector_labels_and_preserves_photos
         yield object()
 
     fake_etsy = FakeEtsy()
+    from merch.services.mockup_verification import PreparedMockup
+
+    async def prepared(*args, **kwargs):  # type: ignore[no-untyped-def]
+        return [PreparedMockup(color, source, None, b"unused", "image/jpeg")
+                for color, source in mockup_plan(product, template)]
+
+    async def checked(*args, **kwargs):  # type: ignore[no-untyped-def]
+        # This test isolates inventory-label migration; real pixels are checked in
+        # test_mockup_pipeline for both native publication and resumed saved IDs.
+        return {"featured_image_id": 9, "image_ids": {"Black": 71},
+                "photo_count": 1, "color_photo_links": 1}
+
+    def checkpoint(run_id, **updates):  # type: ignore[no-untyped-def]
+        updates.pop("allow_completed", None)
+        publish_record.response_data.update(updates)
+
+    monkeypatch.setattr("merch.pipeline.prepare_mockups", prepared)
+    monkeypatch.setattr("merch.pipeline.verify_etsy_mockups", checked)
+    monkeypatch.setattr("merch.pipeline._checkpoint_etsy_publish", checkpoint)
     monkeypatch.setattr("merch.pipeline.EtsyStorefrontClient", lambda *args, **kwargs: fake_etsy)
     monkeypatch.setattr("merch.pipeline.RunRepository", FakeRepository)
     monkeypatch.setattr("merch.pipeline.session_scope", fake_session_scope)

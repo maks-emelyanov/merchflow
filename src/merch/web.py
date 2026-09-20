@@ -248,6 +248,17 @@ def _load_run(db: Session, run_id: str) -> RunRecord:
     return record
 
 
+def _mockup_evidence(response: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    response = response or {}
+    report = response.get("mockup_verification") or {}
+    entries: dict[str, dict[str, Any]] = {}
+    for entry in [*(response.get("mockup_manifest") or []), *(report.get("checks") or [])]:
+        color = str(entry.get("color") or "")
+        if color:
+            entries.setdefault(color, {"color": color}).update(entry)
+    return entries
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     configure_logging()
@@ -399,6 +410,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     or settings.etsy_production_partner_check_enabled
                 ),
                 "featured_variant": product_template.featured_variant().title,
+                "mockup_evidence": {
+                    item.channel: list(_mockup_evidence(item.response_data).values())
+                    for item in run.publishes if item.channel == Channel.ETSY.value
+                },
                 "csrf_token": csrf_token(request),
             },
         )
@@ -555,6 +570,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def get_run(request: Request, run_id: str, db: DatabaseSession) -> dict[str, Any]:
         require_admin(request)
         return _run_payload(_load_run(db, run_id))
+
+    @app.get("/api/runs/{run_id}/mockup-evidence/{side}")
+    async def mockup_evidence_image(
+        request: Request, run_id: str, side: str, db: DatabaseSession, color: str = "",
+    ) -> Response:
+        require_admin(request)
+        if side not in {"source", "actual"}:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Mockup evidence not found")
+        run = _load_run(db, run_id)
+        publish = next((item for item in run.publishes if item.channel == Channel.ETSY.value), None)
+        entry = _mockup_evidence(publish.response_data if publish else None).get(color, {})
+        object_key = entry.get(f"{side}_object_key")
+        content_type = entry.get(f"{side}_content_type")
+        if not object_key or content_type not in {"image/png", "image/jpeg"}:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Mockup evidence not found")
+        try:
+            data = ArtifactStorage(settings).get(object_key)
+        except Exception as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Mockup evidence not found") from exc
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != entry.get(f"{side}_sha256"):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Mockup evidence not found")
+        return Response(data, media_type=content_type, headers={
+            "ETag": f'"{digest}"', "Cache-Control": "private, no-store",
+        })
 
     @app.put("/api/runs/{run_id}/package")
     async def edit_package(
