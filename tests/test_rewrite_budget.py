@@ -152,6 +152,11 @@ async def test_rejected_rewrites_consume_budget_including_legacy_versions(
     isolated_app: Path, monkeypatch: pytest.MonkeyPatch, version: int,
 ) -> None:
     run_id, original = await failed_run(version)
+    # Slogan-bearing artwork has a final deterministic typography fallback.
+    # Keep this test focused on the ordinary no-fallback budget path.
+    original = original.model_copy(update={"slogan": None})
+    with session_scope() as session:
+        RunRepository(session).get(run_id).creative_brief = original.model_dump(mode="json")
     contexts: list[RecoveryContext] = []
 
     async def reject(

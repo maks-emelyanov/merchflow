@@ -92,7 +92,7 @@
 </section>{% endif %}
 
 {% if run.status == 'awaiting_approval' and manual_review_required %}
-<section class="approval panel"><p class="eyebrow">Human release gate</p><h2>Approve exact version {{ run.version }}</h2><p>Featured listing image: <strong>{{ featured_variant }}</strong>. Select only the channels you intend to publish. The approval is invalidated if artwork, copy, pricing, costs, or channel selection changes.</p>
+<section class="approval panel"><p class="eyebrow">Human release gate</p><h2>Approve exact version {{ run.version }}</h2>{% if emergency_design_review %}<p class="warning"><strong>Design review required:</strong> automatic recovery replaced the selected illustrated concept with emergency typography. Confirm that the final composition, hierarchy, formatting, and brand distinctiveness are genuinely storefront-ready.</p>{% endif %}<p>Featured listing image: <strong>{{ featured_variant }}</strong>. Select only the channels you intend to publish. The approval is invalidated if artwork, copy, pricing, costs, or channel selection changes.</p>
   <form id="approval-form" data-run-id="{{ run.id }}" data-version="{{ run.version }}" data-csrf="{{ csrf_token }}">
     <div class="checks"><label><input type="checkbox" name="channel" value="shopify"> Shopify</label><label><input type="checkbox" name="channel" value="etsy"> Etsy</label><label><input type="checkbox" name="channel" value="amazon_us"> Amazon US</label></div>
     {% if ip_check_enabled %}<label class="attest"><input type="checkbox" id="ip-attested" required> I reviewed the evidence and attest that I accept responsibility for IP clearance.</label>{% endif %}
@@ -130,7 +130,7 @@
     </tbody></table>
     {% endif %}
     {% endif %}
-    {% if item.status in ('failed', 'reconciliation_required') and run.status in ('failed', 'partially_published', 'verification_required') %}<button type="button" class="retry-channel" data-run-id="{{ run.id }}" data-channel="{{ item.channel }}" data-csrf="{{ csrf_token }}">Retry verification</button>{% endif %}
+    {% if item.status in ('failed', 'reconciliation_required') and run.status in ('failed', 'partially_published', 'verification_required') and not (item.channel == 'etsy' and artwork_replacement_reconciliation_required) %}<button type="button" class="retry-channel" data-run-id="{{ run.id }}" data-channel="{{ item.channel }}" data-csrf="{{ csrf_token }}">Retry verification</button>{% endif %}
   </article>
   {% endfor %}
 </div></section>

@@ -13,6 +13,10 @@ from alembic.config import Config
 from argon2 import PasswordHasher
 
 from alembic import command
+from merch.artwork_replacement import (
+    reconcile_published_artwork,
+    replace_published_artwork_file,
+)
 from merch.config import get_settings
 from merch.copy_refresh import prepare_copy_refresh_batch
 from merch.database import get_engine, session_scope
@@ -138,6 +142,62 @@ def repair_etsy_listing(run_id: str) -> None:
     """Recheck a completed Etsy run and set its selectors to Size and Color."""
     listing_id = asyncio.run(repair_published_etsy_listing(run_id))
     typer.echo(f"verified Etsy listing {listing_id}: Size, Color")
+
+
+@app.command("replace-published-artwork")
+def replace_published_artwork_command(
+    run_id: str,
+    artwork_file: Annotated[Path, typer.Option("--artwork-file")],
+    apply: Annotated[bool, typer.Option("--apply")] = False,
+    confirm: Annotated[str | None, typer.Option("--confirm")] = None,
+    quality_attestation: Annotated[
+        Path | None, typer.Option("--quality-attestation")
+    ] = None,
+    mockup_timeout_seconds: Annotated[
+        float, typer.Option("--mockup-timeout-seconds", min=30, max=3600)
+    ] = 600,
+    mockup_interval_seconds: Annotated[
+        float, typer.Option("--mockup-interval-seconds", min=1, max=60)
+    ] = 5,
+) -> None:
+    """Preflight or replace artwork on the existing Printify/Etsy product in place."""
+    try:
+        result = asyncio.run(
+            replace_published_artwork_file(
+                run_id,
+                artwork_file,
+                apply=apply,
+                confirmation=confirm,
+                quality_attestation_file=quality_attestation,
+                mockup_timeout_seconds=mockup_timeout_seconds,
+                mockup_interval_seconds=mockup_interval_seconds,
+            )
+        )
+    except (ValueError, RuntimeError, OSError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(result, indent=2))
+
+
+@app.command("reconcile-published-artwork")
+def reconcile_published_artwork_command(
+    run_id: str,
+    apply: Annotated[bool, typer.Option("--apply")] = False,
+    confirm: Annotated[str | None, typer.Option("--confirm")] = None,
+) -> None:
+    """Inspect or safely finish a failed published-artwork replacement."""
+    try:
+        result = asyncio.run(
+            reconcile_published_artwork(
+                run_id,
+                apply=apply,
+                confirmation=confirm,
+            )
+        )
+    except (ValueError, RuntimeError, OSError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(result, indent=2))
 
 
 @app.command("prepare-copy-refresh")

@@ -56,6 +56,9 @@ build-backend = "hatchling.build"
 packages = ["src/merch"]
 
 [tool.hatch.build.targets.sdist]
+exclude = [
+  "/tools/compose_kiln_weather_redesign.py",
+]
 only-include = [
   ".dockerignore",
   ".env.example",

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 from uuid import UUID
 
+from PIL import ImageColor
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -16,6 +18,44 @@ from pydantic import (
 )
 
 Score = Annotated[int, Field(ge=0, le=100)]
+MAX_SLOGAN_CHARS = 240
+
+_CSS_HEX_COLOR = re.compile(
+    r"#[0-9A-Fa-f]{8}\b|#[0-9A-Fa-f]{6}\b|#[0-9A-Fa-f]{4}\b|#[0-9A-Fa-f]{3}\b"
+)
+
+
+def normalize_opaque_color(value: object) -> str:
+    """Normalize one Pillow color or the first embedded hex color to opaque RGB."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("color must be a nonempty string")
+    candidate = value.strip()
+    match = _CSS_HEX_COLOR.search(candidate)
+    if match is not None:
+        candidate = match.group()
+    try:
+        red, green, blue, alpha = cast(
+            tuple[int, int, int, int], ImageColor.getcolor(candidate, "RGBA")
+        )
+    except ValueError as exc:
+        raise ValueError("color must be a concrete CSS color or contain a hex color") from exc
+    if alpha != 255:
+        raise ValueError("color must be fully opaque")
+    return f"#{red:02X}{green:02X}{blue:02X}"
+
+
+def normalize_slogan(value: object) -> str | None:
+    """Keep approved wording while removing unusable blank hard-line boundaries."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("slogan must be text or null")
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in normalized.split("\n") if line.strip()]
+    result = "\n".join(lines) or None
+    if result is not None and len(result) > MAX_SLOGAN_CHARS:
+        raise ValueError(f"slogan must be at most {MAX_SLOGAN_CHARS} characters")
+    return result
 
 
 class StrictModel(BaseModel):
@@ -130,6 +170,11 @@ class CandidateConcept(StrictModel):
     evidence: list[Evidence]
     strategy: ConceptStrategy | None = None
 
+    @field_validator("slogan_if_any", mode="before")
+    @classmethod
+    def slogan_has_printable_lines(cls, value: object) -> str | None:
+        return normalize_slogan(value)
+
 
 class ResearchReport(StrictModel):
     current_date: date
@@ -179,8 +224,13 @@ class CreativeBrief(StrictModel):
     artwork_distress_level: int = Field(default=0, ge=0, le=5)
     strategy: ConceptStrategy | None = None
 
+    @field_validator("slogan", mode="before")
+    @classmethod
+    def slogan_has_printable_lines(cls, value: object) -> str | None:
+        return normalize_slogan(value)
 
-class TypographySpec(StrictModel):
+
+class TypographyProposal(StrictModel):
     exact_text: str
     font_category: Literal["sans", "serif", "slab", "display", "mono"] = "sans"
     font_weight: Annotated[int, Field(ge=100, le=900)] = 700
@@ -195,12 +245,34 @@ class TypographySpec(StrictModel):
     distress_level: int = Field(ge=0, le=5)
     primary_color: str
     secondary_color: str | None
+    vertical_placement: Literal["top", "center", "bottom"] = "center"
     interaction_with_illustration: str
     relative_width: float = Field(gt=0, le=1)
     relative_height: float = Field(gt=0, le=1)
 
+
+class TypographySpec(TypographyProposal):
+    line_breaks: Annotated[list[str], Field(min_length=1)]
+
+    @field_validator("primary_color", mode="before")
+    @classmethod
+    def primary_color_is_opaque_hex(cls, value: object) -> str:
+        return normalize_opaque_color(value)
+
+    @field_validator("outline", "shadow", "secondary_color", mode="before")
+    @classmethod
+    def optional_colors_are_opaque_hex(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        try:
+            return normalize_opaque_color(value)
+        except ValueError:
+            return None
+
     @model_validator(mode="after")
     def text_is_exact(self) -> TypographySpec:
+        if any(not line.strip() for line in self.line_breaks):
+            raise ValueError("every slogan line must contain printable text")
         if " ".join(self.line_breaks) != self.exact_text.replace("\n", " "):
             raise ValueError("line breaks must preserve the exact slogan")
         return self

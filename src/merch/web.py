@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session, selectinload
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.middleware.sessions import SessionMiddleware
 
+from merch.artwork_replacement import has_unresolved_artwork_replacement
 from merch.config import Settings, get_settings
 from merch.copy_refresh import (
     approve_copy_refresh_batch,
@@ -404,6 +405,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         product_template = publication_template(
             product_template, run.excluded_shirt_colors or [], run.publication_template_snapshot
         )
+        emergency_design_review = RunRepository(db).has_current_audit_action(
+            run_id, "artwork.typography_fallback", run.version
+        )
         return templates.TemplateResponse(
             request=request,
             name="run.html",
@@ -415,12 +419,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     settings.manual_approval_enabled
                     or settings.ip_check_enabled
                     or settings.etsy_production_partner_check_enabled
+                    or emergency_design_review
                 ),
+                "emergency_design_review": emergency_design_review,
                 "featured_variant": product_template.featured_variant().title,
                 "mockup_evidence": {
                     item.channel: list(_mockup_evidence(item.response_data).values())
                     for item in run.publishes if item.channel == Channel.ETSY.value
                 },
+                "artwork_replacement_reconciliation_required": any(
+                    item.channel == Channel.ETSY.value
+                    and has_unresolved_artwork_replacement(item.response_data)
+                    for item in run.publishes
+                ),
                 "csrf_token": csrf_token(request),
             },
         )
@@ -726,6 +737,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             retryable = next(
                 (item for item in run.publishes if item.channel == channel.value), None
             )
+            if (
+                channel == Channel.ETSY
+                and retryable is not None
+                and has_unresolved_artwork_replacement(retryable.response_data)
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Published artwork replacement requires the dedicated "
+                    "reconcile-published-artwork command",
+                )
             if (
                 run.status not in {
                     RunStatus.PARTIALLY_PUBLISHED.value,

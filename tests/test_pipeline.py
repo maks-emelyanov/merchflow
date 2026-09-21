@@ -19,7 +19,7 @@ from merch.domain.product_options import (
     full_color_publication_template,
     publication_template,
 )
-from merch.models import Base, ProductMappingRecord, ProductTemplateRecord
+from merch.models import AuditEvent, Base, ProductMappingRecord, ProductTemplateRecord
 from merch.pipeline import (
     ApprovalInvalid,
     _qa_with_color_replacements,
@@ -80,7 +80,7 @@ def test_product_template_can_be_replaced_without_overwriting_history(isolated_a
 
 
 @pytest.mark.asyncio
-async def test_automatic_brief_rewrites_stop_after_eight_and_keep_concept(
+async def test_automatic_brief_rewrites_end_in_one_safe_typography_fallback(
     isolated_app, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("merch.domain.prepress.MAX_GENERATION_EDGE", 512)
@@ -111,12 +111,17 @@ async def test_automatic_brief_rewrites_stop_after_eight_and_keep_concept(
         )
 
     monkeypatch.setattr(OpenAIService, "revise_brief", rewrite)
-    failed_qa = QAReport(
-        passed=False, revision=1, issues=[
-            QAIssue(code="OVERLAP", severity="error", message="Shapes overlap")
-        ], width=400, height=500, has_alpha=True, color_profile="RGBA",
-    )
     for version in range(1, 10):
+        code = "TYPOGRAPHY_LAYOUT" if version == 9 else "OVERLAP"
+        failed_qa = QAReport(
+            passed=False,
+            revision=1,
+            issues=[QAIssue(code=code, severity="error", message="Artwork failed QA")],
+            width=400,
+            height=500,
+            has_alpha=True,
+            color_profile="RGBA",
+        )
         with session_scope() as session:
             repo = RunRepository(session)
             run = repo.get(run_id, full=True)
@@ -134,17 +139,116 @@ async def test_automatic_brief_rewrites_stop_after_eight_and_keep_concept(
             run.qa_report = None
             run.status = RunStatus.AWAITING_BRIEF_REVISION.value
         outcome = await rewrite_failed_brief_run(run_id)
-        assert outcome == (
-            RunStatus.PENDING.value if version <= 8 else RunStatus.AWAITING_BRIEF_REVISION.value
+        assert outcome == RunStatus.PENDING.value
+    with session_scope() as session:
+        repo = RunRepository(session)
+        run = repo.get(run_id, full=True)
+        assert run.version == 10
+        fallback_artifact = repo.add_artifact(
+            run_id, kind="production-v10", revision=1,
+            object_key=f"fixture-production-{run_id}-10", sha256="1" * 64,
+            width=400, height=500, metadata={"qa": failed_qa.model_dump(mode="json")},
         )
+        assert fallback_artifact.kind == "production-v10"
+        run.qa_report = None
+        run.status = RunStatus.AWAITING_BRIEF_REVISION.value
+    assert await rewrite_failed_brief_run(run_id) == RunStatus.AWAITING_BRIEF_REVISION.value
     with session_scope() as session:
         run = RunRepository(session).get(run_id, full=True)
-        assert run.version == 9
+        assert run.version == 10
         assert run.creative_brief["concept_name"] == concept_name
         assert run.creative_brief["slogan"] == slogan
+        assert run.creative_brief["design_mode"] == DesignMode.HYBRID.value
+        assert run.typography_spec["exact_text"] == slogan
+        assert run.typography_spec["text_arc_or_shape"] == "none"
         assert len([call for call in run.provider_calls if call["stage"] == "brief_rewrite"]) == 8
         assert not run.approvals and not run.publishes
+        fallback_events = list(session.query(AuditEvent).filter_by(
+            run_id=run_id, action="artwork.safe_layout_fallback"
+        ))
+        assert len(fallback_events) == 1
+        assert fallback_events[0].detail["trigger"] == "rewrite_budget_exhausted"
     assert calls == 8
+
+
+@pytest.mark.asyncio
+async def test_repeated_typography_failures_pivot_before_spending_rewrite_budget(
+    isolated_app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("merch.domain.prepress.MAX_GENERATION_EDGE", 512)
+    monkeypatch.setattr("merch.domain.prepress.MAX_GENERATION_PIXELS", 262_144)
+    Base.metadata.create_all(get_engine())
+    with session_scope() as session:
+        ConfigurationRepository(session).save_template(
+            fixture_product_template().model_copy(update={"print_width": 400, "print_height": 500})
+        )
+    value = RunInput(run_id=uuid4(), scheduled_for=datetime.now(UTC), manual=False)
+    await run_fixture_pipeline(value, get_settings())
+    run_id = str(value.run_id)
+    calls = 0
+
+    async def rewrite(self, concept, brief, issues, colors, *, recovery_context=None):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return ModelResult(
+            brief.model_copy(update={
+                "composition": "Illustration above a separate straight footer.",
+                "generation_brief": "Draw one compact isolated motif in the upper region only.",
+            }),
+            {"model": "fixture", "estimated_cost_usd": 0.25},
+        )
+
+    monkeypatch.setattr(OpenAIService, "revise_brief", rewrite)
+    for version, code in (
+        (1, "TYPOGRAPHY_LAYOUT"),
+        (2, "TYPOGRAPHY_READABILITY"),
+    ):
+        failed_qa = QAReport(
+            passed=False,
+            revision=1,
+            issues=[QAIssue(code=code, severity="error", message="Text and art collide")],
+            width=400,
+            height=500,
+            has_alpha=True,
+            color_profile="sRGB",
+        )
+        with session_scope() as session:
+            repo = RunRepository(session)
+            run = repo.get(run_id, full=True)
+            assert run.version == version
+            artifact = next(
+                (item for item in run.artifacts if item.kind == f"production-v{version}"), None
+            )
+            if artifact is None:
+                artifact = repo.add_artifact(
+                    run_id,
+                    kind=f"production-v{version}",
+                    revision=1,
+                    object_key=f"typography-failure-{run_id}-{version}",
+                    sha256=str(version) * 64,
+                    width=400,
+                    height=500,
+                    metadata={},
+                )
+            artifact.metadata_json = {
+                **artifact.metadata_json,
+                "qa": failed_qa.model_dump(mode="json"),
+            }
+            run.qa_report = None
+            run.status = RunStatus.AWAITING_BRIEF_REVISION.value
+        assert await rewrite_failed_brief_run(run_id) == RunStatus.PENDING.value
+
+    with session_scope() as session:
+        run = RunRepository(session).get(run_id, full=True)
+        assert run.version == 3
+        assert run.creative_brief["design_mode"] == DesignMode.HYBRID.value
+        assert run.typography_spec["exact_text"] == run.creative_brief["slogan"]
+        fallback = session.query(AuditEvent).filter_by(
+            run_id=run_id, action="artwork.safe_layout_fallback"
+        ).one()
+        assert fallback.detail["trigger"] == "repeated_typography_layout_failure"
+        assert fallback.detail["rewrite_attempts_used"] == 1
+    assert calls == 1
 
 
 @pytest.mark.asyncio
@@ -581,6 +685,60 @@ async def test_complete_mocked_pipeline_has_automatic_release_and_optional_manua
         assert all(item.status == "dry_run" for item in run.publishes)
 
 
+def test_typography_fallback_requires_human_design_review(isolated_app) -> None:
+    Base.metadata.create_all(get_engine())
+    value = RunInput(run_id=uuid4(), scheduled_for=datetime.now(UTC), manual=False)
+    run_id = str(value.run_id)
+    with session_scope() as session:
+        ConfigurationRepository(session).save_template(fixture_product_template())
+        repo = RunRepository(session)
+        run = repo.create(value, f"scheduled-{run_id}")
+        run.status = RunStatus.AWAITING_APPROVAL.value
+        run.qa_report = {"passed": True}
+        run.listings = {"listings": [{"fixture": True}]}
+        run.price_quotes = [{"fixture": True}]
+        repo.audit(
+            run_id,
+            "worker",
+            "artwork.typography_fallback",
+            {"reason": "focused approval-safety fixture"},
+        )
+
+    assert automatic_approval_signal(run_id) is None
+    stale_system_signal = ApprovalSignal(
+        channels=[Channel.ETSY],
+        expected_version=1,
+        ip_attested=False,
+        actor="system",
+    )
+    with pytest.raises(ApprovalInvalid, match="requires human design review"):
+        record_approval(run_id, stale_system_signal)
+
+
+def test_safe_layout_fallback_remains_eligible_for_automatic_release(isolated_app) -> None:
+    Base.metadata.create_all(get_engine())
+    value = RunInput(run_id=uuid4(), scheduled_for=datetime.now(UTC), manual=False)
+    run_id = str(value.run_id)
+    with session_scope() as session:
+        ConfigurationRepository(session).save_template(fixture_product_template())
+        repo = RunRepository(session)
+        run = repo.create(value, f"scheduled-{run_id}")
+        run.status = RunStatus.AWAITING_APPROVAL.value
+        run.qa_report = {"passed": True}
+        run.listings = {"listings": [{"fixture": True}]}
+        run.price_quotes = [{"fixture": True}]
+        repo.audit(
+            run_id,
+            "worker",
+            "artwork.safe_layout_fallback",
+            {"reason": "focused automatic-recovery fixture"},
+        )
+
+    signal = automatic_approval_signal(run_id)
+    assert signal is not None
+    assert signal.actor == "system"
+
+
 def test_enabled_ip_check_requires_attestation(isolated_app) -> None:
     settings = get_settings().model_copy(update={"ip_check_enabled": True})
     Base.metadata.create_all(get_engine())
@@ -1002,7 +1160,10 @@ async def test_effected_artwork_reaches_approval_and_retries_reuse_it(
     async def typography(self, slogan, brief):  # type: ignore[no-untyped-def]
         result = await original_typography(self, slogan, brief)
         spec = result.value.model_copy(update={
-            "text_arc_or_shape": "up", "distress_level": 3,
+            "line_breaks": ["TAKE THE", "SCENIC ROUTE"],
+            "relative_height": 0.30,
+            "text_arc_or_shape": "up",
+            "distress_level": 3,
         })
         return ModelResult(spec, result.metadata)
 
@@ -1354,6 +1515,64 @@ async def test_live_etsy_publish_waits_for_storefront_verification_and_retries_w
     monkeypatch.setattr(PrintifyClient, "product", existing_product)
     assert await publish_channel_run(run_id, Channel.ETSY, settings) == PublishStatus.SUCCEEDED
     assert publish_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_channel_rejects_unresolved_artwork_replacement_before_provider_call(
+    isolated_app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    Base.metadata.create_all(get_engine())
+    value = RunInput(run_id=uuid4(), scheduled_for=datetime.now(UTC), manual=True)
+    await run_fixture_pipeline(value, get_settings())
+    run_id = str(value.run_id)
+    with session_scope() as session:
+        repo = RunRepository(session)
+        run = repo.get(run_id)
+        run.status = RunStatus.VERIFICATION_REQUIRED.value
+        publish = repo.publish_record(run_id, Channel.ETSY.value, "old-fingerprint")
+        publish.status = PublishStatus.RECONCILIATION_REQUIRED.value
+        publish.artwork_upload_id = "old-upload"
+        publish.printify_product_id = "product-1"
+        publish.external_product_id = "99"
+        publish.response_data = {
+            "artwork_replacement": {
+                "operation_id": "replacement-operation",
+                "status": "failed",
+                "stage": "reconciliation_required",
+            }
+        }
+
+    provider_calls: list[str] = []
+
+    async def validate(self, template):  # type: ignore[no-untyped-def]
+        provider_calls.append("validate")
+        return template
+
+    async def upload(self, filename, data):  # type: ignore[no-untyped-def]
+        provider_calls.append("upload")
+        return {"id": "unexpected-upload"}
+
+    async def create(self, shop_id, payload):  # type: ignore[no-untyped-def]
+        provider_calls.append("create")
+        return {"id": "unexpected-product"}
+
+    async def publish(self, shop_id, product_id):  # type: ignore[no-untyped-def]
+        provider_calls.append("publish")
+        return {"status": "accepted"}
+
+    monkeypatch.setattr(PrintifyClient, "validate_template", validate)
+    monkeypatch.setattr(PrintifyClient, "upload_image", upload)
+    monkeypatch.setattr(PrintifyClient, "create_product", create)
+    monkeypatch.setattr(PrintifyClient, "publish", publish)
+
+    with pytest.raises(
+        ApprovalInvalid,
+        match="dedicated reconcile-published-artwork command",
+    ):
+        await publish_channel_run(run_id, Channel.ETSY)
+
+    assert provider_calls == []
 
 
 @pytest.mark.asyncio

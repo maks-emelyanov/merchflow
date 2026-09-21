@@ -18,7 +18,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 from merch.domain.fonts import resolve_font, svg_uses_font
 from merch.schemas import QAIssue, TypographySpec
 
-RENDERER_VERSION = "print-effects-2"
+RENDERER_VERSION = "print-effects-3"
 ARC_RADIANS = math.pi / 3
 
 
@@ -158,6 +158,7 @@ def typography_layer(
         "font_size": 0,
         "requested_letter_spacing": spec.letter_spacing,
         "applied_letter_spacing": spec.letter_spacing if rsvg else 0,
+        "vertical_placement": spec.vertical_placement,
     }
     canvas = Image.new("RGBA", size)
     try:
@@ -178,7 +179,12 @@ def typography_layer(
         if not spec.line_breaks or any(not line.strip() for line in spec.line_breaks):
             raise ValueError("Every slogan line must contain printable text")
         max_width = max(1, int(size[0] * min(0.96, spec.relative_width)))
-        max_height = max(1, int(size[1] * min(0.96, spec.relative_height)))
+        height_fraction = (
+            min(0.30, spec.relative_height)
+            if spec.vertical_placement in {"top", "bottom"}
+            else min(0.96, spec.relative_height)
+        )
+        max_height = max(1, int(size[1] * height_fraction))
         font = _font(font_file, 100)
         longest = max(font.getlength(line) for line in spec.line_breaks) / 100
         font_size = max(24, min(512, math.ceil(max_width * 1.5 / max(1, longest))))
@@ -218,7 +224,12 @@ def typography_layer(
             "center": (size[0] - fitted.width) // 2,
             "right": left + max_width - fitted.width,
         }[spec.text_alignment]
-        y_position = (size[1] - fitted.height) // 2
+        edge_margin = max(1, round(size[1] * 0.06))
+        y_position = {
+            "top": edge_margin,
+            "center": (size[1] - fitted.height) // 2,
+            "bottom": size[1] - edge_margin - fitted.height,
+        }[spec.vertical_placement]
         canvas.alpha_composite(fitted, (x, y_position))
         metadata.update(
             applied_arc=spec.text_arc_or_shape,
@@ -352,6 +363,29 @@ def apply_design_effects(
     if typography:
         text_layer, typography_metadata, issues = typography_layer(
             canvas.size, typography, font_family, font_file
+        )
+    illustration_alpha = canvas.getchannel("A").point(lambda value: 255 if value >= 64 else 0)
+    text_alpha = text_layer.getchannel("A").point(lambda value: 255 if value >= 64 else 0)
+    overlap = ImageChops.darker(illustration_alpha, text_alpha)
+    text_pixels = text_alpha.histogram()[255]
+    overlap_pixels = overlap.histogram()[255]
+    overlap_fraction = overlap_pixels / text_pixels if text_pixels else 0.0
+    typography_metadata["overlap_fraction"] = round(overlap_fraction, 6)
+    if (
+        typography
+        and typography.vertical_placement in {"top", "bottom"}
+        and overlap_fraction > 0.01
+    ):
+        issues.append(
+            QAIssue(
+                code="TYPOGRAPHY_LAYOUT",
+                severity="error",
+                message="Rendered typography overlaps the illustration layer.",
+                recommended_fix=(
+                    "Place the text in a reserved top or bottom band and keep the illustration "
+                    "inside the complementary region."
+                ),
+            )
         )
     scope = (
         "design"

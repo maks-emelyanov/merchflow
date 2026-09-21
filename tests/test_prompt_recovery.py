@@ -14,8 +14,10 @@ from merch.prompts import (
     BRIEF_REWRITE_PROMPT,
     CREATIVE_PROMPT,
     PIPELINE_CAPABILITIES,
+    PROMPT_VERSION,
     QA_PROMPT,
     REVISION_PROMPT,
+    TYPOGRAPHY_PROMPT,
 )
 from merch.schemas import CandidateConcept, CreativeBrief, QAIssue, QAReport
 from merch.services.openai_service import OpenAIService
@@ -45,6 +47,15 @@ def test_artwork_stages_share_actual_pipeline_capabilities(prompt: str) -> None:
     assert "Give dark colored elements both a light" not in prompt
 
 
+def test_typography_prompt_declares_deterministic_text_color_and_placement_contract() -> None:
+    assert PROMPT_VERSION == "2026-09-21.2"
+    assert "literal LF newline" in TYPOGRAPHY_PROMPT
+    assert "mandatory hard line boundary" in TYPOGRAPHY_PROMPT
+    assert "fully opaque #RRGGBB" in TYPOGRAPHY_PROMPT
+    assert "center vertical_placement" in TYPOGRAPHY_PROMPT
+    assert "bottom vertical_placement" in TYPOGRAPHY_PROMPT
+
+
 def test_visual_qa_requires_brief_correction_and_retains_real_failures() -> None:
     assert "BRIEF_CONTRACT" in QA_PROMPT
     assert "Do not turn such a conflict into an illustration defect or waive any real defect" in (
@@ -52,6 +63,21 @@ def test_visual_qa_requires_brief_correction_and_retains_real_failures() -> None
     )
     assert "actual anatomy, readability, contrast, and printability failures separately" in QA_PROMPT
     assert "retain\nits error findings" in QA_PROMPT
+
+
+def test_creative_and_visual_qa_require_distinctive_hierarchy_and_formatting() -> None:
+    assert "one unmistakable focal element" in CREATIVE_PROMPT
+    assert "concept-specific visual detail" in ARTWORK_PROMPT
+    assert "Technical correctness alone is not enough" in QA_PROMPT
+    for code in (
+        "COMPOSITION_HIERARCHY",
+        "TYPOGRAPHY_FORMATTING",
+        "BRAND_DISTINCTIVENESS",
+        "CONCEPT_DILUTION",
+    ):
+        assert code in QA_PROMPT
+    assert "material recomposition" in REVISION_PROMPT
+    assert "plain word stack, generic badge, stock icon" in BRIEF_REWRITE_PROMPT
 
 
 @pytest.mark.asyncio

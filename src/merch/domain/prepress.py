@@ -106,9 +106,26 @@ def prepare_artwork(
             fit_fraction = 0.88
     else:
         fit_fraction = 0.88
+    placement = typography.vertical_placement if typography else "center"
+    if placement in {"top", "bottom"}:
+        text_height = min(0.30, typography.relative_height) if typography else 0.0
+        reserved_fraction = min(0.38, max(0.20, text_height + 0.08))
+        outer_margin = round(target_height * 0.05)
+        separation = round(target_height * 0.04)
+        if placement == "bottom":
+            region_top = outer_margin
+            region_bottom = round(target_height * (1 - reserved_fraction)) - separation
+        else:
+            region_top = round(target_height * reserved_fraction) + separation
+            region_bottom = target_height - outer_margin
+        height_limit = max(1, round((region_bottom - region_top) * 0.92))
+    else:
+        region_top, region_bottom = 0, target_height
+        height_limit = max(1, round(target_height * fit_fraction))
+    width_limit = max(1, round(target_width * fit_fraction))
     source_scale = min(
-        target_width * fit_fraction / image.width,
-        target_height * fit_fraction / image.height,
+        width_limit / image.width,
+        height_limit / image.height,
     )
     used_realesrgan = False
     if source_scale > 1.5 and realesrgan_binary and realesrgan_binary.exists():
@@ -141,17 +158,20 @@ def prepare_artwork(
         except httpx.HTTPError, OSError, ValueError:
             used_realesrgan = False
     scale = min(
-        target_width * fit_fraction / image.width,
-        target_height * fit_fraction / image.height,
+        width_limit / image.width,
+        height_limit / image.height,
     )
     image = image.resize(
         (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
         Image.Resampling.LANCZOS,
     )
     canvas = Image.new("RGBA", (target_width, target_height), (0, 0, 0, 0))
-    canvas.alpha_composite(
-        image, ((target_width - image.width) // 2, (target_height - image.height) // 2)
+    image_position = (
+        (target_width - image.width) // 2,
+        region_top + (region_bottom - region_top - image.height) // 2,
     )
+    canvas.alpha_composite(image, image_position)
+    illustration_bounds = list(canvas.getchannel("A").getbbox() or ())
     use_registry = font_family == DEFAULT_FONT_FAMILY and font_file == DEFAULT_FONT_FILE
     canvas, effects, issues = apply_design_effects(
         canvas,
@@ -160,6 +180,13 @@ def prepare_artwork(
         font_family=None if use_registry else font_family,
         font_file=None if use_registry else font_file,
     )
+    effects["layout"] = {
+        "typography_placement": placement,
+        "illustration_region": [0, region_top, target_width, region_bottom],
+        "illustration_bounds": illustration_bounds,
+        "text_bounds": effects.get("typography", {}).get("bounds"),
+        "overlap_fraction": effects.get("typography", {}).get("overlap_fraction", 0.0),
+    }
     profile = bytearray(ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes())
     # LCMS inserts the current time in the ICC header. Use a fixed creation date
     # so identical clean artwork and effects produce identical PNG hashes.
@@ -293,6 +320,7 @@ def deterministic_qa(
     used_realesrgan: bool = False,
     expected_text: str | None = None,
     rendered_text: str | None = None,
+    enforce_composition_scale: bool = False,
 ) -> QAReport:
     image = Image.open(io.BytesIO(data)).convert("RGBA")
     issues: list[QAIssue] = []
@@ -327,6 +355,24 @@ def deterministic_qa(
             QAIssue(code="empty", severity="error", message="Artwork is fully transparent")
         )
     else:
+        visible_width = (bbox[2] - bbox[0]) / image.width
+        visible_height = (bbox[3] - bbox[1]) / image.height
+        visible_area = visible_width * visible_height
+        if enforce_composition_scale and visible_area < 0.10:
+            issues.append(
+                QAIssue(
+                    code="COMPOSITION_SCALE",
+                    severity="error",
+                    message=(
+                        "The visible design occupies too little of the printable canvas "
+                        f"({visible_width:.1%} wide by {visible_height:.1%} tall)."
+                    ),
+                    recommended_fix=(
+                        "Increase the visual hierarchy and print presence; rebalance line breaks "
+                        "or restore a concept-specific illustration before publication."
+                    ),
+                )
+            )
         pad_x = min(bbox[0], image.width - bbox[2]) / image.width
         pad_y = min(bbox[1], image.height - bbox[3]) / image.height
         if min(pad_x, pad_y) < 0.02:

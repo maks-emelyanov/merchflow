@@ -14,6 +14,7 @@ import httpx
 from pydantic import SecretStr
 from sqlalchemy import select
 
+from merch.artwork_replacement import has_unresolved_artwork_replacement
 from merch.config import Settings, get_settings
 from merch.copy_refresh import effective_approved_listing
 from merch.database import session_scope
@@ -22,8 +23,10 @@ from merch.domain.artwork_recovery import (
     ArtworkFailure,
     RecoveryStrategy,
     build_recovery_context,
+    build_safe_layout_fallback,
     normalize_issue_family,
     structural_rewrite_is_material,
+    typography_fallback_required,
     unsupported_brief_requirement_codes,
 )
 from merch.domain.featured_color import (
@@ -70,6 +73,7 @@ from merch.schemas import (
     RunInput,
     RunStatus,
     SelectionDecision,
+    TypographyProposal,
     TypographySpec,
 )
 from merch.services.analytics import (
@@ -86,7 +90,7 @@ from merch.services.mockup_verification import (
     prepare_mockups,
     verify_etsy_mockups,
 )
-from merch.services.openai_service import ModelResult, OpenAIService
+from merch.services.openai_service import ModelResult, OpenAIService, canonicalize_typography
 from merch.services.printify import (
     AmbiguousCreateError,
     PrintifyClient,
@@ -509,6 +513,7 @@ async def _qa_with_color_replacements(
                         used_realesrgan=used_realesrgan,
                         expected_text=brief.slogan,
                         rendered_text=rendered_text,
+                        enforce_composition_scale=True,
                     )
                     bad_swatches = {
                         color.casefold()
@@ -644,9 +649,16 @@ async def generate_package_run(
             repo = RunRepository(session)
             repo.get(run_id).creative_brief = brief.model_dump(mode="json")
             _record_call(repo, run_id, "creative", creative)
-    typography: TypographySpec | None = (
-        TypographySpec.model_validate(saved_typography) if saved_typography else None
-    )
+    typography: TypographySpec | None = None
+    if saved_typography:
+        if brief.slogan:
+            typography = canonicalize_typography(
+                brief.slogan,
+                brief,
+                TypographyProposal.model_validate(saved_typography),
+            )
+        else:
+            typography = TypographySpec.model_validate(saved_typography)
     if brief.slogan and typography is None:
         typography_result = await ai.typography(brief.slogan, brief)
         typography = typography_result.value
@@ -767,6 +779,7 @@ async def generate_package_run(
                 used_realesrgan=prepared.used_realesrgan,
                 expected_text=brief.slogan,
                 rendered_text=typography.exact_text if typography else None,
+                enforce_composition_scale=True,
             )
             if prepared.issues:
                 raw_deterministic = raw_deterministic.model_copy(update={
@@ -1044,13 +1057,6 @@ async def rewrite_failed_brief_run(run_id: str, settings: Settings | None = None
             for prior_attempt in attempts:
                 if prior_attempt.detail.get("outcome") == "started":
                     prior_attempt.detail = {**prior_attempt.detail, "outcome": "interrupted"}
-            if used_attempts >= settings.max_brief_rewrites:
-                repo.status(
-                    run_id, RunStatus.AWAITING_BRIEF_REVISION,
-                    f"Automatic brief rewrite budget exhausted ({settings.max_brief_rewrites} attempts); "
-                    "artwork still requires a passing brief and QA",
-                )
-                return RunStatus.AWAITING_BRIEF_REVISION.value
             previous_strategy: RecoveryStrategy | None = (
                 "structural_simplification" if any(
                     event.detail.get("recovery_context", {}).get("strategy") == "structural_simplification"
@@ -1082,6 +1088,62 @@ async def rewrite_failed_brief_run(run_id: str, settings: Settings | None = None
             version = run.version
             effects = latest.metadata_json.get("artwork_effects")
             typography_spec = latest.metadata_json.get("typography_spec") or run.typography_spec
+            fallback_applied = session.scalar(select(AuditEvent.id).where(
+                AuditEvent.run_id == run_id,
+                AuditEvent.action.in_([
+                    "artwork.safe_layout_fallback",
+                    "artwork.typography_fallback",
+                ]),
+            )) is not None
+            if fallback_applied:
+                repo.status(
+                    run_id,
+                    RunStatus.AWAITING_BRIEF_REVISION,
+                    "Automatic safe-layout fallback failed QA; manual review is required",
+                )
+                return RunStatus.AWAITING_BRIEF_REVISION.value
+            budget_exhausted = used_attempts >= settings.max_brief_rewrites
+            if typography_fallback_required(
+                failures,
+                brief=brief,
+                budget_exhausted=budget_exhausted,
+            ):
+                fallback_brief, fallback_typography = build_safe_layout_fallback(
+                    brief, allowed_colors
+                )
+                run.version += 1
+                run.creative_brief = fallback_brief.model_dump(mode="json")
+                run.typography_spec = fallback_typography.model_dump(mode="json")
+                run.qa_report = None
+                run.listings = None
+                run.listing_generation_state = None
+                run.price_quotes = None
+                run.excluded_shirt_colors = None
+                run.publication_template_snapshot = None
+                trigger = (
+                    "rewrite_budget_exhausted"
+                    if budget_exhausted
+                    else "repeated_typography_layout_failure"
+                )
+                repo.status(run_id, RunStatus.PENDING, "Automatic safe-layout fallback ready")
+                repo.audit(run_id, "worker", "artwork.safe_layout_fallback", {
+                    "from_version": version,
+                    "to_version": run.version,
+                    "trigger": trigger,
+                    "rewrite_attempts_used": used_attempts,
+                    "previous_brief": brief.model_dump(mode="json"),
+                    "fallback_brief": fallback_brief.model_dump(mode="json"),
+                    "typography_spec": fallback_typography.model_dump(mode="json"),
+                    "failure_history": [item.to_dict() for item in context.history],
+                })
+                return RunStatus.PENDING.value
+            if budget_exhausted:
+                repo.status(
+                    run_id, RunStatus.AWAITING_BRIEF_REVISION,
+                    f"Automatic brief rewrite budget exhausted ({settings.max_brief_rewrites} attempts); "
+                    "artwork still requires a passing brief and QA",
+                )
+                return RunStatus.AWAITING_BRIEF_REVISION.value
             rewrite_issues = list(qa.issues)
             if attempts and attempts[-1].detail.get("rejection_reason"):
                 rewrite_issues.append(QAIssue(
@@ -1199,6 +1261,12 @@ def record_approval(run_id: str, signal: ApprovalSignal, settings: Settings | No
             raise ApprovalInvalid("run is not awaiting approval")
         if record.version != signal.expected_version:
             raise ApprovalInvalid("approval version no longer matches the review package")
+        if signal.actor == "system" and repo.has_current_audit_action(
+            run_id, "artwork.typography_fallback", record.version
+        ):
+            raise ApprovalInvalid(
+                "emergency typography fallback requires human design review"
+            )
         if signal.actor == "system" and (
             settings.manual_approval_enabled
             or settings.ip_check_enabled
@@ -1267,6 +1335,10 @@ def automatic_approval_signal(
         run = repo.get(run_id)
         if run.status != RunStatus.AWAITING_APPROVAL.value:
             raise ApprovalInvalid("run is not ready for automatic release")
+        if repo.has_current_audit_action(
+            run_id, "artwork.typography_fallback", run.version
+        ):
+            return None
         if not (run.qa_report or {}).get("passed") or not run.listings or not run.price_quotes:
             raise ApprovalInvalid("automatic release requires a passing completed package")
         template = (
@@ -1895,6 +1967,15 @@ async def publish_channel_run(
         art = storage.get(latest_artifact.object_key)
         existing = next((item for item in run.publishes if item.channel == channel.value), None)
         if (
+            channel == Channel.ETSY
+            and existing is not None
+            and has_unresolved_artwork_replacement(existing.response_data)
+        ):
+            raise ApprovalInvalid(
+                "Published artwork replacement requires the dedicated "
+                "reconcile-published-artwork command"
+            )
+        if (
             existing
             and existing.printify_product_id
             and existing.status
@@ -1940,6 +2021,14 @@ async def publish_channel_run(
         with session_scope() as session:
             session.scalar(select(RunRecord.id).where(RunRecord.id == run_id).with_for_update())
             publish = RunRepository(session).publish_record(run_id, channel.value, fingerprint)
+            if (
+                channel == Channel.ETSY
+                and has_unresolved_artwork_replacement(publish.response_data)
+            ):
+                raise ApprovalInvalid(
+                    "Published artwork replacement requires the dedicated "
+                    "reconcile-published-artwork command"
+                )
             if publish.status in {PublishStatus.SUCCEEDED.value, PublishStatus.DRY_RUN.value}:
                 return PublishStatus(publish.status)
             # A retry may have progressed while validation or upload was in flight.

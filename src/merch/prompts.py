@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-PROMPT_VERSION = "2026-09-20.1"
+PROMPT_VERSION = "2026-09-21.2"
 
 BRAND_DIRECTION = """
 Odd Hour Press makes smart, strange shirts for specific people: a micro-niche
@@ -144,6 +144,10 @@ precise professional creative brief. The design must read in one second, work in
 DTG, avoid tiny detail, avoid identifiable styles or protected properties, and use
 only shirt colors that appear in the supplied product template.
 Preserve the selected strategy, micro-niche identity and memorable premise.
+Specify a deliberate visual hierarchy: one unmistakable focal element, a
+subordinate supporting element or text block, and one premise-specific signature
+detail. The composition must use the printable area confidently and look designed
+for a shirt, not like a stock icon, a generic badge, or an unformatted word stack.
 Use the selected slogan_if_any verbatim as slogan, including any fictional
 institution name or tagline. Do not invent, replace, or add printed wording.
 Carry strategy unchanged into the brief. Match the illustration and typography
@@ -164,9 +168,16 @@ Product template:
 
 TYPOGRAPHY_PROMPT = """
 Create an apparel typography specification for the exact slogan below. Preserve
-every character, spelling, punctuation, and capitalization. line_breaks must join
-with single spaces to exactly equal exact_text. Choose readable, reproducible
-layout attributes without resembling a protected wordmark.
+every character, spelling, punctuation, capitalization, and literal LF newline in
+exact_text. A literal LF in the supplied slogan is a mandatory hard line boundary:
+line_breaks may add soft wraps within either side but must never combine text across
+that boundary. line_breaks joined by single spaces must equal exact_text after each
+LF in exact_text is replaced by one space. Use center vertical_placement for
+typography-only designs and bottom vertical_placement for hybrid or illustrated designs.
+Choose readable, reproducible layout attributes without resembling a protected
+wordmark. primary_color and every non-null outline, shadow, or secondary_color must
+be one literal, fully opaque #RRGGBB value. Never return conditional color prose,
+transparent colors, or multiple alternatives in a color field.
 Supported font categories are sans (Noto Sans), serif (Noto Serif), slab (Roboto
 Slab), display (Noto Serif Display), and mono (Noto Sans Mono). Prefer font_weight
 400 or 700, the supplied static weights. Serif/display suit literary and vintage
@@ -187,6 +198,9 @@ ARTWORK_PROMPT = PIPELINE_CAPABILITIES + """
 Create only the isolated illustration component for a premium, commercially viable
 DTG T-shirt graphic. Do not show a shirt, photographed wearer, room, mockup, poster
 background, scenery, words, letters, pseudo-writing, signature, logo, or watermark.
+Give the artwork a clear dominant silhouette, intentional variation in scale, and
+at least one concept-specific visual detail that expresses the selected premise.
+Avoid generic clip-art arrangements and interchangeable decorative filler.
 The artwork must fill about 75-80% of the canvas width while keeping at least 6%
 transparent padding on every side. Make a balanced centered composition with bold,
 clean, opaque shapes, crisp edges, clear separation, and the supplied limited palette. Use no canvas
@@ -207,7 +221,16 @@ QA_PROMPT = PIPELINE_CAPABILITIES + """
 Perform prepress visual QA for this T-shirt artwork. Check immediate readability,
 coherence, apparel suitability, exact visible slogan, artifacts, pseudo-text, fine
 detail, contrast, muddy colors, negative space, protected content, and brief match.
-Pass only if production ready. Check plausible anatomy for illustrated people.
+Pass only if production ready. Technical correctness alone is not enough. Treat
+commercial design quality as blocking: require confident print presence, a clear
+focal hierarchy, intentional spacing, polished line breaks, and a distinctive
+concept-specific execution. Reject a generic stock-icon arrangement, a plain strip
+of same-scale text, weak or accidental hierarchy, awkwardly balanced lines, or a
+design whose premise is carried only by listing copy. Use COMPOSITION_HIERARCHY,
+TYPOGRAPHY_FORMATTING, BRAND_DISTINCTIVENESS, or CONCEPT_DILUTION as error codes
+for those findings. Judge the visible result itself; flattering prose in a recovery
+brief does not excuse a bland or under-designed artifact. Check plausible anatomy
+for illustrated people.
 Judge visible defects in the supplied artwork, not hypothetical defects or
 unavailable vector masters or physical proofs. If the brief demands unsupported
 deliverables, exact path coordinates, or a conflicting garment-variant limit,
@@ -320,6 +343,9 @@ Edit only the illustration layer to resolve the listed QA issues while preservin
 the selected theme, audience, design mode, exact slogan, palette, and transparency.
 Preserve identity, not defective geometry: reposition or separate motifs and
 repair anatomy, overlaps, or spacing as needed. Keep a balanced centered layout.
+For COMPOSITION_HIERARCHY, BRAND_DISTINCTIVENESS, or CONCEPT_DILUTION, make a
+material recomposition with a stronger premise-specific focal element and clearer
+scale hierarchy; cosmetic cleanup or generic decorative filler is insufficient.
 Fill about
 75-80% of the canvas width with at least 6% transparent padding. Use only crisp,
 opaque, flat-color shapes with thick printable features and clean separation;
@@ -356,6 +382,10 @@ When the findings identify TYPOGRAPHY_LAYOUT, TYPOGRAPHY_READABILITY, or
 DISTRESS_PRINTABILITY, simplify typography_style and reduce or disable the
 relevant distress. Preserve the exact slogan. Keep the illustration source clean;
 prepress owns the effects. The findings include the actual failed effect settings.
+When the findings identify COMPOSITION_HIERARCHY, TYPOGRAPHY_FORMATTING,
+BRAND_DISTINCTIVENESS, or CONCEPT_DILUTION, replace the weak composition with a
+premise-specific focal hierarchy and intentional text relationship. Do not solve
+these findings with a plain word stack, generic badge, stock icon, or extra clutter.
 
 Selected concept: {concept}
 Current brief: {brief}

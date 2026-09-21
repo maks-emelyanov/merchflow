@@ -16,4 +16,7 @@ test-results
 backups
 *.dump
 output
+.inspection
+assets/generated
+tools/compose_kiln_weather_redesign.py
 dist

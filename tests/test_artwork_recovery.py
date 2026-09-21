@@ -8,11 +8,13 @@ from merch.domain.artwork_recovery import (
     ArtworkFailure,
     RecoveryContext,
     build_recovery_context,
+    build_safe_layout_fallback,
     normalize_issue_family,
     structural_rewrite_is_material,
+    typography_fallback_required,
     unsupported_brief_requirement_codes,
 )
-from merch.schemas import CreativeBrief, QAIssue
+from merch.schemas import ConceptStrategy, CreativeBrief, DesignMode, QAIssue
 
 
 def _issue(code: str, *, warning: bool = False) -> QAIssue:
@@ -169,3 +171,148 @@ def test_structural_rewrite_can_remove_constraints_by_deleting_old_instructions(
         "composition": "Bold runners.", "generation_brief": "Draw bold running silhouettes.",
     })
     assert structural_rewrite_is_material(previous, revised)
+
+
+def test_repeated_typography_failures_select_provider_free_fallback() -> None:
+    brief = _brief().model_copy(update={
+        "slogan": "KILN WEATHER BUREAU\nHEAT ADVISORY IN EFFECT",
+        "design_mode": DesignMode.HYBRID,
+    })
+    failures = [
+        ArtworkFailure(1, 1, (_issue("TYPOGRAPHY_LAYOUT"),)),
+        ArtworkFailure(2, 1, (_issue("TYPOGRAPHY_READABILITY"),)),
+    ]
+    assert typography_fallback_required(
+        failures, brief=brief, budget_exhausted=False
+    )
+    assert not typography_fallback_required(
+        failures[:1], brief=brief, budget_exhausted=False
+    )
+
+
+def test_typography_formatting_counts_as_a_current_fallback_failure() -> None:
+    brief = _brief().model_copy(update={
+        "slogan": "THE EXACT WORDS",
+        "design_mode": DesignMode.HYBRID,
+    })
+    failures = [
+        ArtworkFailure(1, 1, (_issue("TYPOGRAPHY_LAYOUT"),)),
+        ArtworkFailure(2, 1, (_issue("TYPOGRAPHY_FORMATTING"),)),
+    ]
+
+    assert typography_fallback_required(
+        failures, brief=brief, budget_exhausted=False
+    )
+
+
+def test_stale_typography_failures_do_not_override_latest_unrelated_failure() -> None:
+    brief = _brief().model_copy(update={
+        "slogan": "THE EXACT WORDS",
+        "design_mode": DesignMode.HYBRID,
+    })
+    failures = [
+        ArtworkFailure(1, 1, (_issue("TYPOGRAPHY_LAYOUT"),)),
+        ArtworkFailure(2, 1, (_issue("TYPOGRAPHY_READABILITY"),)),
+        ArtworkFailure(3, 1, (_issue("ANATOMY"),)),
+    ]
+
+    assert not typography_fallback_required(
+        failures, brief=brief, budget_exhausted=True
+    )
+
+
+def test_budget_exhaustion_uses_fallback_only_for_current_typography_failure() -> None:
+    slogan_brief = _brief().model_copy(update={
+        "slogan": "THE EXACT WORDS",
+        "design_mode": DesignMode.HYBRID,
+    })
+    unrelated = [ArtworkFailure(8, 1, (_issue("ANATOMY"),))]
+    typography = [ArtworkFailure(8, 1, (_issue("TYPOGRAPHY_LAYOUT"),))]
+    assert not typography_fallback_required(
+        unrelated, brief=slogan_brief, budget_exhausted=True
+    )
+    assert typography_fallback_required(
+        typography, brief=slogan_brief, budget_exhausted=True
+    )
+    assert not typography_fallback_required(
+        [*typography, ArtworkFailure(9, 1, (_issue("ANATOMY"),))],
+        brief=slogan_brief,
+        budget_exhausted=True,
+    )
+    assert not typography_fallback_required(
+        typography, brief=_brief(), budget_exhausted=True
+    )
+    assert not typography_fallback_required(
+        typography,
+        brief=slogan_brief.model_copy(update={"design_mode": DesignMode.TYPOGRAPHY}),
+        budget_exhausted=True,
+    )
+    assert not typography_fallback_required(
+        typography, brief=slogan_brief, budget_exhausted=True, already_applied=True
+    )
+
+
+def test_safe_layout_fallback_preserves_identity_art_and_exact_text() -> None:
+    slogan = "KILN WEATHER BUREAU\nHEAT ADVISORY IN EFFECT"
+    original = _brief().model_copy(update={
+        "slogan": slogan,
+        "design_mode": DesignMode.HYBRID,
+        "strategy": ConceptStrategy(
+            micro_niche="Ceramicists managing kiln-firing anxiety",
+            premise="A studio treats firing temperature as a weather emergency.",
+            brand_connection="A fictional public bureau fits the brand.",
+            brand_fit=96,
+            shareability=87,
+            etsy_angle="Gift for a pottery-class friend.",
+            amazon_angle="Searchable pottery identity.",
+            shopify_angle="A maker-weather service bulletin.",
+        ),
+    })
+    fallback, typography = build_safe_layout_fallback(
+        original, ["Black", "Navy", "Natural"]
+    )
+    for field in (
+        "concept_name", "target_customer", "customer_motivation", "slogan", "strategy"
+    ):
+        assert getattr(fallback, field) == getattr(original, field)
+    assert fallback.design_mode == DesignMode.HYBRID
+    assert fallback.visual_concept == original.visual_concept
+    assert fallback.graphic_style == original.graphic_style
+    assert fallback.palette == original.palette
+    assert fallback.shirt_colors == ["Black", "Navy", "Natural"]
+    assert fallback.artwork_distress_level == 0
+    assert typography.exact_text == slogan
+    assert typography.line_breaks == [
+        "KILN WEATHER BUREAU", "HEAT ADVISORY", "IN EFFECT"
+    ]
+    assert typography.primary_color == "#E38D45"
+    assert typography.outline is None
+    assert typography.text_arc_or_shape == "none"
+    assert typography.vertical_placement == "bottom"
+    assert typography.distress_level == 0
+
+
+def test_safe_layout_fallback_balances_long_one_line_slogan_without_changing_text() -> None:
+    slogan = "CERAMIC EMERGENCY WEATHER OBSERVATION DEPARTMENT REPORTING FOR DUTY"
+    original = _brief().model_copy(update={
+        "slogan": slogan,
+        "design_mode": DesignMode.HYBRID,
+    })
+    _, typography = build_safe_layout_fallback(original, ["Black"])
+    assert len(typography.line_breaks) == 3
+    assert " ".join(typography.line_breaks) == slogan
+    assert typography.exact_text == slogan
+    assert typography.relative_height == pytest.approx(0.30)
+
+
+def test_safe_layout_fallback_keeps_descriptive_creative_palette() -> None:
+    original = _brief().model_copy(update={
+        "slogan": "KILN WEATHER",
+        "palette": ["burnt orange", "warm cream", "smoky navy"],
+    })
+
+    fallback, typography = build_safe_layout_fallback(original, ["Black"])
+
+    assert fallback.palette == original.palette
+    assert typography.primary_color == "#F4E6CC"
+    assert typography.outline == "#1A1F35"

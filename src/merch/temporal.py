@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -12,12 +14,18 @@ from temporalio.client import (
     Client,
     Schedule,
     ScheduleActionStartWorkflow,
+    ScheduleOverlapPolicy,
+    SchedulePolicy,
     ScheduleSpec,
     ScheduleState,
     ScheduleUpdate,
     ScheduleUpdateInput,
 )
-from temporalio.common import RetryPolicy
+from temporalio.common import (
+    RetryPolicy,
+    SearchAttributeKey,
+    WorkflowIDReusePolicy,
+)
 from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import WorkflowAlreadyStartedError
@@ -34,6 +42,8 @@ from merch.schemas import (
     RunInput,
     RunStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 with workflow.unsafe.imports_passed_through():
     from merch.copy_refresh import apply_copy_refresh_batch, prepare_copy_refresh_batch
@@ -69,6 +79,18 @@ ACTIVITY_RETRY = RetryPolicy(
         "ValueError",
     ],
 )
+
+DAILY_DESIGN_SCHEDULE_ID = "merch-daily-design"
+DAILY_ANALYTICS_SCHEDULE_ID = "merch-daily-analytics"
+DAILY_SCHEDULE_POLICY = SchedulePolicy(
+    overlap=ScheduleOverlapPolicy.BUFFER_ONE,
+    catchup_window=timedelta(hours=24),
+    pause_on_failure=False,
+)
+TEMPORAL_SCHEDULED_START_TIME = SearchAttributeKey.for_datetime(
+    "TemporalScheduledStartTime"
+)
+SCHEDULE_REPAIR_RETRY_SECONDS = 60
 
 
 async def temporal_client(settings: Settings | None = None) -> Client:
@@ -169,25 +191,35 @@ async def analytics_activity(_: str) -> dict[str, str]:
     return await sync_analytics()
 
 
-@activity.defn(name="launch_daily_workflow")
-async def launch_daily_activity(scheduled_iso: str) -> str:
-    scheduled = datetime.fromisoformat(scheduled_iso)
-    run_date = scheduled.astimezone(ZoneInfo(get_settings().schedule_timezone)).date().isoformat()
+async def _start_daily_workflow(
+    scheduled: datetime,
+    settings: Settings,
+    client: Client | None = None,
+) -> str:
+    run_date = scheduled.astimezone(ZoneInfo(settings.schedule_timezone)).date().isoformat()
     run_id = uuid5(NAMESPACE_URL, f"merch-daily-{run_date}")
     value = RunInput(run_id=run_id, scheduled_for=scheduled, manual=False)
     workflow_id = f"merch-daily-{run_date}"
     create_run(value, workflow_id)
-    client = await temporal_client()
+    client = client or await temporal_client(settings)
     try:
         await client.start_workflow(
             MerchWorkflow.run,
             value,
             id=workflow_id,
-            task_queue=get_settings().temporal_task_queue,
+            task_queue=settings.temporal_task_queue,
+            id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
         )
     except WorkflowAlreadyStartedError:
         pass
     return workflow_id
+
+
+@activity.defn(name="launch_daily_workflow")
+async def launch_daily_activity(scheduled_iso: str) -> str:
+    scheduled = datetime.fromisoformat(scheduled_iso)
+    settings = get_settings()
+    return await _start_daily_workflow(scheduled, settings)
 
 
 @activity.defn(name="prepare_copy_refresh")
@@ -489,11 +521,16 @@ class AnalyticsWorkflow:
 class DailyLauncherWorkflow:
     @workflow.run
     async def run(self) -> str:
+        scheduled = workflow.now()
+        if workflow.patched("daily-launcher-nominal-schedule-time-v1"):
+            scheduled = workflow.info().typed_search_attributes.get(
+                TEMPORAL_SCHEDULED_START_TIME
+            ) or scheduled
         return cast(
             str,
             await workflow.execute_activity(
                 "launch_daily_workflow",
-                workflow.now().isoformat(),
+                scheduled.isoformat(),
                 start_to_close_timeout=timedelta(minutes=2),
                 retry_policy=ACTIVITY_RETRY,
                 result_type=str,
@@ -671,11 +708,14 @@ async def retry_failed_artwork_run(
     return value
 
 
-async def reconcile_schedules(settings: Settings | None = None) -> None:
+async def reconcile_schedules(
+    settings: Settings | None = None,
+    client: Client | None = None,
+) -> None:
     settings = settings or get_settings()
-    client = await temporal_client(settings)
+    client = client or await temporal_client(settings)
     schedules = {
-        "merch-daily-design": Schedule(
+        DAILY_DESIGN_SCHEDULE_ID: Schedule(
             action=ScheduleActionStartWorkflow(
                 DailyLauncherWorkflow.run,
                 id="merch-daily-launcher",
@@ -685,9 +725,10 @@ async def reconcile_schedules(settings: Settings | None = None) -> None:
                 cron_expressions=[f"{settings.schedule_minute} {settings.workflow_hour} * * *"],
                 time_zone_name=settings.schedule_timezone,
             ),
+            policy=DAILY_SCHEDULE_POLICY,
             state=ScheduleState(note="Daily merch product development"),
         ),
-        "merch-daily-analytics": Schedule(
+        DAILY_ANALYTICS_SCHEDULE_ID: Schedule(
             action=ScheduleActionStartWorkflow(
                 AnalyticsWorkflow.run,
                 id="merch-analytics",
@@ -697,6 +738,7 @@ async def reconcile_schedules(settings: Settings | None = None) -> None:
                 cron_expressions=[f"{settings.schedule_minute} {settings.analytics_hour} * * *"],
                 time_zone_name=settings.schedule_timezone,
             ),
+            policy=DAILY_SCHEDULE_POLICY,
             state=ScheduleState(note="Daily marketplace analytics synchronization"),
         ),
     }
@@ -716,7 +758,55 @@ async def reconcile_schedules(settings: Settings | None = None) -> None:
         except RPCError as exc:
             if exc.status != RPCStatusCode.NOT_FOUND:
                 raise
-            await client.create_schedule(schedule_id, schedule)
+            try:
+                await client.create_schedule(schedule_id, schedule)
+            except RPCError as create_exc:
+                if create_exc.status != RPCStatusCode.ALREADY_EXISTS:
+                    raise
+
+
+def _today_scheduled_time(now: datetime, settings: Settings) -> datetime:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("Current time must include a timezone")
+    local_now = now.astimezone(ZoneInfo(settings.schedule_timezone))
+    return local_now.replace(
+        hour=settings.workflow_hour,
+        minute=settings.schedule_minute,
+        second=0,
+        microsecond=0,
+    ).astimezone(UTC)
+
+
+async def start_due_daily_run(
+    settings: Settings | None = None,
+    client: Client | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """Start today's missed design run after startup unless its schedule is paused."""
+    settings = settings or get_settings()
+    client = client or await temporal_client(settings)
+    description = await client.get_schedule_handle(DAILY_DESIGN_SCHEDULE_ID).describe()
+    if description.schedule.state.paused:
+        return None
+    current = now or datetime.now(UTC)
+    scheduled = _today_scheduled_time(current, settings)
+    if current.astimezone(UTC) < scheduled:
+        return None
+    return await _start_daily_workflow(scheduled, settings, client)
+
+
+async def _repair_schedules_until_ready(settings: Settings, client: Client) -> None:
+    """Repair scheduling without ever preventing the activity worker from polling."""
+    while True:
+        try:
+            await reconcile_schedules(settings, client)
+            await start_due_daily_run(settings, client)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Daily schedule startup repair failed; retrying in 60 seconds")
+            await asyncio.sleep(SCHEDULE_REPAIR_RETRY_SECONDS)
 
 
 async def run_worker(settings: Settings | None = None) -> None:
@@ -747,4 +837,16 @@ async def run_worker(settings: Settings | None = None) -> None:
             apply_copy_refresh_activity,
         ],
     )
-    await worker.run()
+    schedule_repair = asyncio.create_task(
+        _repair_schedules_until_ready(settings, client),
+        name="daily-schedule-startup-repair",
+    )
+    try:
+        # Give fast local reconciliation a head start, but never await its network
+        # path before the worker begins polling already-queued activities.
+        await asyncio.sleep(0)
+        await worker.run()
+    finally:
+        schedule_repair.cancel()
+        with suppress(asyncio.CancelledError):
+            await schedule_repair

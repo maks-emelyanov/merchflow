@@ -273,6 +273,21 @@ class PrintifyClient:
             ),
         )
 
+    async def update_product_print_areas(
+        self, shop_id: str, product_id: str, print_areas: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Replace artwork placement on an existing product without changing its variants."""
+        if not print_areas:
+            raise ValueError("Printify product artwork requires at least one print area")
+        return cast(
+            dict[str, Any],
+            await self._request(
+                "PUT",
+                f"/shops/{shop_id}/products/{product_id}.json",
+                json={"print_areas": print_areas},
+            ),
+        )
+
     async def publishing_succeeded(
         self, shop_id: str, product_id: str, listing_id: int, handle: str
     ) -> None:

@@ -17,6 +17,13 @@ def fake_providers_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MERCH_MANUAL_APPROVAL_ENABLED", "false")
     monkeypatch.setenv("MERCH_ETSY_PRODUCTION_PARTNER_CHECK_ENABLED", "false")
     monkeypatch.setenv("MERCH_IP_CHECK_ENABLED", "false")
+    # The production image installs the full Noto/Roboto registry.  Keep the
+    # host-side fixture pipeline deterministic on lean developer images too,
+    # without weakening production's fail-closed font resolution.
+    fallback_font = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+    if fallback_font.is_file():
+        monkeypatch.setenv("MERCH_FONT_FAMILY", "DejaVu Sans")
+        monkeypatch.setenv("MERCH_FONT_FILE", str(fallback_font))
 
 
 @pytest.fixture

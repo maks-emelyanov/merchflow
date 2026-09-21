@@ -12,7 +12,7 @@ from merch.database import get_engine, session_scope
 from merch.defaults import fixture_product_template
 from merch.models import Base, CopyRefreshBatchRecord, CopyRefreshItemRecord
 from merch.repository import ConfigurationRepository, RunRepository
-from merch.schemas import ApprovalRequest, RunInput, RunStatus
+from merch.schemas import ApprovalRequest, PublishStatus, RunInput, RunStatus
 from merch.web import create_app
 
 
@@ -138,6 +138,61 @@ def test_run_page_and_api_show_saved_featured_color_choice(isolated_app) -> None
         assert page.status_code == 200
         assert "Best color harmony" in page.text
         assert f"/artifacts/{preview.id}" in page.text
+
+
+def test_unresolved_artwork_replacement_hides_and_blocks_generic_etsy_retry(
+    isolated_app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    Base.metadata.create_all(get_engine())
+    template = fixture_product_template().model_copy(update={"featured_variant_id": 1001})
+    value = RunInput(run_id=uuid4(), scheduled_for=datetime.now(UTC), manual=True)
+    with session_scope() as session:
+        repo = RunRepository(session)
+        run = repo.create(value, f"manual-{value.run_id}")
+        run.status = RunStatus.VERIFICATION_REQUIRED.value
+        run.template_snapshot = template.model_dump(mode="json")
+        publish = repo.publish_record(str(value.run_id), "etsy", "old-fingerprint")
+        publish.status = PublishStatus.RECONCILIATION_REQUIRED.value
+        publish.printify_product_id = "product-1"
+        publish.response_data = {
+            "artwork_replacement": {
+                "operation_id": "replacement-operation",
+                "status": "failed",
+                "stage": "reconciliation_required",
+            }
+        }
+        publish.error = "Dedicated artwork replacement reconciliation is required"
+
+    temporal_calls: list[str] = []
+
+    async def unexpected_temporal_client(settings):  # type: ignore[no-untyped-def]
+        temporal_calls.append("connect")
+        raise AssertionError("Temporal must not start for artwork reconciliation")
+
+    monkeypatch.setattr("merch.web.temporal_client", unexpected_temporal_client)
+    with TestClient(create_app(get_settings())) as client:
+        login = client.get("/login")
+        assert client.post(
+            "/login",
+            data={"password": "test-password", "csrf_token": _csrf(login.text)},
+        ).status_code == 200
+        page = client.get(f"/runs/{value.run_id}")
+        assert page.status_code == 200
+        assert "Dedicated artwork replacement reconciliation is required" in page.text
+        assert "Retry verification" not in page.text
+
+        response = client.post(
+            f"/api/runs/{value.run_id}/retry/etsy",
+            headers={"X-CSRF-Token": _csrf(page.text)},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Published artwork replacement requires the dedicated "
+        "reconcile-published-artwork command"
+    )
+    assert temporal_calls == []
 
 
 def test_run_effects_use_latest_saved_artifact_not_requested_settings(isolated_app) -> None:
@@ -293,6 +348,17 @@ def test_ip_ui_is_hidden_until_enabled_even_for_a_saved_report(isolated_app) -> 
     assert 'id="approval-form"' not in hidden
     assert "Automatic release" in hidden
     assert '"ip_report"' not in hidden
+    with session_scope() as session:
+        RunRepository(session).audit(
+            str(value.run_id),
+            "worker",
+            "artwork.typography_fallback",
+            {"reason": "focused design-review fixture"},
+        )
+    fallback_review = run_html(False)
+    assert 'id="approval-form"' in fallback_review
+    assert "Design review required:" in fallback_review
+    assert "Automatic release" not in fallback_review
     shown = run_html(True)
     assert "QA and IP evidence" in shown
     assert "IP screen:" in shown

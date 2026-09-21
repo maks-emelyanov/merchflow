@@ -465,6 +465,95 @@ async def test_etsy_client_uses_rank_one_upload_and_reads_back_image() -> None:
 
 
 @pytest.mark.asyncio
+async def test_etsy_client_deletes_only_the_selected_listing_image() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204, request=request)
+
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.etsy.com/v3"
+    )
+    settings = Settings(
+        etsy_api_key="key", etsy_shared_secret="secret", etsy_access_token="token", etsy_shop_id=42
+    )
+    client = EtsyStorefrontClient(settings, client=http)
+    try:
+        await client.delete_image(7, 91)
+        assert len(requests) == 1
+        assert requests[0].method == "DELETE"
+        assert requests[0].url.path == "/v3/application/shops/42/listings/7/images/91"
+        assert requests[0].headers["x-api-key"] == "key:secret"
+        assert requests[0].headers["Authorization"] == "Bearer token"
+    finally:
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_etsy_client_reads_one_listing_transaction_as_a_sale_gate() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            request=request,
+            json={"count": 3, "results": [{"transaction_id": 91}]},
+        )
+
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.etsy.com/v3"
+    )
+    settings = Settings(
+        etsy_api_key="key",
+        etsy_shared_secret="secret",
+        etsy_access_token="token",
+        etsy_shop_id=42,
+    )
+    client = EtsyStorefrontClient(settings, client=http)
+    try:
+        assert await client.listing_transactions(7) == [{"transaction_id": 91}]
+        assert len(requests) == 1
+        assert requests[0].method == "GET"
+        assert requests[0].url.path == (
+            "/v3/application/shops/42/listings/7/transactions"
+        )
+        assert dict(requests[0].url.params) == {"limit": "1", "offset": "0"}
+    finally:
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_etsy_client_rejects_incomplete_listing_transaction_page() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json={"count": 1, "results": []},
+        )
+
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://openapi.etsy.com/v3"
+    )
+    settings = Settings(
+        etsy_api_key="key",
+        etsy_shared_secret="secret",
+        etsy_access_token="token",
+        etsy_shop_id=42,
+    )
+    client = EtsyStorefrontClient(settings, client=http)
+    try:
+        with pytest.raises(
+            StorefrontVerificationError,
+            match="omitted a matching order",
+        ):
+            await client.listing_transactions(7)
+    finally:
+        await http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_etsy_client_updates_inventory_and_variation_images() -> None:
     requests: list[httpx.Request] = []
 

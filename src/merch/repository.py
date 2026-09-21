@@ -88,6 +88,50 @@ class RunRepository:
             raise KeyError(f"run {run_id} not found")
         return record
 
+    def has_audit_action(self, run_id: str, action: str) -> bool:
+        """Return whether a durable run event with this exact action exists."""
+        return self.session.scalar(
+            select(AuditEvent.id).where(
+                AuditEvent.run_id == run_id,
+                AuditEvent.action == action,
+            ).limit(1)
+        ) is not None
+
+    def has_current_audit_action(self, run_id: str, action: str, version: int) -> bool:
+        """Return whether an action belongs to the package version under review.
+
+        New events identify their resulting version explicitly. Older events did
+        not, so treat one as current only until a later artwork/package revision
+        event proves that the operator moved on.
+        """
+        events = list(self.session.scalars(
+            select(AuditEvent)
+            .where(AuditEvent.run_id == run_id, AuditEvent.action == action)
+            .order_by(AuditEvent.created_at.desc())
+        ))
+        if not events:
+            return False
+        event = events[0]
+        event_version = event.detail.get("to_version", event.detail.get("version"))
+        if event_version is not None:
+            try:
+                return int(event_version) == version
+            except (TypeError, ValueError):
+                return False
+        invalidating_actions = {
+            "artwork.brief_rewritten",
+            "artwork.regeneration_started",
+            "artwork.safe_layout_fallback",
+            "run.artwork_retried",
+        }
+        return self.session.scalar(
+            select(AuditEvent.id).where(
+                AuditEvent.run_id == run_id,
+                AuditEvent.created_at > event.created_at,
+                AuditEvent.action.in_(invalidating_actions),
+            ).limit(1)
+        ) is None
+
     def list_runs(self, limit: int = 100) -> list[RunRecord]:
         return list(
             self.session.scalars(

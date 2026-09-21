@@ -108,6 +108,53 @@ def test_default_effects_preserve_illustration_only_artwork(effects_font: tuple[
     assert not issues
 
 
+def test_hybrid_prepress_reserves_a_nonoverlapping_bottom_text_band(
+    monkeypatch: pytest.MonkeyPatch, effects_font: tuple[str, Path],
+) -> None:
+    monkeypatch.setattr("merch.domain.design_effects.shutil.which", lambda _: None)
+    family, font = effects_font
+    typography = _typography(lines=["KILN WEATHER BUREAU", "HEAT ADVISORY IN EFFECT"]).model_copy(
+        update={
+            "vertical_placement": "bottom",
+            "relative_width": 0.88,
+            "relative_height": 0.28,
+        }
+    )
+    prepared = prepare_artwork(
+        make_fixture_art(600, 720),
+        800,
+        1000,
+        typography=typography,
+        font_family=family,
+        font_file=font,
+    )
+    layout = prepared.effects["layout"]
+    illustration_bounds = layout["illustration_bounds"]
+    text_bounds = layout["text_bounds"]
+    assert illustration_bounds and text_bounds
+    assert illustration_bounds[3] < text_bounds[1]
+    assert layout["overlap_fraction"] == 0
+    assert not [issue for issue in prepared.issues if issue.code == "TYPOGRAPHY_LAYOUT"]
+
+
+def test_reserved_text_overlap_is_reported_as_layout_failure(
+    monkeypatch: pytest.MonkeyPatch, effects_font: tuple[str, Path],
+) -> None:
+    monkeypatch.setattr("merch.domain.design_effects.shutil.which", lambda _: None)
+    family, font = effects_font
+    rendered, metadata, issues = apply_design_effects(
+        _solid_design(),
+        _typography(lines=["CENTERED WORDS"]).model_copy(
+            update={"vertical_placement": "bottom", "relative_height": 0.3}
+        ),
+        font_family=family,
+        font_file=font,
+    )
+    assert rendered.getchannel("A").getbbox()
+    assert metadata["typography"]["overlap_fraction"] > 0.01
+    assert any(issue.code == "TYPOGRAPHY_LAYOUT" for issue in issues)
+
+
 def test_saved_creative_briefs_without_effects_default_to_clean_artwork() -> None:
     saved = {
         "concept_name": "Evening trails", "target_customer": "Hikers",

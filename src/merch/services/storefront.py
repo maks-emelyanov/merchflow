@@ -512,6 +512,25 @@ class EtsyStorefrontClient:
         )
         return cast(list[dict[str, Any]], result.get("results", []))
 
+    async def listing_transactions(self, listing_id: int) -> list[dict[str, Any]]:
+        """Read a bounded first page; one row is enough to block artwork replacement."""
+        result = await self._get(
+            f"/application/shops/{self.settings.etsy_shop_id}/listings/"
+            f"{listing_id}/transactions?limit=1&offset=0",
+            "read listing transactions",
+        )
+        rows = result.get("results")
+        count = result.get("count")
+        if not isinstance(rows, list) or not isinstance(count, int) or count < len(rows):
+            raise StorefrontVerificationError(
+                "Etsy listing transactions response is incomplete"
+            )
+        if count and not rows:
+            raise StorefrontVerificationError(
+                "Etsy listing transactions response omitted a matching order"
+            )
+        return cast(list[dict[str, Any]], rows)
+
     async def update_variation_images(
         self, listing_id: int, images: list[dict[str, int]]
     ) -> None:
@@ -525,6 +544,15 @@ class EtsyStorefrontClient:
     async def images(self, listing_id: int) -> list[dict[str, Any]]:
         result = await self._get(f"/application/listings/{listing_id}/images", "read listing images")
         return cast(list[dict[str, Any]], result.get("results", []))
+
+    async def delete_image(self, listing_id: int, image_id: int) -> None:
+        """Delete one image from an existing listing without changing the listing itself."""
+        response = await self.client.delete(
+            f"/application/shops/{self.settings.etsy_shop_id}/listings/"
+            f"{listing_id}/images/{image_id}",
+            headers=self._headers(),
+        )
+        self._raise_for_status(response, "delete listing image")
 
     async def upload_featured(
         self, listing_id: int, image: bytes, content_type: str, alt_text: str

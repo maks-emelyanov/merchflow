@@ -53,7 +53,10 @@ from merch.schemas import (
     SelectionDecision,
     ShirtColorRanking,
     ShirtColorScore,
+    TypographyProposal,
     TypographySpec,
+    normalize_opaque_color,
+    normalize_slogan,
 )
 from merch.services.openai_costs import estimate_image_cost, estimate_text_cost
 
@@ -66,6 +69,56 @@ class ModelResult[T: BaseModel]:
 
 class OpenAINonRetryableError(RuntimeError):
     """An OpenAI billing, credential, or request error that a retry cannot fix."""
+
+
+def _canonical_line_breaks(slogan: str, proposed: list[str]) -> list[str]:
+    """Keep valid soft wraps without allowing one to cross an approved hard break."""
+    if not proposed or any(not line.strip() for line in proposed):
+        return slogan.split("\n")
+    index = 0
+    for hard_line in slogan.split("\n"):
+        wrapped: list[str] = []
+        while index < len(proposed):
+            wrapped.append(proposed[index])
+            index += 1
+            joined = " ".join(wrapped)
+            if joined == hard_line:
+                break
+            if not hard_line.startswith(joined + " "):
+                return slogan.split("\n")
+        else:
+            return slogan.split("\n")
+    return proposed if index == len(proposed) else slogan.split("\n")
+
+
+def canonicalize_typography(
+    slogan: str, brief: CreativeBrief, spec: TypographyProposal
+) -> TypographySpec:
+    """Bind model-chosen styling to validated deterministic text and placement contracts."""
+    approved = normalize_slogan(slogan)
+    if approved is None:
+        raise ValueError("Typography requires a nonblank approved slogan")
+    try:
+        primary_color = normalize_opaque_color(spec.primary_color)
+    except ValueError:
+        primary_color = "#F7F3E8"
+        for candidate in brief.palette:
+            try:
+                primary_color = normalize_opaque_color(candidate)
+                break
+            except ValueError:
+                continue
+    return TypographySpec.model_validate(
+        {
+            **spec.model_dump(mode="python"),
+            "exact_text": approved,
+            "line_breaks": _canonical_line_breaks(approved, spec.line_breaks),
+            "primary_color": primary_color,
+            "vertical_placement": (
+                "center" if brief.design_mode == DesignMode.TYPOGRAPHY else "bottom"
+            ),
+        }
+    )
 
 
 class OpenAIService:
@@ -495,12 +548,15 @@ class OpenAIService:
     async def typography(self, slogan: str, brief: CreativeBrief) -> ModelResult[TypographySpec]:
         prompt = TYPOGRAPHY_PROMPT.format(slogan=slogan, brief=brief.model_dump_json(indent=2))
         if self.client:
-            return await self._parse(
-                prompt, TypographySpec, model=self.settings.openai_typography_model
+            result = await self._parse(
+                prompt, TypographyProposal, model=self.settings.openai_typography_model
+            )
+            return ModelResult(
+                canonicalize_typography(slogan, brief, result.value), result.metadata
             )
         spec = TypographySpec(
             exact_text=slogan,
-            line_breaks=[slogan],
+            line_breaks=slogan.split("\n"),
             letter_spacing=0.03,
             line_spacing=1.0,
             text_alignment="center",
@@ -514,7 +570,10 @@ class OpenAIService:
             relative_width=0.78,
             relative_height=0.12,
         )
-        return ModelResult(spec, self._fake_metadata("typography", prompt))
+        return ModelResult(
+            canonicalize_typography(slogan, brief, spec),
+            self._fake_metadata("typography", prompt),
+        )
 
     async def artwork(
         self, brief: CreativeBrief, width: int, height: int

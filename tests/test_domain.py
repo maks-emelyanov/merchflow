@@ -170,9 +170,69 @@ def test_typography_preserves_exact_text() -> None:
         "relative_width": 0.8,
         "relative_height": 0.2,
     }
-    assert TypographySpec.model_validate(values).exact_text == "TAKE THE SCENIC ROUTE"
+    typography = TypographySpec.model_validate(values)
+    assert typography.exact_text == "TAKE THE SCENIC ROUTE"
+    assert typography.vertical_placement == "center"
     with pytest.raises(ValidationError):
         TypographySpec.model_validate({**values, "line_breaks": ["TAKE A SHORTCUT"]})
+    with pytest.raises(ValidationError):
+        TypographySpec.model_validate({**values, "line_breaks": []})
+    with pytest.raises(ValidationError):
+        TypographySpec.model_validate({**values, "line_breaks": ["TAKE THE", " "]})
+
+
+def test_typography_normalizes_opaque_colors_and_drops_invalid_optional_colors() -> None:
+    values = {
+        "exact_text": "KILN WEATHER BUREAU",
+        "line_breaks": ["KILN WEATHER BUREAU"],
+        "letter_spacing": 0,
+        "line_spacing": 1,
+        "text_alignment": "center",
+        "text_arc_or_shape": "none",
+        "outline": "navy",
+        "shadow": "#123456FF",
+        "distress_level": 0,
+        "primary_color": "#f4e6cc on dark garments; #1a1f35 on light garments",
+        "secondary_color": "transparent",
+        "interaction_with_illustration": "below",
+        "relative_width": 0.8,
+        "relative_height": 0.2,
+    }
+    typography = TypographySpec.model_validate(values)
+    assert typography.primary_color == "#F4E6CC"
+    assert typography.outline == "#000080"
+    assert typography.shadow == "#123456"
+    assert typography.secondary_color is None
+
+    optional_invalid = TypographySpec.model_validate(
+        {**values, "outline": "not a color", "shadow": "#12345680"}
+    )
+    assert optional_invalid.outline is None
+    assert optional_invalid.shadow is None
+    with pytest.raises(ValidationError, match="concrete CSS color"):
+        TypographySpec.model_validate({**values, "primary_color": "not a color"})
+    with pytest.raises(ValidationError, match="fully opaque"):
+        TypographySpec.model_validate({**values, "primary_color": "#12345680"})
+
+
+def test_creative_brief_normalizes_blank_slogan_lines_before_approval() -> None:
+    values = {
+        "concept_name": "Kiln Weather Bureau",
+        "target_customer": "Ceramicists",
+        "customer_motivation": "Studio humor",
+        "slogan": "  KILN WEATHER BUREAU\r\n\r\n HEAT ADVISORY IN EFFECT  ",
+        "design_mode": "hybrid",
+        "visual_concept": "A simple kiln gauge",
+        "composition": "Gauge above exact text",
+        "graphic_style": "flat vintage utility graphic",
+        "palette": ["#F4E6CC", "#1A1F35"],
+        "shirt_colors": ["Black"],
+        "typography_style": "bold slab",
+        "generation_brief": "Draw only one isolated kiln gauge.",
+    }
+    brief = CreativeBrief.model_validate(values)
+    assert brief.slogan == "KILN WEATHER BUREAU\nHEAT ADVISORY IN EFFECT"
+    assert CreativeBrief.model_validate({**values, "slogan": " \r\n "}).slogan is None
 
 
 def test_prepress_dimensions_alpha_profile_and_upscale_warning(tmp_path: Path) -> None:
@@ -203,6 +263,48 @@ def test_prepress_dimensions_alpha_profile_and_upscale_warning(tmp_path: Path) -
     )
     assert report.has_alpha
     assert any(item.code == "upscale_fallback" for item in report.issues)
+
+
+def test_commercial_scale_qa_rejects_a_tiny_horizontal_word_strip() -> None:
+    image = Image.new("RGBA", (400, 500), (0, 0, 0, 0))
+    ImageDraw.Draw(image).rectangle((24, 237, 375, 262), fill=(255, 255, 255, 255))
+    output = io.BytesIO()
+    image.save(output, "PNG")
+
+    report = deterministic_qa(
+        output.getvalue(),
+        expected_width=400,
+        expected_height=500,
+        shirt_colors=["#000000"],
+        revision=1,
+        max_bytes=5_000_000,
+        enforce_composition_scale=True,
+    )
+
+    finding = next(item for item in report.issues if item.code == "COMPOSITION_SCALE")
+    assert finding.severity == "error"
+    assert "88.0% wide by 5.2% tall" in finding.message
+    assert not report.passed
+
+
+def test_commercial_scale_qa_accepts_a_confident_composition_footprint() -> None:
+    image = Image.new("RGBA", (400, 500), (0, 0, 0, 0))
+    ImageDraw.Draw(image).rectangle((40, 100, 359, 399), fill=(255, 255, 255, 255))
+    output = io.BytesIO()
+    image.save(output, "PNG")
+
+    report = deterministic_qa(
+        output.getvalue(),
+        expected_width=400,
+        expected_height=500,
+        shirt_colors=["#000000"],
+        revision=1,
+        max_bytes=5_000_000,
+        enforce_composition_scale=True,
+    )
+
+    assert not any(item.code == "COMPOSITION_SCALE" for item in report.issues)
+    assert report.passed
 
 
 def test_flat_print_cleanup_removes_translucent_debris_and_gradients() -> None:
