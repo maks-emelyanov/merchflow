@@ -31,6 +31,16 @@ from merch.setup_comfort_colors import (
     setup_comfort_colors,
 )
 
+PRINT_DIMENSIONS = {
+    "S": (3703, 4200),
+    "M": (4107, 4658),
+    "L": (4494, 5097),
+    "XL": (4494, 5097),
+    "2XL": (4494, 5097),
+    "3XL": (4494, 5097),
+    "4XL": (4494, 5097),
+}
+
 
 @pytest.fixture
 def catalog() -> dict[str, Any]:
@@ -41,7 +51,8 @@ def catalog() -> dict[str, Any]:
                 "id": index, "title": f"{color} / {size}",
                 "options": {"color": color, "size": size},
                 "placeholders": [{
-                    "position": "front", "decoration_method": "dtg", "width": 4500, "height": 5100,
+                    "position": "front", "decoration_method": "dtg",
+                    "width": PRINT_DIMENSIONS[size][0], "height": PRINT_DIMENSIONS[size][1],
                 }],
             }
             for index, (color, size) in enumerate(
@@ -52,9 +63,13 @@ def catalog() -> dict[str, Any]:
 
 
 def _costs(catalog: dict[str, Any]) -> ReviewedCosts:
+    cost_by_size = {size: 1300 + index * 100 for index, size in enumerate(SIZES)}
     return ReviewedCosts(
         currency="USD", reviewed_at=datetime.now(UTC).date(),
-        costs_by_variant={str(row["id"]): 1300 + index for index, row in enumerate(catalog["variants"])},
+        costs_by_variant={
+            str(row["id"]): cost_by_size[row["options"]["size"]]
+            for row in catalog["variants"]
+        },
     )
 
 
@@ -74,7 +89,9 @@ def mocked_printify(
     state: dict[str, Any] = {
         "catalog": catalog, "requests": [], "variant_reads": 0, "on_recheck": None,
         "blueprint": {"id": BLUEPRINT_ID, "brand": "Comfort Colors®", "model": "1717"},
-        "providers": [{"id": PROVIDER_ID, "title": "SwiftPOD", "decoration_methods": ["dtg"]}],
+        "providers": [{
+            "id": PROVIDER_ID, "title": "Printify Choice", "decoration_methods": ["dtg"],
+        }],
         "shops": [
             {"id": channel.printify_shop_id, "sales_channel": channel.channel.value}
             for channel in configured.channels
@@ -90,7 +107,7 @@ def mocked_printify(
             value = state["blueprint"]
         elif request.url.path.endswith("/print_providers.json"):
             value = state["providers"]
-        elif request.url.path.endswith("/39/variants.json"):
+        elif request.url.path.endswith("/99/variants.json"):
             state["variant_reads"] += 1
             if state["variant_reads"] % 2 == 0 and state["on_recheck"]:
                 state["on_recheck"]()
@@ -122,8 +139,8 @@ def test_build_template_preserves_channels_and_specific_costs(catalog: dict[str,
     original = fixture_product_template()
     costs = _costs(catalog)
     result = build_template(catalog, original, costs, verified_at=date(2026, 9, 20))
-    assert (result.blueprint_id, result.print_provider_id) == (706, 39)
-    assert len(result.variants) == 48
+    assert (result.blueprint_id, result.print_provider_id) == (706, 99)
+    assert len(result.variants) == 98
     assert {item.size for item in result.variants} == set(SIZES)
     assert {item.color for item in result.variants} == set(COLORS)
     assert result.channels == original.channels
@@ -137,13 +154,12 @@ def test_build_template_preserves_channels_and_specific_costs(catalog: dict[str,
 
 
 def test_catalog_accepts_provider_size_scaling_and_one_pixel_rounding(catalog: dict[str, Any]) -> None:
-    size_dimensions = {"S": (3461, 3955), "M": (3839, 4387)}
     for row in catalog["variants"]:
-        width, height = size_dimensions.get(row["options"]["size"], (4200, 4800))
+        width, height = PRINT_DIMENSIONS[row["options"]["size"]]
         row["placeholders"][0].update(width=width, height=height)
     selected, width, height = catalog_selection(catalog)
-    assert len(selected) == 48
-    assert (width, height) == (4200, 4800)
+    assert len(selected) == 98
+    assert (width, height) == (4494, 5097)
 
 
 @pytest.mark.parametrize("price", [None, 0, -1, 12.50, True, "1299"])
@@ -199,6 +215,14 @@ def test_costs_must_cover_exact_catalog_selection(catalog: dict[str, Any], extra
         build_template(catalog, fixture_product_template(), costs, verified_at=date.today())
 
 
+def test_costs_must_be_size_tiered_for_safe_fallback_pricing(catalog: dict[str, Any]) -> None:
+    costs = _costs(catalog)
+    first = catalog["variants"][0]
+    costs.costs_by_variant[str(first["id"])] += 1
+    with pytest.raises(ValueError, match="size-tiered"):
+        build_template(catalog, fixture_product_template(), costs, verified_at=date.today())
+
+
 @pytest.mark.asyncio
 async def test_preview_without_costs_exposes_real_ids_and_never_writes(
     mocked_printify: dict[str, Any], configured: ProductTemplate,
@@ -206,7 +230,7 @@ async def test_preview_without_costs_exposes_real_ids_and_never_writes(
     preview = await setup_comfort_colors(settings=_settings())
     assert preview["status"] == "preview"
     assert preview["activation_ready"] is False
-    assert preview["variant_count"] == 48
+    assert preview["variant_count"] == 98
     assert all(value is None for value in preview["costs_file_template"]["costs_by_variant"].values())
     assert mocked_printify["variant_reads"] == 1
     with session_scope() as session:
@@ -220,7 +244,7 @@ async def test_preview_with_costs_prices_every_preserved_channel(
 ) -> None:
     result = await setup_comfort_colors(_file_costs(tmp_path, catalog), settings=_settings())
     assert result["activation_ready"] is True
-    assert len(result["retail_prices"]) == 48 * 3
+    assert len(result["retail_prices"]) == 98 * 3
     assert {item["channel"] for item in result["retail_prices"]} == {item.value for item in Channel}
     assert all(item["retail_price_cents"] % 100 == 99 for item in result["retail_prices"])
     with session_scope() as session:

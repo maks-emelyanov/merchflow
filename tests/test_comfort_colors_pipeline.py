@@ -33,7 +33,6 @@ from merch.schemas import (
     MarketplaceListingSet,
     ProductTemplate,
     PublishStatus,
-    QAIssue,
     QAReport,
     RunInput,
     RunStatus,
@@ -50,13 +49,13 @@ async def test_comfort_colors_daily_run_preserves_strategy_and_publishes_approve
 ) -> None:
     """Use real prepress, pricing, approval and publication with fictional providers.
 
-    MERCH_TEST_FULL_PRINT_SIZE=1 additionally exercises the actual 4200x4800
+    MERCH_TEST_FULL_PRINT_SIZE=1 additionally exercises the actual 4494x5097
     production canvas; the default scales only the output dimensions for CI.
     """
     monkeypatch.setattr("merch.domain.prepress.MAX_GENERATION_EDGE", 512)
     monkeypatch.setattr("merch.domain.prepress.MAX_GENERATION_PIXELS", 262_144)
     Base.metadata.create_all(get_engine())
-    dimensions = {"S": (3461, 3955), "M": (3839, 4387)}
+    dimensions = {"S": (3703, 4200), "M": (4107, 4658)}
     catalog = {
         "variants": [
             {
@@ -64,8 +63,8 @@ async def test_comfort_colors_daily_run_preserves_strategy_and_publishes_approve
                 "options": {"color": color, "size": size},
                 "placeholders": [{
                     "position": "front", "decoration_method": "dtg",
-                    "width": dimensions.get(size, (4200, 4800))[0],
-                    "height": dimensions.get(size, (4200, 4800))[1],
+                    "width": dimensions.get(size, (4494, 5097))[0],
+                    "height": dimensions.get(size, (4494, 5097))[1],
                 }],
             }
             for index, (color, size) in enumerate(
@@ -74,14 +73,18 @@ async def test_comfort_colors_daily_run_preserves_strategy_and_publishes_approve
         ],
     }
     today = datetime.now(UTC).date()
+    cost_by_size = {size: 1300 + index * 100 for index, size in enumerate(SIZES)}
     costs = ReviewedCosts(
         currency="USD", reviewed_at=today,
-        costs_by_variant={str(row["id"]): 1300 + index for index, row in enumerate(catalog["variants"])},
+        costs_by_variant={
+            str(row["id"]): cost_by_size[row["options"]["size"]]
+            for row in catalog["variants"]
+        },
     )
     template = build_template(catalog, fixture_product_template(), costs, verified_at=today)
-    assert (template.print_width, template.print_height) == (4200, 4800)
+    assert (template.print_width, template.print_height) == (4494, 5097)
     if os.environ.get("MERCH_TEST_FULL_PRINT_SIZE") != "1":
-        template = template.model_copy(update={"print_width": 420, "print_height": 480})
+        template = template.model_copy(update={"print_width": 449, "print_height": 510})
     with session_scope() as session:
         ConfigurationRepository(session).save_template(template)
     settings = get_settings().model_copy(update={
@@ -89,6 +92,7 @@ async def test_comfort_colors_daily_run_preserves_strategy_and_publishes_approve
         "font_family": "DejaVu Sans",
         "font_file": Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
         "realesrgan_binary": None, "realesrgan_endpoint": None,
+        "flat_artwork_cleanup_enabled": False,
         "manual_approval_enabled": False, "ip_check_enabled": False,
         "etsy_production_partner_check_enabled": False,
     })
@@ -105,9 +109,19 @@ async def test_comfort_colors_daily_run_preserves_strategy_and_publishes_approve
         assert brief.strategy is not None
         assert set(brief.shirt_colors) == set(COLORS)
         image = Image.new("RGBA", (width, height))
-        ImageDraw.Draw(image).rounded_rectangle(
-            (width // 8, height // 8, width * 7 // 8, height * 7 // 8),
-            radius=width // 10, fill="#F7F3E8",
+        draw = ImageDraw.Draw(image)
+        left, right = width // 8, width * 7 // 8
+        span = right - left
+        white_end = left + span * 47 // 100
+        black_end = left + span * 94 // 100
+        draw.rectangle(
+            (left, height // 8, white_end - 1, height * 7 // 8), fill="#FFFFFF"
+        )
+        draw.rectangle(
+            (white_end, height // 8, black_end - 1, height * 7 // 8), fill="#000000"
+        )
+        draw.rectangle(
+            (black_end, height // 8, right - 1, height * 7 // 8), fill="#FF00FF"
         )
         output = io.BytesIO()
         image.save(output, "PNG")
@@ -119,17 +133,8 @@ async def test_comfort_colors_daily_run_preserves_strategy_and_publishes_approve
     ) -> ModelResult[QAReport]:
         result = await original_visual(self, image, brief, deterministic, effects=effects)
         assert result.value.passed
-        assert "Ivory" not in brief.shirt_colors  # Real deterministic contrast rejected it.
+        assert set(brief.shirt_colors) == set(COLORS)
         visual_colors.append(brief.shirt_colors)
-        if "Espresso" in brief.shirt_colors:
-            return ModelResult(result.value.model_copy(update={
-                "passed": False,
-                "issues": [*result.value.issues, QAIssue(
-                    code="GARMENT_CONTRAST", severity="error",
-                    message="Fixture visual review rejects Espresso only",
-                    affected_shirt_colors=["Espresso"],
-                )],
-            }), result.metadata)
         return result
 
     monkeypatch.setattr(PrintifyClient, "_request", no_provider_requests)
@@ -140,6 +145,11 @@ async def test_comfort_colors_daily_run_preserves_strategy_and_publishes_approve
     create_run(value, f"comfort-colors-daily-{run_id}")
     await research_run(run_id, settings)
     assert await screen_and_select_run(run_id, settings)
+    with session_scope() as session:
+        run = RunRepository(session).get(run_id)
+        selected = dict(run.selected_concept or {})
+        selected["slogan_if_any"] = None
+        run.selected_concept = selected
     assert await generate_package_run(run_id, settings=settings)
 
     with session_scope() as session:
@@ -153,10 +163,10 @@ async def test_comfort_colors_daily_run_preserves_strategy_and_publishes_approve
         publication = ProductTemplate.model_validate(run.publication_template_snapshot)
         assert publication.garment_facts == template.garment_facts
         assert publication.production_costs_reviewed_at == today
-        assert set(run.excluded_shirt_colors or []) == {"Ivory", "Espresso"}
+        assert run.excluded_shirt_colors == []
         enabled = [item for item in publication.variants if item.enabled]
-        assert len(enabled) == 36
-        assert {item.color for item in enabled} == set(COLORS) - {"Ivory", "Espresso"}
+        assert len(enabled) == 98
+        assert {item.color for item in enabled} == set(COLORS)
         for color in {item.color for item in enabled}:
             assert {item.size for item in enabled if item.color == color} == set(SIZES)
         assert publication.featured_variant() in enabled
@@ -172,7 +182,7 @@ async def test_comfort_colors_daily_run_preserves_strategy_and_publishes_approve
             for channel in publication.channels if channel.enabled for variant in enabled
         ]
         assert run.price_quotes == expected_quotes
-        assert len(run.price_quotes) == 36 * 3
+        assert len(run.price_quotes) == 98 * 3
         listings = MarketplaceListingSet.model_validate(run.listings)
         validate_listing_copy(listings)
         assert all(item.target_customer == strategy["micro_niche"] for item in listings.listings)
@@ -204,11 +214,11 @@ async def test_comfort_colors_daily_run_preserves_strategy_and_publishes_approve
         for publish in run.publishes:
             payload = publish.response_data
             assert publish.status == PublishStatus.DRY_RUN.value
-            assert payload["blueprint_id"] == 706 and payload["print_provider_id"] == 39
+            assert payload["blueprint_id"] == 706 and payload["print_provider_id"] == 99
             assert {item["id"] for item in payload["variants"]} == approved_ids
             assert {item["id"] for item in payload["variants"] if item["is_default"]} == {publication.featured_variant_id}
             assert set(payload["print_areas"][0]["variant_ids"]) == approved_ids
-            assert payload["verification"]["variant_count"] == 36
+            assert payload["verification"]["variant_count"] == 98
         assert run.template_snapshot == template.model_dump(mode="json")
         assert ProductTemplate.model_validate(run.publication_template_snapshot) == publication
         assert run.creative_brief and run.creative_brief["strategy"] == strategy

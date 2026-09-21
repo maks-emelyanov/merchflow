@@ -75,8 +75,8 @@ def saved_package(active: ProductTemplate) -> tuple[str, ProductTemplate, Produc
 
 def another_garment() -> ProductTemplate:
     return fixture_product_template().model_copy(update={
-        "name": "Comfort Colors 1717", "blueprint_id": 706, "print_provider_id": 39,
-        "print_width": 4200, "print_height": 4800,
+        "name": "Comfort Colors 1717", "blueprint_id": 706, "print_provider_id": 99,
+        "print_width": 4494, "print_height": 5097,
     })
 
 

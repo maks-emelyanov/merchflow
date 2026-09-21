@@ -58,6 +58,8 @@ from merch.schemas import (
 from merch.services.etsy_publisher import direct_inventory
 from merch.services.openai_service import ModelResult, OpenAIService
 from merch.services.printify import PrintifyClient
+from merch.setup_comfort_colors import COLORS as COMFORT_COLORS
+from merch.setup_comfort_colors import SIZES as COMFORT_SIZES
 from merch.setup_etsy_tee import COLORS, COST_CENTS, SIZES, build_template
 from merch.temporal import retry_failed_artwork_run
 
@@ -414,6 +416,83 @@ def test_catalog_replacements_require_all_sizes_and_keep_fourteen_colors() -> No
     assert full_color_publication_template(template, {"Olive"}, groups, {"Silver", "Steel Blue"}) is None
 
 
+def test_comfort_colors_replacements_require_s_through_4xl_and_matching_canvas() -> None:
+    dimensions = {"S": (3703, 4200), "M": (4107, 4658)}
+    variants = [
+        VariantConfig(
+            variant_id=index + 1,
+            title=f"{color} / {size}",
+            color=color,
+            color_hex=swatch,
+            size=size,
+            production_cost_cents=1000 + size_index * 100,
+        )
+        for color_index, (color, swatch) in enumerate(COMFORT_COLORS.items())
+        for size_index, size in enumerate(COMFORT_SIZES)
+        for index in [color_index * len(COMFORT_SIZES) + size_index]
+    ]
+    template = ProductTemplate(
+        name="Comfort Colors 1717",
+        blueprint_id=706,
+        print_provider_id=99,
+        print_width=4494,
+        print_height=5097,
+        variants=variants,
+        featured_variant_id=next(
+            item.variant_id for item in variants if item.color == "Pepper" and item.size == "L"
+        ),
+        channels=[ChannelConfig(
+            channel=Channel.ETSY,
+            printify_shop_id="test-etsy",
+            percent_fee=0.12,
+            fixed_fee_cents=45,
+        )],
+    )
+    rows = [
+        {
+            "id": 1000 + index,
+            "title": f"{color} / {size}",
+            "options": {"color": color, "size": size},
+            "placeholders": [{
+                "position": "front",
+                "decoration_method": "dtg",
+                "width": dimensions.get(size, (4494, 5097))[0],
+                "height": dimensions.get(size, (4494, 5097))[1],
+            }],
+        }
+        for index, (color, size) in enumerate(
+            (color, size)
+            for color in ("Graphite", "Grey", "Navy")
+            for size in COMFORT_SIZES
+        )
+    ]
+    rows = [
+        row for row in rows
+        if row["options"] != {"color": "Graphite", "size": "4XL"}
+    ]
+    incompatible = next(row for row in rows if row["options"]["color"] == "Grey")
+    incompatible["placeholders"][0]["width"] = 4000
+
+    groups = catalog_replacement_groups(template, {"variants": rows})
+    assert [group[0].color for group in groups] == ["Navy"]
+    publication = full_color_publication_template(template, {"Ivory"}, groups, set())
+    assert publication is not None
+    assert len(publication.variants) == 98
+    assert {item.color for item in publication.variants} == (
+        set(COMFORT_COLORS) - {"Ivory"} | {"Navy"}
+    )
+    assert {item.size for item in publication.variants if item.color == "Navy"} == set(
+        COMFORT_SIZES
+    )
+    for item in publication.variants:
+        if item.color == "Navy":
+            assert item.production_cost_cents == next(
+                variant.production_cost_cents
+                for variant in template.variants
+                if variant.size == item.size
+            )
+
+
 @pytest.mark.asyncio
 async def test_visual_qa_rechecks_replacements_until_fourteen_pass(
     monkeypatch: pytest.MonkeyPatch,
@@ -496,6 +575,121 @@ async def test_visual_qa_rechecks_replacements_until_fourteen_pass(
     assert len({item.color for item in result.publication.variants}) == 14
     assert result.publication.featured_variant().color == "White"
     assert "Steel Blue" in visual_colors[-1]
+
+
+@pytest.mark.asyncio
+async def test_comfort_colors_uses_printify_choice_reserve_after_color_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    variants = [
+        VariantConfig(
+            variant_id=index + 1,
+            title=f"{color} / L",
+            color=color,
+            color_hex=swatch,
+            size="L",
+            production_cost_cents=1200,
+        )
+        for index, (color, swatch) in enumerate(COMFORT_COLORS.items())
+    ]
+    template = ProductTemplate(
+        name="Comfort Colors 1717",
+        blueprint_id=706,
+        print_provider_id=99,
+        print_width=100,
+        print_height=100,
+        variants=variants,
+        featured_variant_id=next(item.variant_id for item in variants if item.color == "Pepper"),
+        channels=[ChannelConfig(
+            channel=Channel.ETSY,
+            printify_shop_id="test-etsy",
+            percent_fee=0.12,
+            fixed_fee_cents=45,
+        )],
+    )
+    catalog = {
+        "variants": [
+            {
+                "id": 100 + index,
+                "title": f"{color} / L",
+                "options": {"color": color, "size": "L"},
+                "placeholders": [{
+                    "position": "front",
+                    "decoration_method": "dtg",
+                    "width": 100,
+                    "height": 100,
+                }],
+            }
+            for index, color in enumerate(("Graphite", "Grey"))
+        ]
+    }
+
+    async def variants_catalog(self, blueprint_id, provider_id):  # type: ignore[no-untyped-def]
+        assert (blueprint_id, provider_id) == (706, 99)
+        return catalog
+
+    async def visual_qa(self, image, brief, deterministic, *, effects=None):  # type: ignore[no-untyped-def]
+        assert "Pepper" not in brief.shirt_colors
+        assert "Graphite" in brief.shirt_colors
+        return ModelResult(
+            deterministic.model_copy(update={"passed": True}),
+            {"model": "fixture", "estimated_cost_usd": 0.0},
+        )
+
+    monkeypatch.setattr(PrintifyClient, "variants", variants_catalog)
+    monkeypatch.setattr(OpenAIService, "visual_qa", visual_qa)
+    image = Image.new("RGBA", (100, 100), (255, 255, 255, 255))
+    ImageDraw.Draw(image).rectangle((50, 0, 99, 99), fill=(0, 0, 0, 255))
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    raw = QAReport(
+        passed=False,
+        revision=1,
+        issues=[QAIssue(
+            code="contrast",
+            severity="error",
+            message="Artwork does not contrast with Pepper",
+            affected_shirt_colors=["Pepper"],
+        )],
+        width=100,
+        height=100,
+        has_alpha=True,
+        color_profile="sRGB",
+    )
+    brief = CreativeBrief(
+        concept_name="Test",
+        target_customer="Adults",
+        customer_motivation="A gift",
+        slogan=None,
+        design_mode=DesignMode.ILLUSTRATION,
+        visual_concept="Split mark",
+        composition="Centered",
+        graphic_style="Flat",
+        palette=["#000000", "#FFFFFF"],
+        shirt_colors=list(COMFORT_COLORS),
+        typography_style=None,
+        generation_brief="One split black and white mark",
+    )
+    settings = get_settings().model_copy(update={
+        "provider_mode": "live",
+        "openai_api_key": SecretStr("test-only-key"),
+    })
+    result = await _qa_with_color_replacements(
+        buffer.getvalue(),
+        brief,
+        raw,
+        template,
+        settings,
+        OpenAIService(settings),
+        source_scale=1.0,
+        used_realesrgan=True,
+        rendered_text=None,
+    )
+    assert result.report.passed and not result.shortfall
+    assert result.excluded_base_colors == ["Pepper"]
+    assert result.publication is not None
+    assert len({item.color for item in result.publication.variants}) == 14
+    assert result.publication.featured_variant().color == "Ivory"
 
 
 @pytest.mark.asyncio

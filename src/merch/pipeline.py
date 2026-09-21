@@ -44,6 +44,7 @@ from merch.domain.product_options import (
     exclude_low_contrast_colors,
     full_color_publication_template,
     publication_template,
+    replacement_color_target,
 )
 from merch.models import (
     ArtifactRecord,
@@ -477,12 +478,10 @@ async def _qa_with_color_replacements(
     effects: dict[str, Any] | None = None,
 ) -> ColorQAResult:
     base_colors = {item.color for item in template.variants if item.enabled}
-    replace_to_fourteen = (
-        len(base_colors) == 14
-        and (template.blueprint_id, template.print_provider_id) == (12, 39)
-    )
+    replacement_target = replacement_color_target(template)
+    preserve_palette = replacement_target is not None
     deterministic, excluded = exclude_low_contrast_colors(
-        raw_deterministic, template, allow_all=replace_to_fourteen
+        raw_deterministic, template, allow_all=preserve_palette
     )
     if not deterministic.passed:
         return ColorQAResult(deterministic, None, excluded, [], [], None)
@@ -491,7 +490,7 @@ async def _qa_with_color_replacements(
     rejected: set[str] = set()
     visual_calls: list[ModelResult[QAReport]] = []
     while True:
-        if excluded and replace_to_fourteen and candidate_groups is None:
+        if excluded and preserve_palette and candidate_groups is None:
             if settings.provider_mode == "live":
                 printify = PrintifyClient(settings)
                 try:
@@ -528,7 +527,7 @@ async def _qa_with_color_replacements(
             else:
                 candidate_groups = []
 
-        if replace_to_fourteen and excluded:
+        if preserve_palette and excluded:
             publication = full_color_publication_template(
                 template, set(excluded), candidate_groups or [], rejected
             )
@@ -536,7 +535,10 @@ async def _qa_with_color_replacements(
                 shortfall = QAIssue(
                     code="insufficient_contrast_colors",
                     severity="error",
-                    message="Fewer than 14 catalog colors pass contrast QA for this artwork",
+                    message=(
+                        f"Fewer than {replacement_target} catalog colors pass contrast QA "
+                        "for this artwork"
+                    ),
                     recommended_fix="Revise the artwork or creative brief before publication",
                 )
                 report = deterministic.model_copy(
@@ -558,9 +560,9 @@ async def _qa_with_color_replacements(
         )
         visual_calls.append(visual)
         adjusted, visual_excluded = exclude_low_contrast_colors(
-            visual.value, publication, allow_all=replace_to_fourteen
+            visual.value, publication, allow_all=preserve_palette
         )
-        if visual_excluded and replace_to_fourteen:
+        if visual_excluded and preserve_palette:
             excluded = sorted(set(excluded) | (set(visual_excluded) & base_colors))
             rejected.update(set(visual_excluded) - base_colors)
             if adjusted.passed:
@@ -894,10 +896,14 @@ async def generate_package_run(
                 + "); rewrite the brief for the raster artwork and configured catalog",
             )
         elif color_shortfall:
+            target_colors = replacement_color_target(template) or len(
+                {item.color for item in template.variants if item.enabled}
+            )
             set_status(
                 run_id,
                 RunStatus.AWAITING_BRIEF_REVISION,
-                "Fewer than 14 catalog colors pass contrast QA; revise the artwork brief",
+                f"Fewer than {target_colors} catalog colors pass contrast QA; "
+                "revise the artwork brief",
             )
         elif repeated_visual_defects:
             codes = ", ".join(sorted(repeated_visual_defects))

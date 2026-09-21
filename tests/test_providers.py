@@ -13,9 +13,14 @@ from openai import BadRequestError, RateLimitError
 from PIL import Image
 
 from merch.config import Settings
+from merch.defaults import fixture_product_template
 from merch.schemas import DesignMode, ResearchReport, TypographyProposal, TypographySpec
 from merch.services.openai_service import ModelResult, OpenAINonRetryableError, OpenAIService
-from merch.services.printify import AmbiguousCreateError, PrintifyClient
+from merch.services.printify import (
+    AmbiguousCreateError,
+    PrintifyClient,
+    ProviderConfigurationError,
+)
 
 
 @pytest.mark.asyncio
@@ -336,6 +341,54 @@ async def test_printify_orders_uses_supported_page_parameter_only() -> None:
     assert (await client.orders("123", page=2))["data"] == []
     assert paths == ["https://api.printify.com/v1/shops/123/orders.json?page=2"]
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_printify_template_validation_refreshes_and_checks_print_area() -> None:
+    incompatible = False
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        second_width = 4000 if incompatible else 4494
+        return httpx.Response(200, json={
+            "variants": [
+                {
+                    "id": 1001,
+                    "cost": 975,
+                    "placeholders": [{
+                        "position": "front",
+                        "decoration_method": "dtg",
+                        "width": 3703,
+                        "height": 4200,
+                    }],
+                },
+                {
+                    "id": 1002,
+                    "cost": 1075,
+                    "placeholders": [{
+                        "position": "front",
+                        "decoration_method": "dtg",
+                        "width": second_width,
+                        "height": 5097,
+                    }],
+                },
+            ]
+        }, request=request)
+
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.printify.com/v1"
+    )
+    client = PrintifyClient(
+        Settings(provider_mode="live", printify_api_token="token"), client=http
+    )
+    try:
+        current = await client.validate_template(fixture_product_template())
+        assert (current.print_width, current.print_height) == (4494, 5097)
+        assert [item.production_cost_cents for item in current.variants] == [975, 1075]
+        incompatible = True
+        with pytest.raises(ProviderConfigurationError, match="incompatible print areas"):
+            await client.validate_template(fixture_product_template())
+    finally:
+        await http.aclose()
 
 
 @pytest.mark.asyncio

@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from merch.domain.print_areas import proportionally_compatible, variant_print_dimensions
 from merch.schemas import ProductTemplate, QAReport, VariantConfig
 
-# Ordered reserve shades for Bella+Canvas 3001 / SwiftPOD. Names are verified
-# against Printify's catalog at run time; hex values approximate the Bella+Canvas
-# color card and are used only to screen artwork contrast. Keep the broad,
-# familiar colors first so a product does not fill up with novelty shades.
-FALLBACK_COLORS = {
+# Ordered reserve shades are verified against Printify's live catalog at run
+# time. Swatches are used only to screen artwork contrast. Keep broad, familiar
+# colors first so a product does not fill up with novelty shades.
+BELLA_FALLBACK_COLORS = {
     "Silver": "#D6D5D1",
     "Forest": "#20362F",
     "Steel Blue": "#5F849C",
@@ -45,6 +45,75 @@ FALLBACK_COLORS = {
     "Heather Blue Lagoon": "#86A1A9",
     "Heather Prism Lilac": "#C7A1B2",
 }
+
+COMFORT_COLORS_FALLBACK_COLORS = {
+    "Graphite": "#373231",
+    "Grey": "#7A7F79",
+    "Navy": "#263040",
+    "Blue Spruce": "#536758",
+    "Chambray": "#D9EDF5",
+    "Light Green": "#738874",
+    "Khaki": "#AEA583",
+    "Seafoam": "#609A95",
+    "Orchid": "#CBB3CC",
+    "Watermelon": "#DA665F",
+    "Brick": "#915C5C",
+    "Denim": "#4E5064",
+    "Berry": "#875570",
+    "Bright Salmon": "#FF796C",
+    "Burnt Orange": "#E27C4B",
+    "Chalky Mint": "#A7D9D4",
+    "Chili": "#853F44",
+    "China Blue": "#43516E",
+    "Citrus": "#FFC86E",
+    "Crunchberry": "#EB7CA2",
+    "Flo Blue": "#7682C2",
+    "Granite": "#8A8E90",
+    "Grape": "#645C81",
+    "Hemp": "#676A4A",
+    "Hydrangea": "#B2DAF3",
+    "Ice Blue": "#7B8E95",
+    "Island Green": "#5AB98F",
+    "Island Reef": "#A2D8C2",
+    "Lagoon Blue": "#89E4ED",
+    "Melon": "#FF9A5F",
+    "Midnight": "#3F485B",
+    "Mustard": "#D0AE6E",
+    "Mystic Blue": "#647CA3",
+    "Neon Lemon": "#C9DB78",
+    "Neon Pink": "#F57CAF",
+    "Neon Red Orange": "#FF867B",
+    "Neon Violet": "#E8ACE3",
+    "Paprika": "#FF4645",
+    "Peachy": "#F7C3AE",
+    "Periwinkle": "#6570AF",
+    "Red": "#A80D27",
+    "Royal Caribe": "#5D8AC7",
+    "Sandstone": "#A69F88",
+    "Sapphire": "#03B2D3",
+    "Terracotta": "#DB8C76",
+    "Violet": "#A88FD7",
+    "Washed Denim": "#8595B8",
+    "Wine": "#5E5266",
+}
+
+FALLBACK_COLORS_BY_GARMENT = {
+    (12, 39): BELLA_FALLBACK_COLORS,
+    (706, 99): COMFORT_COLORS_FALLBACK_COLORS,
+}
+TARGET_COLORS_BY_GARMENT = {
+    (12, 39): 14,
+    (706, 99): 14,
+}
+
+
+def replacement_color_target(template: ProductTemplate) -> int | None:
+    """Return the preserved palette size for garments with reserve colors."""
+    target = TARGET_COLORS_BY_GARMENT.get(
+        (template.blueprint_id, template.print_provider_id)
+    )
+    enabled_colors = {item.color for item in template.variants if item.enabled}
+    return target if target is not None and len(enabled_colors) == target else None
 
 
 def exclude_low_contrast_colors(
@@ -95,38 +164,66 @@ def catalog_replacement_groups(
     template: ProductTemplate, catalog: dict[str, Any]
 ) -> list[list[VariantConfig]]:
     """Return complete, available color groups with the same print area and sizes."""
-    if (template.blueprint_id, template.print_provider_id) != (12, 39):
+    fallback_colors = FALLBACK_COLORS_BY_GARMENT.get(
+        (template.blueprint_id, template.print_provider_id)
+    )
+    if fallback_colors is None:
         return []
     base_colors = {item.color for item in template.variants if item.enabled}
-    sizes = {item.size for item in template.variants if item.enabled}
-    costs = {item.size: item.production_cost_cents for item in template.variants if item.enabled}
-    by_options = {
-        (item["options"]["color"], item["options"]["size"]): item
-        for item in catalog.get("variants", [])
+    enabled = [item for item in template.variants if item.enabled]
+    sizes = list(dict.fromkeys(item.size for item in enabled))
+    costs_by_size = {
+        size: {item.production_cost_cents for item in enabled if item.size == size}
+        for size in sizes
     }
+    if any(len(values) != 1 for values in costs_by_size.values()):
+        return []
+    costs = {size: next(iter(values)) for size, values in costs_by_size.items()}
+    by_options: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for item in catalog.get("variants", []):
+        options = item.get("options", {})
+        key = (options.get("color"), options.get("size"))
+        if all(isinstance(value, str) for value in key):
+            by_options.setdefault(key, []).append(item)
+    base_ids = {item.variant_id for item in template.variants}
+    candidate_ids: set[int] = set()
     groups: list[list[VariantConfig]] = []
-    for color, swatch in FALLBACK_COLORS.items():
+    for color, swatch in fallback_colors.items():
         if color in base_colors:
             continue
         group: list[VariantConfig] = []
-        for size in sorted(sizes):
-            remote = by_options.get((color, size))
-            if not remote or not remote.get("is_available", True):
+        for size in sizes:
+            matches = by_options.get((color, size), [])
+            if len(matches) != 1:
                 break
-            front = [
-                area for area in remote.get("placeholders", [])
-                if area.get("position") == template.position
-                and area.get("decoration_method") == template.decoration_method
-            ]
-            if len(front) != 1 or not (
-                0 < front[0].get("width", 0) <= template.print_width
-                and 0 < front[0].get("height", 0) <= template.print_height
+            remote = matches[0]
+            variant_id = remote.get("id")
+            if (
+                remote.get("is_available") is False
+                or type(variant_id) is not int
+                or variant_id <= 0
+            ):
+                break
+            try:
+                dimensions = variant_print_dimensions(
+                    remote,
+                    position=template.position,
+                    decoration_method=template.decoration_method,
+                )
+            except ValueError:
+                break
+            if (
+                dimensions[0] > template.print_width
+                or dimensions[1] > template.print_height
+                or not proportionally_compatible(
+                    dimensions, (template.print_width, template.print_height)
+                )
             ):
                 break
             group.append(
                 VariantConfig(
-                    variant_id=remote["id"],
-                    title=remote["title"],
+                    variant_id=variant_id,
+                    title=str(remote.get("title") or f"{color} / {size}"),
                     color=color,
                     color_hex=swatch,
                     size=size,
@@ -134,7 +231,11 @@ def catalog_replacement_groups(
                 )
             )
         if len(group) == len(sizes):
+            group_ids = {item.variant_id for item in group}
+            if len(group_ids) != len(group) or group_ids & (base_ids | candidate_ids):
+                continue
             groups.append(group)
+            candidate_ids.update(group_ids)
     return groups
 
 

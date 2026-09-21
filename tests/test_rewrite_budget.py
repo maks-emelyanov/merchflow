@@ -71,8 +71,8 @@ async def test_historical_artwork_recovery_keeps_saved_garment_and_palette(
     run_id, brief = await failed_run()
     saved_template = fixture_product_template()
     active = saved_template.model_copy(update={
-        "blueprint_id": 706, "print_provider_id": 39,
-        "print_width": 4200, "print_height": 4800,
+        "blueprint_id": 706, "print_provider_id": 99,
+        "print_width": 4494, "print_height": 5097,
         "variants": [item.model_copy(update={"color": "Pepper"}) for item in saved_template.variants],
     })
     with session_scope() as session:

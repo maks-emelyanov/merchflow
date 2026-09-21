@@ -9,6 +9,7 @@ from typing import Any, cast
 import httpx
 
 from merch.config import Settings
+from merch.domain.print_areas import largest_compatible_print_area, variant_print_dimensions
 from merch.schemas import Channel, MarketplaceListing, PriceQuote, ProductTemplate
 
 
@@ -95,17 +96,38 @@ class PrintifyClient:
         catalog = await self.variants(template.blueprint_id, template.print_provider_id)
         current = {int(item["id"]): item for item in catalog.get("variants", [])}
         updated = []
+        dimensions: list[tuple[int, int]] = []
         for variant in template.variants:
             remote = current.get(variant.variant_id)
             if remote is None or not remote.get("is_available", True):
                 raise ProviderConfigurationError(
                     f"Printify variant {variant.variant_id} is unavailable"
                 )
+            try:
+                dimensions.append(
+                    variant_print_dimensions(
+                        remote,
+                        position=template.position,
+                        decoration_method=template.decoration_method,
+                    )
+                )
+            except ValueError as exc:
+                raise ProviderConfigurationError(
+                    f"Printify variant {variant.variant_id} has an invalid print area: {exc}"
+                ) from exc
             data = variant.model_dump()
             data["production_cost_cents"] = int(remote.get("cost", variant.production_cost_cents))
             updated.append(type(variant).model_validate(data))
+        try:
+            print_width, print_height = largest_compatible_print_area(dimensions)
+        except ValueError as exc:
+            raise ProviderConfigurationError(
+                f"Printify variants have incompatible print areas: {exc}"
+            ) from exc
         data = template.model_dump()
         data["variants"] = [item.model_dump() for item in updated]
+        data["print_width"] = print_width
+        data["print_height"] = print_height
         return ProductTemplate.model_validate(data)
 
     async def upload_image(self, filename: str, data: bytes) -> dict[str, Any]:
