@@ -15,9 +15,10 @@ from xml.sax.saxutils import escape, quoteattr
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
+from merch.domain.fonts import resolve_font, svg_uses_font
 from merch.schemas import QAIssue, TypographySpec
 
-RENDERER_VERSION = "print-effects-1"
+RENDERER_VERSION = "print-effects-2"
 ARC_RADIANS = math.pi / 3
 
 
@@ -63,10 +64,8 @@ def curve_line(image: Image.Image, direction: str) -> Image.Image:
     return curved.crop(bounds)
 
 
-def _font(font_file: Path, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    if font_file.is_file():
-        return ImageFont.truetype(str(font_file), size=size)
-    return ImageFont.load_default(size=size)
+def _font(font_file: Path, size: int) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(str(font_file), size=size)
 
 
 def _shaped_line(
@@ -75,6 +74,7 @@ def _shaped_line(
     font_size: int,
     font_family: str,
     font_file: Path,
+    font_weight: int,
     rsvg: str | None,
 ) -> Image.Image:
     font = _font(font_file, font_size)
@@ -91,7 +91,7 @@ def _shaped_line(
             text = (
                 f'<text x="{margin}" y="{margin - box[1]}" xml:space="preserve" '
                 f'font-family={quoteattr(font_family)} font-size="{font_size}" '
-                f'font-weight="{spec.font_weight}" letter-spacing="{spec.letter_spacing}em" '
+                f'font-weight="{font_weight}" letter-spacing="{spec.letter_spacing}em" '
                 f"fill={quoteattr(spec.primary_color)} "
                 f'stroke={quoteattr(spec.outline or "none")} stroke-width="{stroke * 2}" '
                 f'paint-order="stroke fill">{escape(line)}</text>'
@@ -140,8 +140,8 @@ def _shaped_line(
 def typography_layer(
     size: tuple[int, int],
     spec: TypographySpec,
-    font_family: str,
-    font_file: Path,
+    font_family: str | None,
+    font_file: Path | None,
 ) -> tuple[Image.Image, dict[str, Any], list[QAIssue]]:
     rsvg = shutil.which("rsvg-convert")
     metadata: dict[str, Any] = {
@@ -149,6 +149,11 @@ def typography_layer(
         "applied_arc": "none",
         "backend": "svg" if rsvg else "pillow",
         "font_hash": None,
+        "requested_font_category": spec.font_category,
+        "requested_font_weight": spec.font_weight,
+        "font_family": None,
+        "applied_font_weight": None,
+        "font_source": "custom" if font_family is not None or font_file is not None else "registry",
         "bounds": None,
         "font_size": 0,
         "requested_letter_spacing": spec.letter_spacing,
@@ -156,10 +161,19 @@ def typography_layer(
     }
     canvas = Image.new("RGBA", size)
     try:
-        metadata["font_hash"] = (
-            hashlib.sha256(font_file.read_bytes()).hexdigest()
-            if font_file.is_file()
-            else "pillow-default"
+        selected_font = resolve_font(
+            spec.font_category, spec.font_weight, family=font_family, file=font_file,
+        )
+        font_family, font_file = selected_font.family, selected_font.file
+        if rsvg and not svg_uses_font(selected_font):
+            rsvg = None
+        metadata.update(
+            font_hash=hashlib.sha256(font_file.read_bytes()).hexdigest(),
+            font_family=font_family,
+            applied_font_weight=selected_font.weight,
+            font_source=selected_font.source,
+            backend="svg" if rsvg else "pillow",
+            applied_letter_spacing=spec.letter_spacing if rsvg else 0,
         )
         if not spec.line_breaks or any(not line.strip() for line in spec.line_breaks):
             raise ValueError("Every slogan line must contain printable text")
@@ -170,7 +184,9 @@ def typography_layer(
         font_size = max(24, min(512, math.ceil(max_width * 1.5 / max(1, longest))))
         lines = [
             curve_line(
-                _shaped_line(line, spec, font_size, font_family, font_file, rsvg),
+                _shaped_line(
+                    line, spec, font_size, font_family, font_file, selected_font.weight, rsvg,
+                ),
                 spec.text_arc_or_shape,
             )
             for line in spec.line_breaks
@@ -322,8 +338,8 @@ def apply_design_effects(
     typography: TypographySpec | None,
     *,
     artwork_distress_level: int = 0,
-    font_family: str = "Noto Sans",
-    font_file: Path = Path("/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"),
+    font_family: str | None = None,
+    font_file: Path | None = None,
 ) -> tuple[Image.Image, dict[str, Any], list[QAIssue]]:
     text_layer = Image.new("RGBA", canvas.size)
     typography_metadata: dict[str, Any] = {

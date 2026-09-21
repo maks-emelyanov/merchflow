@@ -7,6 +7,18 @@
 </div>
 {% if run.error %}<p class="error">{{ run.error }}</p>{% endif %}
 {% if payload.listing_generation_state and payload.listing_generation_state.warning %}<p class="warning">{{ payload.listing_generation_state.warning }}</p>{% endif %}
+{% set strategy = (payload.selected_concept or {}).get('strategy') %}
+{% if strategy %}
+<section class="panel"><p class="eyebrow">Odd Hour Press · Design direction</p><h2>{{ strategy.micro_niche }}</h2>
+  <p><strong>{{ strategy.premise }}</strong></p><p>{{ strategy.brand_connection }}</p>
+  {% if payload.selection %}<p>{{ payload.selection.rationale }}</p>{% endif %}
+  <details><summary>Channel positioning</summary><ul>
+    <li><strong>Etsy:</strong> {{ strategy.etsy_angle }}</li>
+    <li><strong>Amazon:</strong> {{ strategy.amazon_angle }}</li>
+    <li><strong>Shopify:</strong> {{ strategy.shopify_angle }}</li>
+  </ul></details>
+</section>
+{% endif %}
 {% if run.status == 'awaiting_brief_revision' %}
 <section class="panel"><h2>Revise the creative brief</h2><p>Update the visual instructions to resolve the repeated defect, then retry this concept. Research and selection will be reused.</p>
   <textarea id="revised-brief-json" class="package-editor">{{ payload.creative_brief|tojson(indent=2) }}</textarea>
@@ -25,6 +37,7 @@
     {% if payload.typography_spec %}{{ arc_labels.get(typography.get('applied_arc', 'none'), 'Straight lettering') }} · {% endif %}
     {% if distress.get('removed_fraction', 0) <= 0 %}No distress{% else %}{{ 'Whole-design' if distress.get('scope') == 'design' else 'Text' }} distress{% if distress.get('applied_level', 0) > 0 %}, level {{ distress.applied_level }}/5{% endif %} · {% if distress.removed_fraction < 0.001 %}less than 0.1{% else %}{{ '%.1f'|format(distress.removed_fraction * 100) }}{% endif %}% ink removed{% endif %}.
   </p>
+  {% if typography.get('font_family') %}<p><strong>Lettering:</strong> {{ typography.font_family }} · weight {{ typography.applied_font_weight }} ({{ typography.get('requested_font_category', 'sans') }}).</p>{% endif %}
   {% if typography.get('requested_arc', 'none') != typography.get('applied_arc', 'none') %}<p class="warning">The requested {{ arc_labels.get(typography.requested_arc, typography.requested_arc)|lower }} could not be applied. Review the artwork and QA findings.</p>{% endif %}
   {% for warning in effect_warnings %}<p class="warning">{{ warning }}</p>{% endfor %}
   {% if not effect_warnings and (distress.get('requested_level', 0) != distress.get('applied_level', 0) or distress.get('reduced_for_detail', false)) %}<p class="warning">{% if distress.get('applied_level', 0) == 0 and distress.get('removed_fraction', 0) > 0 %}Distress was reduced below level 1{% elif distress.get('requested_level', 0) != distress.get('applied_level', 0) %}Distress was reduced from level {{ distress.requested_level }} to {{ distress.get('applied_level', 0) }}{% else %}Distress was reduced{% endif %} to protect lettering and small details.</p>{% endif %}
@@ -55,7 +68,23 @@
     {% if payload.replacement_shirt_colors %}<p><strong>Catalog replacements that passed contrast QA:</strong> {{ payload.replacement_shirt_colors|join(', ') }}. These colors are included in the approved prices and publication.</p>{% endif %}
     {% if ip_check_enabled and payload.ip_report %}<p><strong>IP screen:</strong> {{ payload.ip_report.status }} · risk {{ payload.ip_report.risk_score }}/100</p><p class="warning">This evidence is not legal clearance.</p><ul>{% for match in payload.ip_report.matches %}<li>{{ match.source }} — {{ match.explanation }}</li>{% endfor %}</ul><a href="{{ payload.ip_report.uspto_search_url }}" rel="noreferrer">Open USPTO search</a>{% endif %}
   </section>
-  <section class="panel"><h2>Candidate ranking</h2><ol class="ranking">{% for concept in run.concepts|sort(attribute='weighted_score', reverse=true) %}<li><span>{{ concept.data.concept_name }}</span><strong>{{ '%.1f'|format(concept.weighted_score or 0) }}</strong><small>{{ 'eligible' if concept.eligible else concept.rejection_reason if ip_check_enabled else 'ineligible' }}</small></li>{% endfor %}</ol></section>
+  <section class="panel"><h2>Candidate ranking</h2><p class="muted">Scores are selection heuristics, not sales forecasts. Evidence support adjusts demand, competition, and momentum toward neutral when measurements are unavailable.</p>
+  <ol class="ranking">{% for concept in payload.concepts|sort(attribute='weighted_score', reverse=true) %}<li class="candidate-ranking">
+    <div><span>{{ concept.data.concept_name }}{% if concept.selected %} · Selected{% endif %}</span> <strong>{{ '%.1f'|format(concept.weighted_score or 0) }}</strong> <small>{{ 'eligible' if concept.eligible else concept.rejection_reason if ip_check_enabled else 'ineligible' }}</small></div>
+    <details><summary>Premise, scores &amp; sources</summary>
+      {% if concept.data.get('strategy') %}<p><strong>{{ concept.data.strategy.micro_niche }}</strong> · {{ concept.data.strategy.premise }}</p>{% endif %}
+      <p>{{ concept.data.competitive_advantage }}</p>
+      {% if concept.score_breakdown %}<div class="table-wrap"><table><thead><tr><th>Signal</th><th>Raw</th><th>Support</th><th>Adjusted</th><th>Weight</th></tr></thead><tbody>
+      {% for name, component in concept.score_breakdown.components.items() %}<tr><td>{{ name|replace('_', ' ')|title }}</td><td>{{ component.raw }}</td><td>{% if name in ('demand', 'low_competition', 'trend_velocity') and concept.score_breakdown.version != 'legacy' %}{{ '%.0f'|format(component.confidence * 100) }}%{% else %}Estimate{% endif %}</td><td>{{ '%.1f'|format(component.effective) }}</td><td>{{ '%.0f'|format(component.weight * 100) }}%</td></tr>{% endfor %}
+      </tbody></table></div>{% if ip_check_enabled and concept.score_breakdown.get('ip_penalty') %}<p>IP risk adjustment: −{{ concept.score_breakdown.ip_penalty }}.</p>{% endif %}{% endif %}
+      <ul>{% for evidence in concept.data.evidence %}<li><a href="{{ evidence.url }}" target="_blank" rel="noopener noreferrer">{{ evidence.title }}</a> · {{ evidence.get('kind', 'unknown')|replace('_', ' ') }}
+        <p>{{ evidence.claim }}</p>{% if evidence.excerpt %}<blockquote>{{ evidence.excerpt }}</blockquote>{% endif %}
+        {% if evidence.accessed_at or evidence.published_at %}<small>{% if evidence.published_at %}Published {{ evidence.published_at }}. {% endif %}{% if evidence.accessed_at %}Accessed {{ evidence.accessed_at }}.{% endif %}</small>{% endif %}
+        {% for limitation in evidence.get('limitations', []) %}<p class="muted">{{ limitation }}</p>{% endfor %}
+      </li>{% else %}<li>No source evidence recorded.</li>{% endfor %}</ul>
+      {% if concept.data.risks %}<p><strong>Limitations:</strong> {{ concept.data.risks|join('; ') }}</p>{% endif %}
+    </details>
+  </li>{% endfor %}</ol></section>
 </div>
 
 {% if payload.listings %}<section class="panel"><h2>Channel packages</h2><div class="listing-grid">{% for listing in payload.listings.listings %}<article><p class="eyebrow">{{ listing.channel|replace('_', ' ') }}</p><h3>{{ listing.title }}</h3><p>{{ listing.short_description }}</p><div class="tags">{% for tag in listing.tags %}<span>{{ tag }}</span>{% endfor %}</div></article>{% endfor %}</div>

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from urllib.parse import quote_plus
 
+from merch.domain.concept_ranking import weighted_concept_score as weighted_concept_score
 from merch.schemas import CandidateConcept, IPMatch, IPScreeningReport
 
 FORBIDDEN_TERMS = {
@@ -78,19 +79,3 @@ def ip_report_eligible(report: IPScreeningReport, threshold: int = 20) -> bool:
         and report.risk_score <= threshold
         and not any(match.blocking for match in report.matches)
     )
-
-
-def weighted_concept_score(concept: CandidateConcept, include_ip_risk: bool = True) -> float:
-    s = concept.scores
-    score = (
-        0.25 * s.demand
-        + 0.20 * s.trend_velocity
-        + 0.15 * s.purchase_intent
-        + 0.15 * s.novelty
-        + 0.10 * (100 - s.competition)
-        + 0.10 * s.printability
-        + 0.05 * s.longevity
-    )
-    if include_ip_risk and s.ip_risk:
-        score -= min(50, s.ip_risk * 1.5)
-    return round(max(0, score), 2)

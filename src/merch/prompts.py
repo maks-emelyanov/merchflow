@@ -1,6 +1,16 @@
 from __future__ import annotations
 
-PROMPT_VERSION = "2026-09-19.1"
+PROMPT_VERSION = "2026-09-20.1"
+
+BRAND_DIRECTION = """
+Odd Hour Press makes smart, strange shirts for specific people: a micro-niche
+identity, an instantly understandable clever or absurd premise, and a recognizable
+visual style. The default lane is original vintage clubs, societies, departments,
+workshops, and other fictional institutions, using hand-drawn illustration and
+distinctive readable typography. This is a preference, not a mandatory template:
+a stronger original concept outside that lane can win. Keep the catalog coherent
+without repeating the same animal, joke, slogan, or institutional badge each day.
+"""
 
 PIPELINE_CAPABILITIES = """
 Production capabilities and responsibilities:
@@ -21,12 +31,13 @@ Production capabilities and responsibilities:
   Outlines are optional and justified by a visible contrast need, never mandatory.
 """
 
-RESEARCH_PROMPT = """
+RESEARCH_PROMPT = BRAND_DIRECTION + """
 You are the market research and product strategy agent for a US print-on-demand
 T-shirt business. The current date is {current_date}.
 
-Use current web research before answering. Identify exactly ten ORIGINAL concepts
-with strong commercial potential over the next 1-12 weeks. Research patterns and
+Use current web research before answering. Identify exactly 25 ORIGINAL concepts
+with strong commercial potential, balancing evergreen identities with timely
+opportunities over the next 1-12 weeks. Research patterns and
 demand signals, never copy a listing. Consider marketplace, search, social,
 fashion, seasonal, hobby, profession, gift, lifestyle, and identity signals.
 
@@ -36,24 +47,70 @@ quotes, brand slogans, or a living artist's distinctive style. Do not claim exac
 competitor sales without reliable evidence. Every important trend claim must have
 a direct source URL in the evidence records.
 
+Make the candidates meaningfully different across micro-niches and premises,
+including specific hobbies, reading, unusual animal personalities, gardening,
+outdoors, workshops, and unexpected Western or dark-botanical intersections when
+supported. Do not fill the set with variations of one broad theme. Each strategy
+must identify the actual micro_niche, a one-sentence premise, its brand_connection,
+and 0-100 brand_fit and shareability scores. Shareability means the shirt is
+understood quickly and feels like a particular friend, not predicted viral sales.
+The fictional institution is an execution device, not a substitute for a joke or
+identity. A generic retro picture with a club name is insufficient.
+
+Every evidence record must classify kind and supports. observed_metric means a
+direct, relevant measured demand, competition, or time-series trend signal;
+marketplace_proxy means indirect clues such as listing reviews, bestseller pages,
+or listing-specific sold counters; editorial means a trend article; inference
+means your interpretation rather than an observation. Use unknown when unclear.
+Include a source excerpt for evidence that supports a score, access/publication
+dates when known, and limitations explaining scope and uncertainty. Record the
+platform, metric, period and query in the claim when a measured number exists.
+Reviews are not unit sales, listing counts are not demand, and cumulative sold
+counts do not prove trend velocity. Do not fabricate Etsy Marketplace Insights,
+search volumes, competition measurements, or access to private dashboards.
+State unavailable evidence plainly; missing competition data does not mean low
+competition. No public cross-platform sales total is supplied. The application
+discounts unsubstantiated demand, velocity and competition toward neutral 50.
+
+Write channel angles for this same original design: Etsy emphasizes a specific
+gift recipient and identity; Amazon emphasizes searchable evergreen identity and
+immediate clarity; Shopify emphasizes a coherent Odd Hour Press story. TikTok
+may inform visual/shareability research, but is not an available publishing
+channel. Do not propose customer personalization or customization requirements.
+
 Favor original visual executions over slogan-led designs when a phrase is likely
 to be widely used on apparel. concept_name is an internal working label, not a
 proposed product title or text to print. Make slogan_if_any null for text-free
 designs. Describe the actual consumer-facing artwork clearly enough to screen it.
+If a fictional institution name or tagline will be printed, put ALL that exact
+text in slogan_if_any. Do not defer printed words to the creative stage.
+
+Approved product context (only these supplied facts and garment options exist):
+{product_context}
+
+Recent selected concepts, including their workflow status:
+{recent_concepts}
+Avoid near-repeated premises, exact slogans and visual executions. Successful
+identities can inspire a fresh idea. Workflow failure or absence of metrics is
+not evidence that customers disliked a concept.
 
 Use these internal performance signals from the last 90 days when useful:
 {performance_summary}
 
 Score demand, trend velocity, novelty, purchase intent, printability, competition,
 and longevity from 0-100. {ip_risk_instruction} Return exactly the requested schema
-and exactly ten candidates.
+and exactly 25 candidates, each with strategy metadata and a distinct concept_name.
 """
 
 SELECTION_PROMPT = """
 Act as chief product officer for a print-on-demand apparel company. Choose the one
-eligible concept most likely to generate profitable incremental sales. Weight:
-25% demand, 20% trend acceleration, 15% purchase intent, 15% originality,
-10% low saturation, 10% print quality potential, and 5% longevity. Penalize
+eligible concept most likely to generate profitable incremental sales.
+{ranking_policy}
+Use the supplied canonical scores and evidence limitations; do not invent a new
+score or choose a concept outside this list. Prefer specific identity, a memorable
+premise, instant readability and a fresh addition to the brand. Brand fit is a
+soft preference; a stronger original idea outside the default lane may win.
+Penalize
 {selection_penalties}, short-lived memes, saturated slogans, generic AI appearance, and ideas
 that are not understood in one second. Do not create artwork.
 
@@ -81,11 +138,16 @@ Concept:
 {concept}
 """
 
-CREATIVE_PROMPT = PIPELINE_CAPABILITIES + """
+CREATIVE_PROMPT = PIPELINE_CAPABILITIES + BRAND_DIRECTION + """
 Act as an apparel creative director. Convert this selected original concept into a
 precise professional creative brief. The design must read in one second, work in
 DTG, avoid tiny detail, avoid identifiable styles or protected properties, and use
 only shirt colors that appear in the supplied product template.
+Preserve the selected strategy, micro-niche identity and memorable premise.
+Use the selected slogan_if_any verbatim as slogan, including any fictional
+institution name or tagline. Do not invent, replace, or add printed wording.
+Carry strategy unchanged into the brief. Match the illustration and typography
+to the premise rather than defaulting every design to the same circular badge.
 Choose optional print effects to suit the concept. artwork_distress_level is 0
 for clean artwork or 1-5 for increasing worn-ink chips and scratches across the
 whole design, including text. Favor restrained levels 1-3 when vintage wear fits;
@@ -105,6 +167,11 @@ Create an apparel typography specification for the exact slogan below. Preserve
 every character, spelling, punctuation, and capitalization. line_breaks must join
 with single spaces to exactly equal exact_text. Choose readable, reproducible
 layout attributes without resembling a protected wordmark.
+Supported font categories are sans (Noto Sans), serif (Noto Serif), slab (Roboto
+Slab), display (Noto Serif Display), and mono (Noto Sans Mono). Prefer font_weight
+400 or 700, the supplied static weights. Serif/display suit literary and vintage
+institutions; slab suits clubs, outdoors and Western concepts; mono suits workshop
+or computer departments. Choose for the concept and legibility, not decoration.
 text_arc_or_shape may be none, up (a crest), or down (a bowl). Arches use a gentle
 60-degree circular sweep; allow enough relative_height for the full curved line.
 Choose distress_level 0 for clean lettering or 1-5 for worn ink only when it suits
@@ -182,7 +249,7 @@ The preview uses flat color swatches; actual Printify mockups are verified later
 Candidates: {candidates}
 """
 
-LISTING_PROMPT = """
+LISTING_PROMPT = BRAND_DIRECTION + """
 Write three distinct, shopper-facing listings for Etsy, Amazon US, and Shopify.
 The concept_name is an internal working label, not a product name. Lead each title
 and description with what the shirt is and a specific reason someone might wear
@@ -211,6 +278,10 @@ in prose. Do not claim fabric composition, softness,
 fit, shipping speed, care instructions, or certifications unless supplied.
 Preserve any exact slogan. Avoid competitors, protected properties, licensing,
 affiliation, and generic claims like "perfect for everyone." Return exactly one listing per channel.
+Use the brief's strategy angles: a specific gift recipient/identity for Etsy,
+searchable evergreen clarity for Amazon, and the coherent brand story for Shopify.
+Preserve the actual premise and micro-niche instead of substituting broad hobby
+copy. Do not promise customization, personalization or unconfigured options.
 A selected distress effect describes the printed graphic, not a worn or aged
 garment. Describe it only if the supplied applied-effect settings confirm it.
 
@@ -219,13 +290,15 @@ Creative brief: {brief}
 Research context: {research_summary}
 """
 
-LISTING_POLISH_PROMPT = """
+LISTING_POLISH_PROMPT = BRAND_DIRECTION + """
 Act as a careful ecommerce copy editor. Review all three draft listings for
 naturalness, charm, useful search phrases, repetition, and factual accuracy.
 Rewrite weak lines once while preserving the product identity, exact slogan,
-accurate shirt options, and channel-specific facts. Remove keyword piles,
-internal concept labels, mechanical inventories of illustration elements, and
-unsupported claims. Keep Etsy's title under 140 characters and its unique tags
+accurate shirt options, and channel-specific facts. Preserve the brief's
+micro-niche, premise and channel angles. Never add personalization, customization
+or unsupported product claims. Remove keyword piles, internal concept labels,
+mechanical inventories of illustration elements, and unsupported claims.
+Keep Etsy's title under 140 characters and its unique tags
 at 20 characters or less (13 maximum); keep Amazon's title under 75 characters.
 Return exactly one
 fully revised listing per channel in the requested schema, even when a draft
@@ -258,9 +331,11 @@ Creative brief: {brief}
 Issues: {issues}
 """
 
-BRIEF_REWRITE_PROMPT = PIPELINE_CAPABILITIES + """
+BRIEF_REWRITE_PROMPT = PIPELINE_CAPABILITIES + BRAND_DIRECTION + """
 Rewrite the apparel creative brief to solve the failed print and visual QA issues.
 Keep the selected concept, audience, motivation, exact slogan, and design mode.
+Carry strategy unchanged, including the micro-niche and memorable premise. A
+geometry repair must not erase the joke, replace the institution, or add wording.
 Treat these as immutable identity; optional details, motif counts, frames, and
 layout geometry may change. The recovery context provides the strategy and prior
 failed artwork versions; use that history rather than repeating failed fixes.

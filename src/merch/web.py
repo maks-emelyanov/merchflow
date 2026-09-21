@@ -165,6 +165,9 @@ def _run_payload(record: RunRecord) -> dict[str, Any]:
                 "weighted_score": item.weighted_score,
                 "selected": item.selected,
                 "data": item.data,
+                "score_breakdown": (record.selection or {}).get("score_breakdowns", {}).get(
+                    item.data.get("concept_name", "")
+                ),
             }
             for item in record.concepts
         ],
@@ -228,6 +231,10 @@ def _run_page_payload(record: RunRecord, ip_check_enabled: bool) -> dict[str, An
         payload["selected_concept"].get("scores", {}).pop("ip_risk", None)
     for concept in payload["concepts"]:
         concept["data"].get("scores", {}).pop("ip_risk", None)
+        if concept.get("score_breakdown"):
+            concept["score_breakdown"].pop("ip_penalty", None)
+    for breakdown in (payload.get("selection") or {}).get("score_breakdowns", {}).values():
+        breakdown.pop("ip_penalty", None)
     return payload
 
 
@@ -762,7 +769,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         require_admin(request)
         await require_csrf(request)
-        record = ConfigurationRepository(db).save_template(value)
+        repository = ConfigurationRepository(db)
+        try:
+            current = repository.get_template_record()
+        except RuntimeError:
+            record = repository.save_template(value)
+        else:
+            try:
+                record = repository.activate_template(value, expected_version=current.version)
+            except ValueError as exc:
+                raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         RunRepository(db).audit(None, "admin", "template.saved", {"version": record.version})
         return {"version": record.version, "template": value.model_dump(mode="json")}
 

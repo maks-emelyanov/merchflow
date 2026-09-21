@@ -102,8 +102,9 @@ async def test_scheduled_run_recovers_contract_and_separation_failures_without_i
 
     async def research(
         self: OpenAIService, current_date: date, performance_summary: str,
+        **context: Any,
     ) -> ModelResult[ResearchReport]:
-        result = await original_research(self, current_date, performance_summary)
+        result = await original_research(self, current_date, performance_summary, **context)
         first = result.value.candidates[0].model_copy(update={
             "concept_name": "Evening running club", "target_customer": "Social runners",
             "customer_motivation": "Celebrating an evening run with friends",

@@ -76,6 +76,23 @@ def schedule() -> None:
     typer.echo("schedules reconciled")
 
 
+@app.command("setup-comfort-colors")
+def comfort_colors_setup(
+    costs_file: Annotated[Path | None, typer.Option("--costs-file")] = None,
+    activate: Annotated[bool, typer.Option("--activate")] = False,
+) -> None:
+    """Preview Comfort Colors 1717; activate only with reviewed variant costs."""
+    from merch.setup_comfort_colors import read_reviewed_costs, setup_comfort_colors
+
+    try:
+        costs = read_reviewed_costs(costs_file) if costs_file else None
+        result = asyncio.run(setup_comfort_colors(costs, activate=activate))
+    except (ValueError, RuntimeError, OSError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(result, indent=2))
+
+
 @app.command("run")
 def manual_run() -> None:
     """Start a manual production workflow."""

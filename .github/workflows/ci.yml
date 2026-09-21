@@ -10,7 +10,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     env:
       MERCH_PROVIDER_MODE: fake
       MERCH_PUBLISH_MODE: dry_run
@@ -20,6 +20,7 @@ jobs:
         with:
           python-version: "3.14"
       - run: uv sync --extra dev --locked
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fontconfig fonts-noto-core fonts-noto-mono fonts-roboto-slab librsvg2-bin
       - run: uv run ruff check .
       - run: uv run mypy src
       - run: uv run pytest
@@ -40,5 +41,6 @@ jobs:
         with:
           python-version: "3.14"
       - run: uv sync --extra dev --locked
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fontconfig fonts-noto-core fonts-noto-mono fonts-roboto-slab librsvg2-bin
       - run: uv run playwright install --with-deps chromium
       - run: uv run pytest -m playwright

@@ -171,6 +171,9 @@ def _product_context(template: ProductTemplate) -> dict[str, Any]:
         "sizes": sorted({item.size for item in variants}),
         "channels": [item.channel.value for item in template.channels if item.enabled],
         "etsy_production_partner_confirmed": template.etsy_production_partner_confirmed,
+        "garment_facts": (
+            template.garment_facts.model_dump(mode="json") if template.garment_facts else None
+        ),
     }
 
 

@@ -119,7 +119,7 @@ def test_saved_creative_briefs_without_effects_default_to_clean_artwork() -> Non
     }
     brief = CreativeBrief.model_validate(saved)
     assert brief.artwork_distress_level == 0
-    assert brief.model_dump(exclude={"artwork_distress_level", "print_method"}) == saved
+    assert brief.model_dump(exclude={"artwork_distress_level", "print_method", "strategy"}) == saved
 
 
 def test_typography_rendering_failure_returns_a_reviewable_preview_and_failed_qa(

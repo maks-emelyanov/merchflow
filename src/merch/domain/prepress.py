@@ -15,6 +15,7 @@ import httpx
 from PIL import Image, ImageCms, ImageColor, ImageDraw, ImageFilter
 
 from merch.domain.design_effects import apply_design_effects
+from merch.domain.fonts import DEFAULT_FONT_FAMILY, DEFAULT_FONT_FILE
 from merch.schemas import QAIssue, QAReport, TypographySpec
 
 MAX_GENERATION_EDGE = 3840
@@ -83,8 +84,8 @@ def prepare_artwork(
     target_height: int,
     *,
     typography: TypographySpec | None = None,
-    font_family: str = "Noto Sans",
-    font_file: Path = Path("/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"),
+    font_family: str = DEFAULT_FONT_FAMILY,
+    font_file: Path = DEFAULT_FONT_FILE,
     realesrgan_binary: Path | None = None,
     realesrgan_endpoint: str | None = None,
     flat_palette: list[str] | None = None,
@@ -151,12 +152,13 @@ def prepare_artwork(
     canvas.alpha_composite(
         image, ((target_width - image.width) // 2, (target_height - image.height) // 2)
     )
+    use_registry = font_family == DEFAULT_FONT_FAMILY and font_file == DEFAULT_FONT_FILE
     canvas, effects, issues = apply_design_effects(
         canvas,
         typography,
         artwork_distress_level=artwork_distress_level,
-        font_family=font_family,
-        font_file=font_file,
+        font_family=None if use_registry else font_family,
+        font_file=None if use_registry else font_file,
     )
     profile = bytearray(ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes())
     # LCMS inserts the current time in the ICC header. Use a fixed creation date

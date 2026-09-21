@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session, selectinload
 
+from merch.domain.concept_ranking import concept_score_breakdown
+from merch.domain.performance import summarize_performance
 from merch.models import (
     ApprovalRecord,
     ArtifactRecord,
@@ -30,11 +33,32 @@ from merch.schemas import (
 )
 
 
+def lock_active_template(session: Session) -> ProductTemplateRecord | None:
+    """Serialize catalog changes with run starts and terminal-run resumes.
+
+    Call before reading state that will decide whether a run can resume. SQLite
+    omits FOR UPDATE, so a no-op UPDATE acquires its transaction-wide write lock
+    without modifying template data, versions, snapshots, or timestamps.
+    """
+    if session.get_bind().dialect.name == "sqlite":
+        session.execute(text("UPDATE product_templates SET active = active WHERE active = 1"))
+    return session.scalar(
+        select(ProductTemplateRecord)
+        .where(ProductTemplateRecord.active.is_(True))
+        .order_by(ProductTemplateRecord.version.desc())
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+
+
 class RunRepository:
     def __init__(self, session: Session):
         self.session = session
 
     def create(self, value: RunInput, workflow_id: str) -> RunRecord:
+        # Serialize run creation with a catalog switch: after this transaction
+        # commits, activation sees the pending run and cannot change its garment.
+        lock_active_template(self.session)
         existing = self.session.get(RunRecord, str(value.run_id))
         if existing:
             return existing
@@ -70,6 +94,34 @@ class RunRepository:
                 select(RunRecord).order_by(RunRecord.created_at.desc()).limit(limit)
             )
         )
+
+    def recent_concepts(self, exclude_run_id: str, days: int = 90) -> list[dict[str, Any]]:
+        records = self.session.scalars(
+            select(RunRecord)
+            .where(
+                RunRecord.id != exclude_run_id,
+                RunRecord.created_at >= datetime.now(UTC) - timedelta(days=days),
+                RunRecord.selected_concept.is_not(None),
+            )
+            .order_by(RunRecord.created_at.desc())
+        )
+        result: list[dict[str, Any]] = []
+        for record in records:
+            concept = record.selected_concept
+            if not concept:
+                continue
+            result.append({
+                "date": record.created_at.date().isoformat(),
+                "status": record.status,
+                "concept_name": concept.get("concept_name"),
+                "target_customer": concept.get("target_customer"),
+                "slogan": concept.get("slogan_if_any"),
+                "visual_concept": concept.get("visual_concept"),
+                "strategy": concept.get("strategy"),
+            })
+            if len(result) == 30:
+                break
+        return result
 
     def view(self, record: RunRecord) -> RunView:
         return RunView(
@@ -118,7 +170,15 @@ class RunRepository:
         ip_report: dict[str, Any] | None,
     ) -> None:
         record = self.get(run_id, full=True)
-        record.selection = decision
+        record.selection = {
+            **decision,
+            "score_breakdowns": {
+                concept.data["concept_name"]: concept_score_breakdown(
+                    CandidateConcept.model_validate(concept.data), include_ip_risk=ip_report is not None,
+                )
+                for concept in record.concepts
+            },
+        }
         record.selected_concept = selected.model_dump(mode="json")
         record.ip_report = ip_report
         for concept in record.concepts:
@@ -331,7 +391,7 @@ class ConfigurationRepository:
     def __init__(self, session: Session):
         self.session = session
 
-    def get_template(self) -> ProductTemplate:
+    def get_template_record(self) -> ProductTemplateRecord:
         record = self.session.scalar(
             select(ProductTemplateRecord)
             .where(ProductTemplateRecord.active.is_(True))
@@ -339,7 +399,34 @@ class ConfigurationRepository:
         )
         if record is None:
             raise RuntimeError("Product template must be configured before running the pipeline")
-        return ProductTemplate.model_validate(record.data)
+        return record
+
+    def get_template(self) -> ProductTemplate:
+        return ProductTemplate.model_validate(self.get_template_record().data)
+
+    def activate_template(
+        self, template: ProductTemplate, *, expected_version: int
+    ) -> ProductTemplateRecord:
+        current = lock_active_template(self.session)
+        if current is None or current.version != expected_version:
+            raise ValueError("Active template changed during setup; preview the current catalog again")
+        if ProductTemplate.model_validate(current.data) == template:
+            return current
+        terminal = {
+            RunStatus.PUBLISHED.value, RunStatus.REJECTED.value,
+            RunStatus.CANCELLED.value, RunStatus.FAILED.value,
+            RunStatus.NO_SAFE_CANDIDATE.value,
+        }
+        active = self.session.scalar(
+            select(RunRecord.id).where(RunRecord.status.not_in(terminal)).limit(1)
+        )
+        if active:
+            raise ValueError(f"Resolve active run {active} before changing the template")
+        record = self.save_template(template)
+        RunRepository(self.session).audit(
+            None, "admin", "template.activated", {"version": record.version, "name": template.name}
+        )
+        return record
 
     def save_template(self, template: ProductTemplate) -> ProductTemplateRecord:
         current = self.session.scalar(
@@ -397,6 +484,7 @@ class MetricsRepository:
         payload = metric.model_dump(mode="json")
         if identity:
             identity.data = payload
+            identity.concept_id = str(metric.concept_id) if metric.concept_id else identity.concept_id
             identity.imported_at = datetime.now(UTC)
         else:
             self.session.add(
@@ -424,15 +512,55 @@ class MetricsRepository:
         rows = self.recent(days)
         if not rows:
             return "No first-party performance data is available yet."
-        totals: dict[str, dict[str, int]] = {}
+        # A one-time CSV import can predate its publication mapping. Resolve
+        # those saved observations at read time without requiring a reimport.
+        channels = {
+            row.channel for row in rows
+            if not (row.concept_id or row.data.get("concept_id"))
+        }
+        mapped_concepts: dict[tuple[str, str], set[str]] = {}
+        if channels:
+            mappings = self.session.scalars(
+                select(ProductMappingRecord).where(ProductMappingRecord.channel.in_(channels))
+            )
+            for mapping in mappings:
+                if not mapping.concept_id:
+                    continue
+                external_ids = {
+                    mapping.printify_product_id, mapping.marketplace_product_id,
+                    mapping.marketplace_listing_id, mapping.asin, *(mapping.skus or []),
+                }
+                for external_id in external_ids:
+                    if external_id:
+                        mapped_concepts.setdefault(
+                            (mapping.channel, str(external_id)), set(),
+                        ).add(mapping.concept_id)
+        observations = []
+        ids = set()
         for row in rows:
-            bucket = totals.setdefault(row.channel, {"orders": 0, "revenue": 0, "visits": 0})
-            bucket["orders"] += int(row.data.get("orders") or 0)
-            bucket["revenue"] += int(row.data.get("gross_revenue_cents") or 0)
-            bucket["visits"] += int(row.data.get("visits") or 0)
-        return "; ".join(
-            f"{channel}: {data['orders']} orders, ${data['revenue'] / 100:.2f} revenue, {data['visits']} visits"
-            for channel, data in sorted(totals.items())
+            concept_id = row.concept_id or row.data.get("concept_id")
+            if not concept_id and row.external_product_id:
+                matches = mapped_concepts.get((row.channel, row.external_product_id), set())
+                if len(matches) == 1:
+                    concept_id = next(iter(matches))
+            if concept_id:
+                ids.add(concept_id)
+            observations.append({
+                **row.data, "concept_id": concept_id,
+                "channel": row.channel, "source": row.source,
+                "external_product_id": row.external_product_id,
+                "metric_date": row.metric_date.isoformat(),
+            })
+        concepts = {
+            item.id: {
+                "name": item.data.get("concept_name"),
+                "strategy": item.data.get("strategy"),
+                "target_customer": item.data.get("target_customer"),
+            }
+            for item in self.session.scalars(select(ConceptRecord).where(ConceptRecord.id.in_(ids)))
+        }
+        return json.dumps(
+            summarize_performance(observations, concepts, days), sort_keys=True,
         )
 
     def connector_result(

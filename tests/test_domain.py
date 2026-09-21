@@ -28,6 +28,7 @@ from merch.schemas import (
     IPMatch,
     IPScreeningReport,
     MarketplaceListingSet,
+    NewResearchReport,
     QAIssue,
     QAReport,
     ResearchReport,
@@ -41,11 +42,15 @@ from merch.services.storage import ArtifactStorage
 
 
 @pytest.mark.asyncio
-async def test_research_schema_requires_exactly_ten_candidates() -> None:
+async def test_new_research_has_25_candidates_and_legacy_reports_remain_readable() -> None:
     report = (
         await OpenAIService(Settings()).research(__import__("datetime").date.today(), "none")
     ).value
-    assert len(report.candidates) == 10
+    assert len(report.candidates) == 25
+    legacy = {**report.model_dump(), "candidates": report.candidates[:10]}
+    assert len(ResearchReport.model_validate(legacy).candidates) == 10
+    with pytest.raises(ValidationError):
+        NewResearchReport.model_validate(legacy)
     with pytest.raises(ValidationError):
         ResearchReport.model_validate({**report.model_dump(), "candidates": report.candidates[:9]})
 
@@ -62,6 +67,7 @@ def test_evidence_url_is_validated_without_unsupported_uri_schema() -> None:
 def test_openai_structured_schemas_avoid_dynamic_objects_and_uri_format() -> None:
     for schema in (
         ResearchReport,
+        NewResearchReport,
         SelectionDecision,
         CreativeBrief,
         TypographySpec,

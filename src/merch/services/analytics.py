@@ -4,12 +4,16 @@ import asyncio
 import csv
 import io
 from datetime import UTC, date, datetime, timedelta
+from fractions import Fraction
 from typing import Any, cast
 
 import httpx
 
 from merch.config import Settings
 from merch.schemas import Channel, DailyPerformance
+
+ETSY_RECEIPT_PAGE_SIZE = 100
+ETSY_MAX_RECEIPT_PAGES = 121  # Etsy's maximum supported offset is 12,000.
 
 
 def _cents(value: Any) -> int | None:
@@ -159,24 +163,59 @@ class EtsyAnalyticsClient:
         await self._get(f"/application/shops/{self.settings.etsy_shop_id}/receipts", limit=1)
         return "connected"
 
+    async def _receipts_since(self, since: date) -> list[dict[str, Any]]:
+        """Return a complete bounded receipt window, or fail without partial totals."""
+        min_created = int(datetime.combine(since, datetime.min.time(), tzinfo=UTC).timestamp())
+        max_created = int(datetime.now(UTC).timestamp())
+        receipts: list[dict[str, Any]] = []
+        receipt_ids: set[int] = set()
+        expected_count: int | None = None
+        for _ in range(ETSY_MAX_RECEIPT_PAGES):
+            data = await self._get(
+                f"/application/shops/{self.settings.etsy_shop_id}/receipts",
+                min_created=min_created, max_created=max_created,
+                limit=ETSY_RECEIPT_PAGE_SIZE, offset=len(receipts),
+                sort_on="receipt_id", sort_order="asc",
+            )
+            count = int(data["count"])
+            if count < 0 or count > ETSY_RECEIPT_PAGE_SIZE * ETSY_MAX_RECEIPT_PAGES:
+                raise RuntimeError("Etsy receipt window exceeds supported pagination; import CSV instead")
+            if expected_count is not None and count != expected_count:
+                raise RuntimeError("Etsy receipt count changed during pagination; retry the sync")
+            expected_count = count
+            page = data.get("results", [])
+            if len(page) > ETSY_RECEIPT_PAGE_SIZE or len(receipts) + len(page) > count:
+                raise RuntimeError("Etsy returned an inconsistent receipt page; retry the sync")
+            for receipt in page:
+                receipt_id = int(receipt["receipt_id"])
+                if receipt_id in receipt_ids:
+                    raise RuntimeError("Etsy repeated a receipt during pagination; retry the sync")
+                receipt_ids.add(receipt_id)
+                receipts.append(receipt)
+            if len(receipts) == count:
+                return receipts
+            if not page:
+                raise RuntimeError("Etsy returned an incomplete receipt window; retry the sync")
+        raise RuntimeError("Etsy receipt pagination limit reached; import CSV instead")
+
     async def sync(self, since: date) -> list[DailyPerformance]:
         if not self.configured:
             return []
-        min_created = int(datetime.combine(since, datetime.min.time(), tzinfo=UTC).timestamp())
-        data = await self._get(
-            f"/application/shops/{self.settings.etsy_shop_id}/receipts",
-            min_created=min_created,
-            limit=100,
-        )
+        receipts = await self._receipts_since(since)
         output: dict[tuple[date, str], DailyPerformance] = {}
-        for receipt in data.get("results", []):
+        for receipt in receipts:
             when = datetime.fromtimestamp(receipt["create_timestamp"], UTC).date()
+            receipt_listings: set[str] = set()
             for transaction in receipt.get("transactions", []):
                 listing_id = str(transaction.get("listing_id"))
                 key = (when, listing_id)
                 current = output.get(key)
                 amount = transaction.get("price", {})
-                revenue = int(amount.get("amount", 0) / max(1, amount.get("divisor", 100)) * 100)
+                quantity = int(transaction.get("quantity", 1))
+                revenue = round(Fraction(
+                    int(amount.get("amount", 0)) * quantity * 100,
+                    max(1, int(amount.get("divisor", 100))),
+                ))
                 if current is None:
                     current = DailyPerformance(
                         metric_date=when,
@@ -186,11 +225,15 @@ class EtsyAnalyticsClient:
                         units=0,
                         gross_revenue_cents=0,
                         source="etsy_api",
-                        completeness={"sales": True, "traffic": False},
+                        completeness={"sales": True, "traffic": False, "receipt_window_complete": True},
                     )
                     output[key] = current
-                current.orders = (current.orders or 0) + 1
-                current.units = (current.units or 0) + int(transaction.get("quantity", 1))
+                # Different variations of one listing can share a receipt. They
+                # contribute units and revenue separately, but only one order.
+                if listing_id not in receipt_listings:
+                    current.orders = (current.orders or 0) + 1
+                    receipt_listings.add(listing_id)
+                current.units = (current.units or 0) + quantity
                 current.gross_revenue_cents = (current.gross_revenue_cents or 0) + revenue
         return list(output.values())
 
@@ -299,6 +342,12 @@ class AmazonAnalyticsClient:
                     gross_revenue_cents=_cents(sales.get("orderedProductSales", {}).get("amount")),
                     refunds_cents=_cents(sales.get("refundAmount", {}).get("amount")),
                     source="amazon_sales_and_traffic",
+                    period_start=date.fromisoformat(
+                        payload["reportSpecification"]["dataStartTime"][:10]
+                    ) if payload["reportSpecification"].get("dataStartTime") else since,
+                    period_end=date.fromisoformat(
+                        payload["reportSpecification"]["dataEndTime"][:10]
+                    ),
                     completeness={"sales": True, "traffic": True, "fees": False},
                 )
             )

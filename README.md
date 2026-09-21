@@ -4,7 +4,7 @@ MerchFlow turns product research into print-ready artwork and verified Etsy list
 
 The engineering focus is recovery and correctness across external APIs: checkpoints preserve completed model calls, bounded revisions recover from artwork defects, uncertain publication requests require reconciliation before replay, and pixel comparisons verify the photos actually served by Etsy. Audit artifacts, Prometheus metrics, and optional OpenTelemetry tracing make the workflow inspectable.
 
-Each daily workflow researches ten concepts, ranks them, creates and validates one product package, then publishes enabled channels independently through Printify. Manual release approval, IP screening and attestation, and the Etsy production-partner confirmation check can each be enabled when needed.
+Each daily workflow researches 25 concepts, ranks them, creates and validates one product package, then publishes enabled channels independently through Printify. Odd Hour Press's default direction is specific identity and smart, strange humor expressed through original vintage clubs, companies, and institutions, with room for strong related ideas. Manual release approval, IP screening and attestation, and the Etsy production-partner confirmation check can each be enabled when needed.
 
 The safe default uses fake model/provider responses and `MERCH_PUBLISH_MODE=dry_run`. Scheduled and manual runs can complete automatically in dry-run mode. Live marketplace mutation requires an explicit `MERCH_PUBLISH_MODE=live` setting; QA, catalog, price, variant, and storefront verification still gate publication.
 
@@ -38,21 +38,21 @@ The example passwords and service ports are for local development. Compose binds
 
 The startup migration creates the application schema. The scheduler runs both analytics and product development daily at **09:30 America/New_York**, and the worker executes both workflows. Set `MERCH_WORKFLOW_HOUR`, `MERCH_ANALYTICS_HOUR`, `MERCH_SCHEDULE_MINUTE`, and `MERCH_SCHEDULE_TIMEZONE` to adjust the schedule. Scheduled launchers create deterministic `merch-daily-YYYY-MM-DD` workflow IDs, so a daily run cannot be duplicated. Reconciliation preserves an existing pause.
 
-For a fast host-only acceptance run with no services or external APIs, install Python 3.14 and [uv](https://docs.astral.sh/uv/), then run:
+For a fast host-only acceptance run with no services or external APIs, install Python 3.14, [uv](https://docs.astral.sh/uv/), and the [font/rendering dependencies](#typography-dependencies), then run:
 
 ```bash
 uv sync --extra dev --locked
-uv run merch fixture
-uv run merch fixture --approve
+MERCH_ENV_FILE=.env.example uv run merch fixture
+MERCH_ENV_FILE=.env.example uv run merch fixture --approve
 ```
 
 The fixture command stops at `awaiting_approval` so its package can be inspected. `--approve` explicitly exercises dry-run channel publication. Normal Temporal workflows release automatically when manual checks are disabled.
 
 ## What is implemented
 
-- Strict Pydantic schemas for research, ten candidates, selection, creative/typography briefs, IP evidence, QA, listings, pricing, templates, approval, and normalized analytics.
+- Strict Pydantic schemas for research, 25 new candidates, selection, creative/typography briefs, IP evidence, QA, listings, pricing, templates, approval, and normalized analytics. Historical 10-candidate reports remain readable.
 - OpenAI Responses API structured parsing with Astra for selection, creative direction, and visual QA; Terra for research, typography, and listings. Web-search-enabled research and optional IP checks store prompts, response IDs, citations, usage, model and schema versions. Raster generation/editing uses `gpt-image-2.5-sunburst` without asking the model to render text.
-- Exact slogan rendering through SVG/librsvg’s Pango/HarfBuzz stack and the container’s Noto Sans OFL font. Output is transparent sRGB PNG at exact catalog dimensions with 300-DPI metadata.
+- Exact slogan rendering through SVG/librsvg’s Pango/HarfBuzz stack, with Noto Sans, Noto Serif, Roboto Slab, Noto Serif Display, and Noto Sans Mono. Output is transparent sRGB PNG at exact catalog dimensions with 300-DPI metadata.
 - Deterministic dimensions, alpha, size, text equality, padding, color contrast, dark-garment gradient and enlargement checks. Passing deterministic checks proceed to vision QA; failed checks go directly to a targeted revision, up to three total attempts.
 - When enabled, IP screening uses denylisted brands/properties, web/marketplace evidence, USPTO search links and `ip_risk > 20` rejection. This is evidence, not legal clearance.
 - Versioned immutable SHA-256 storage in MinIO/S3 or the local filesystem. Regeneration, copy edits, price edits, and post-approval cost changes invalidate approval.
@@ -79,7 +79,7 @@ Configure one active product template through `PUT /api/template` (the OpenAPI c
 next .99((production cost + fixed channel fee) / (1 - percentage fee - 0.40))
 ```
 
-Shipping is buyer-paid and excluded. Listing metadata is generated only from this snapshot. Before publishing, the worker re-reads the catalog; availability/cost changes update the package version and send it back for approval.
+Shipping is buyer-paid and excluded. Listing metadata is generated only from this snapshot. Before publishing, the worker rechecks catalog availability and print areas. Unavailable variants block release or require a revised package and QA. Printify's catalog API does not supply production costs, so operators must review and update those costs; changes to approved prices or costs invalidate approval.
 
 For the Etsy-only Bella+Canvas 3001 / SwiftPOD setup, `docker compose exec -T web .venv/bin/python -m merch.setup_etsy_tee` verifies live catalog variant IDs and installs a versioned 14-color, XS-3XL (98-variant) template using the existing Etsy shop and fee assumptions. The base colors are Black, White, Navy, Asphalt, Dark Grey Heather, Athletic Heather, Natural, Military Green, Olive, Light Blue, Maroon, True Royal, Red, and Soft Pink. The selection prioritizes [Printify's top-selling colors](https://printify.com/blog/product-variants/) where this provider offers them, then adds familiar choices across light, dark, and accent colors. Swatch hex values approximate the garment colors for artwork QA; verify them against garment samples when color matching matters. Production costs were reviewed in Printify on 2026-09-16; recheck prices and stock before live publishing. Artwork QA checks every enabled shirt color, and removes colors that fail contrast for that product.
 
@@ -88,6 +88,54 @@ Set `MERCH_IP_CHECK_ENABLED=true` to run deterministic and web-search IP checks 
 Manual checks are opt-in. `MERCH_MANUAL_APPROVAL_ENABLED=false`, `MERCH_ETSY_PRODUCTION_PARTNER_CHECK_ENABLED=false`, and `MERCH_IP_CHECK_ENABLED=false` are the defaults. When all three are off, a passing package automatically releases to its enabled channels; the release still checks the exact package version, current Printify catalog, QA, approved prices, and live storefront results. Set `MERCH_MANUAL_APPROVAL_ENABLED=true` to require channel selection and typing `PUBLISH` on the run page. Enabling either IP screening or the Etsy partner check also requires the human release step. These settings take effect after restarting the web and worker.
 
 Set `MERCH_PROVIDER_MODE=live` to call OpenAI and validate Printify. Keep `MERCH_PUBLISH_MODE=dry_run` while validating credentials and previews. Only after that set `MERCH_PUBLISH_MODE=live`; enabled channels can then publish automatically after QA and validation. When manual checks are enabled, the workflow waits for their required review and confirmation.
+
+### Daily product strategy
+
+Fresh research produces 25 distinct, strategy-bearing concepts with a micro-niche, recognizable premise, brand connection, and channel-specific positioning. The research prompt includes the active garment facts and enabled channels, source-aware first-party metrics, and the latest 30 selected concepts from the preceding 90 days. Production failures are not treated as customer-demand failures. This larger research set uses more model tokens than the former ten-concept batch.
+
+The canonical score weights demand and purchase intent at 20% each; originality, low competition, printability, brand fit, and shareability at 10% each; and momentum and longevity at 5% each. Demand, inverse competition, and momentum are adjusted toward neutral 50 by supporting evidence: observed metrics have confidence 1, marketplace proxies 0.5, editorial evidence 0.25, and unsupported inference 0. A supporting excerpt is required. These values are selection heuristics, not validated sales predictions. Reviews are not unit sales; cumulative sold counts do not establish acceleration. The selection model chooses from up to three eligible concepts within five points of the leader, and the application stores the calculated score. Existing IP screening and penalties still apply when enabled.
+
+The run page shows the premise, channel positioning, candidate score components, sources, dates, and evidence limitations. Exact printed wording and selected strategy survive creative direction and recovery. Saved research and selected runs are reused, and legacy concepts retain their prior scoring behavior. These additions use existing JSON storage and require no database migration.
+
+Performance feedback preserves unknown values and concept attribution. Product mappings added after a CSV import are used in subsequent summaries without requiring reimport. For overlapping Etsy API/CSV observations it prefers sales fields from a complete API receipt import and fills missing fields from CSV, counting each product/day/metric once. CSV takes precedence over older API imports whose pagination coverage is unknown. Amazon contributes only the latest reporting window for each product. Source and coverage limitations remain visible in the research context.
+
+### Comfort Colors 1717 setup
+
+The supported default-garment transition is Comfort Colors 1717 / SwiftPOD, blueprint 706 / provider 39, with Pepper, Ivory, Black, Blue Jean, Moss, Espresso, True Navy, and Crimson in S–3XL (48 variants). Existing installations keep their active garment until setup verifies the catalog and reviewed costs and activates a new template version.
+
+Setup requires a configured Printify token and an existing template with an enabled Etsy channel. Preview the live catalog without changing configuration, and keep the report in the ignored output directory:
+
+```bash
+mkdir -p output/reports
+docker compose exec -T web .venv/bin/merch setup-comfort-colors > output/reports/comfort-colors-preview.json
+```
+
+The preview contains variant IDs and a `costs_file_template`. Save that object as `output/reports/comfort-colors-costs.json` and replace every null cost with the actual reviewed Printify USD production cost in positive integer cents. Set `reviewed_at` to the date you checked the costs; future dates are rejected. The structure is `currency: "USD"`, `reviewed_at: "YYYY-MM-DD"`, and `costs_by_variant`, keyed by exactly the 48 returned variant IDs. Headline prices and Bella+Canvas costs are never substituted: [Printify's catalog API](https://developers.printify.com/#catalog) does not provide production costs.
+
+Copy the reviewed file into the web container, preview calculated retail prices, then activate:
+
+```bash
+docker compose cp output/reports/comfort-colors-costs.json web:/tmp/comfort-colors-costs.json
+docker compose exec -T web .venv/bin/merch setup-comfort-colors --costs-file /tmp/comfort-colors-costs.json
+docker compose exec -T web .venv/bin/merch setup-comfort-colors --costs-file /tmp/comfort-colors-costs.json --activate
+```
+
+Setup preserves existing channel/shop settings, fees, Etsy listing defaults, and production-partner configuration. It requires all requested variants and proportionally compatible front-DTG print areas, rendering at the largest available dimensions. Before activation it rereads the catalog and checks that the template version is unchanged. Missing variants, missing costs, an active run, or a concurrent template change prevents activation with an actionable error. Finish or cancel active runs before switching garments. Repeat activation with identical settings is idempotent. The Connectors template editor uses the same active-run guard. Installing this release alone does not activate Comfort Colors.
+
+New runs use verified garment-dyed and relaxed-fit facts in their copy. These facts do not support oversized or acid-washed claims. Artwork QA can omit an unreadable color while retaining the full size range in every remaining color; existing Bella+Canvas runs keep their original color-replacement rules. Historical packages retain their saved garment when resumed and still undergo catalog, price, and QA checks before publication. Published listings are unchanged by template activation.
+
+### Typography dependencies
+
+Docker and CI install the required fonts and renderer. For equivalent host rendering on Debian/Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y fontconfig fonts-noto-core fonts-noto-mono fonts-roboto-slab librsvg2-bin
+```
+
+Other operating systems need the same font families and an `rsvg-convert` executable on `PATH`; Docker provides the reference environment. The categories resolve to Noto Sans (sans), Noto Serif (serif), Roboto Slab (slab), Noto Serif Display (display), and Noto Sans Mono (mono). The registry uses Regular (400) or Bold (700) faces and records the actual family, weight, and font hash with each artifact. Pillow measurement and SVG rendering resolve the same face. Missing fonts produce a reviewable typography QA error.
+
+Setting `MERCH_FONT_FAMILY` and `MERCH_FONT_FILE` to a nondefault pair remains a global custom-font override. Unregistered custom files use Pillow to avoid silent SVG font substitution. Existing saved artwork is not regenerated when fonts change. Noto packages include OFL licensing; Debian's Roboto Slab package includes its Apache-2.0 license.
 
 ### OpenAI cost controls
 
@@ -202,7 +250,7 @@ uv run pytest
 MERCH_ENV_FILE=.env.example docker compose config --quiet
 ```
 
-The default test run skips the opt-in Temporal and browser integration tests. Run those groups in separate pytest processes, matching CI:
+The main suite includes large raster and publication tests and can take about 25 minutes; its CI job allows 35 minutes. The default test run skips the opt-in Temporal and browser integration tests. Run those groups in separate pytest processes, matching CI:
 
 ```bash
 RUN_TEMPORAL_TESTS=1 uv run pytest -m temporal
@@ -212,16 +260,15 @@ RUN_PLAYWRIGHT=1 uv run pytest -m playwright
 
 CI runs all three test groups with fake providers or mocked HTTP transports and does not call live marketplace APIs. Tests cover strict schemas, ranking/IP rules, pricing, typography equality, prepress/alpha/profile checks, hashing, encryption/redaction, metrics/CSV normalization, OpenAI and Printify contracts, automatic and manual release, CSRF and authentication. Recovery tests cover persistent rewrite budgets and interrupted publication checkpoints. Mockup tests cover rendered-variant selection, duplicate and swapped photo content, JPEG/resizing tolerance, changes during verification, resumed/adopted listings, cross-channel status, and authenticated evidence access.
 
-Generated artwork, run reports, local databases, `.env` files, and backups are excluded from Git. Use `.env.example` as the configuration template. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and pull request guidance and [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
-
-## Publishing and license
-
-Create an empty GitHub repository, then connect and push this existing `main` branch:
+Daily-design tests cover 25-concept validation, legacy reports, evidence-adjusted ranking, selection fallback, saved checkpoints, exact slogan/strategy recovery, source-aware performance, and all five font families. Comfort Colors tests cover catalog/cost validation, activation conflicts, preserved Etsy settings, and a complete fake-provider dry run. To exercise the actual 4200×4800 print dimensions as well:
 
 ```bash
-git remote add origin <github-repository-url>
-git push -u origin main
+MERCH_TEST_FULL_PRINT_SIZE=1 uv run pytest tests/test_comfort_colors_pipeline.py
 ```
+
+Generated artwork, run reports, local databases, `.env` files, and backups are excluded from Git. Use `.env.example` as the configuration template. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and pull request guidance and [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+
+## License
 
 This project is released under the [MIT License](LICENSE). It permits use, modification, and redistribution, including commercial use, as long as the copyright and license notice are kept with copies of the software.
 

@@ -72,6 +72,13 @@ class Evidence(StrictModel):
     published_at: date | None = None
     accessed_at: datetime | None = None
     excerpt: str | None = None
+    kind: Literal[
+        "observed_metric", "marketplace_proxy", "editorial", "inference", "unknown"
+    ] = "unknown"
+    supports: list[Literal["demand", "competition", "trend_velocity"]] = Field(
+        default_factory=list
+    )
+    limitations: list[str] = Field(default_factory=list)
 
     @field_validator("url")
     @classmethod
@@ -92,6 +99,17 @@ class ConceptScores(StrictModel):
     ip_risk: Score
 
 
+class ConceptStrategy(StrictModel):
+    micro_niche: str
+    premise: str
+    brand_connection: str
+    brand_fit: Score
+    shareability: Score
+    etsy_angle: str
+    amazon_angle: str
+    shopify_angle: str
+
+
 class CandidateConcept(StrictModel):
     concept_name: str
     target_customer: str
@@ -110,12 +128,26 @@ class CandidateConcept(StrictModel):
     risks: list[str]
     scores: ConceptScores
     evidence: list[Evidence]
+    strategy: ConceptStrategy | None = None
 
 
 class ResearchReport(StrictModel):
     current_date: date
     market_summary: str
-    candidates: Annotated[list[CandidateConcept], Field(min_length=10, max_length=10)]
+    candidates: Annotated[list[CandidateConcept], Field(min_length=10, max_length=30)]
+
+
+class NewResearchReport(ResearchReport):
+    candidates: Annotated[list[CandidateConcept], Field(min_length=25, max_length=25)]
+
+    @model_validator(mode="after")
+    def distinct_strategy_concepts(self) -> NewResearchReport:
+        names = [" ".join(item.concept_name.split()).casefold() for item in self.candidates]
+        if any(not name for name in names) or len(set(names)) != len(names):
+            raise ValueError("new research requires 25 distinct nonempty concept names")
+        if any(item.strategy is None for item in self.candidates):
+            raise ValueError("every new research candidate requires a strategy")
+        return self
 
 
 class RejectedConcept(StrictModel):
@@ -145,6 +177,7 @@ class CreativeBrief(StrictModel):
     typography_style: str | None
     generation_brief: str
     artwork_distress_level: int = Field(default=0, ge=0, le=5)
+    strategy: ConceptStrategy | None = None
 
 
 class TypographySpec(StrictModel):
@@ -299,6 +332,20 @@ class ChannelConfig(StrictModel):
         return self
 
 
+class GarmentFacts(StrictModel):
+    brand: str | None = None
+    model: str | None = None
+    finish: str | None = None
+    fit: str | None = None
+    source_url: str | None = None
+    verified_at: date | None = None
+
+    @field_validator("source_url")
+    @classmethod
+    def valid_http_url(cls, value: str | None) -> str | None:
+        return str(TypeAdapter(HttpUrl).validate_python(value)) if value is not None else None
+
+
 class ProductTemplate(StrictModel):
     name: str
     blueprint_id: int
@@ -311,6 +358,8 @@ class ProductTemplate(StrictModel):
     featured_variant_id: int | None = None
     channels: Annotated[list[ChannelConfig], Field(min_length=1)]
     etsy_production_partner_confirmed: bool = False
+    garment_facts: GarmentFacts | None = None
+    production_costs_reviewed_at: date | None = None
 
     @model_validator(mode="after")
     def unique_catalog_configuration(self) -> ProductTemplate:
@@ -385,6 +434,8 @@ class PublishInput(StrictModel):
 
 class DailyPerformance(StrictModel):
     metric_date: date
+    period_start: date | None = None
+    period_end: date | None = None
     channel: Channel
     concept_id: UUID | None = None
     external_product_id: str | None = None

@@ -68,6 +68,18 @@ class PrintifyClient:
     async def blueprints(self) -> list[dict[str, Any]]:
         return cast(list[dict[str, Any]], await self._request("GET", "/catalog/blueprints.json"))
 
+    async def blueprint(self, blueprint_id: int) -> dict[str, Any]:
+        return cast(
+            dict[str, Any],
+            await self._request("GET", f"/catalog/blueprints/{blueprint_id}.json"),
+        )
+
+    async def print_providers(self, blueprint_id: int) -> list[dict[str, Any]]:
+        return cast(
+            list[dict[str, Any]],
+            await self._request("GET", f"/catalog/blueprints/{blueprint_id}/print_providers.json"),
+        )
+
     async def variants(self, blueprint_id: int, provider_id: int) -> dict[str, Any]:
         return cast(
             dict[str, Any],

@@ -28,6 +28,7 @@ from merch.config import Settings, get_settings
 from merch.schemas import (
     ApprovalSignal,
     CreativeBrief,
+    ProductTemplate,
     PublishInput,
     PublishStatus,
     RunInput,
@@ -519,10 +520,11 @@ async def start_manual_run(settings: Settings | None = None) -> RunInput:
 async def resume_researched_run(run_id: str, settings: Settings | None = None) -> RunInput:
     """Resume a failed run after research without repeating its paid research call."""
     from merch.database import session_scope
-    from merch.repository import RunRepository
+    from merch.repository import RunRepository, lock_active_template
 
     settings = settings or get_settings()
     with session_scope() as session:
+        lock_active_template(session)
         repository = RunRepository(session)
         record = repository.get(run_id, full=True)
         if (
@@ -582,11 +584,12 @@ async def retry_failed_artwork_run(
     """Retry artwork after a QA failure without repeating research or selection."""
     from merch.database import session_scope
     from merch.domain.ip_screening import ip_report_eligible
-    from merch.repository import ConfigurationRepository, RunRepository
-    from merch.schemas import IPScreeningReport
+    from merch.repository import ConfigurationRepository, RunRepository, lock_active_template
+    from merch.schemas import CandidateConcept, IPScreeningReport
 
     settings = settings or get_settings()
     with session_scope() as session:
+        lock_active_template(session)
         repository = RunRepository(session)
         record = repository.get(run_id, full=True)
         ip_eligible = True
@@ -617,13 +620,23 @@ async def retry_failed_artwork_run(
         if revised_brief is not None:
             if revised_brief.concept_name != record.selected_concept["concept_name"]:
                 raise ValueError("Revised brief must retain the selected concept")
-            if revised_brief.model_dump(mode="json") == record.creative_brief:
+            selected = CandidateConcept.model_validate(record.selected_concept)
+            previous_brief = (
+                CreativeBrief.model_validate(record.creative_brief) if record.creative_brief else None
+            )
+            if selected.strategy is not None:
+                if revised_brief.slogan != selected.slogan_if_any:
+                    raise ValueError("Revised brief must preserve the selected concept's exact printed slogan")
+                revised_brief = revised_brief.model_copy(update={"strategy": selected.strategy})
+                if previous_brief is not None:
+                    previous_brief = previous_brief.model_copy(update={"strategy": selected.strategy})
+            if previous_brief is not None and revised_brief == previous_brief:
                 raise ValueError("Revise the creative brief before retrying artwork")
-            allowed_colors = {
-                item.color
-                for item in ConfigurationRepository(session).get_template().variants
-                if item.enabled
-            }
+            template = (
+                ProductTemplate.model_validate(record.template_snapshot)
+                if record.template_snapshot else ConfigurationRepository(session).get_template()
+            )
+            allowed_colors = {item.color for item in template.variants if item.enabled}
             if not set(revised_brief.shirt_colors).issubset(allowed_colors):
                 raise ValueError("Revised brief contains colors outside the enabled template")
             record.creative_brief = revised_brief.model_dump(mode="json")

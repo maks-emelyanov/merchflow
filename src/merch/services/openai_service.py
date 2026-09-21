@@ -13,7 +13,11 @@ from pydantic import BaseModel
 
 from merch.config import Settings
 from merch.domain.artwork_recovery import RecoveryContext
-from merch.domain.ip_screening import weighted_concept_score
+from merch.domain.concept_ranking import (
+    concept_score_breakdown,
+    selection_candidates,
+    weighted_concept_score,
+)
 from merch.domain.prepress import make_fixture_art
 from merch.prompts import (
     ARTWORK_PROMPT,
@@ -34,12 +38,14 @@ from merch.schemas import (
     CandidateConcept,
     Channel,
     ConceptScores,
+    ConceptStrategy,
     CreativeBrief,
     DesignMode,
     Evidence,
     IPScreeningReport,
     MarketplaceListing,
     MarketplaceListingSet,
+    NewResearchReport,
     QAIssue,
     QAReport,
     RejectedConcept,
@@ -160,11 +166,15 @@ class OpenAIService:
         )
 
     async def research(
-        self, current_date: date, performance_summary: str
+        self, current_date: date, performance_summary: str,
+        *, product_context: dict[str, Any] | None = None,
+        recent_concepts: list[dict[str, Any]] | None = None,
     ) -> ModelResult[ResearchReport]:
         prompt = RESEARCH_PROMPT.format(
             current_date=current_date.isoformat(),
             performance_summary=performance_summary,
+            product_context=json.dumps(product_context or {}),
+            recent_concepts=json.dumps(recent_concepts or []),
             ip_risk_instruction=(
                 "Score IP risk from 0-100, where 0 is safest and 100 is riskiest."
                 if self.settings.ip_check_enabled
@@ -172,28 +182,69 @@ class OpenAIService:
             ),
         )
         if self.client:
-            return await self._parse(
-                prompt, ResearchReport, web_search=True, model=self.settings.openai_research_model
+            result = await self._parse(
+                prompt, NewResearchReport, web_search=True, model=self.settings.openai_research_model
             )
+            # Validate the fresh contract even when a mocked/custom provider bypasses parsing.
+            report = NewResearchReport.model_validate(result.value.model_dump())
+            return ModelResult(report, result.metadata)
+        # These are fictional development fixtures, not claimed market findings.
+        ideas = [
+            ("Trail Ritual 1", "quiet morning hikers", "The early trail is a quiet commuter route", "A sunrise nested inside a simple switchback trail silhouette", "TAKE THE SCENIC ROUTE"),
+            ("Trail Ritual 2", "hikers who pack more snacks than gear", "Trail maintenance is mostly snack breaks", "A tiny backpack overflowing with trail snacks beside a mountain", None),
+            ("Pigeon Lunch Bureau", "city walkers who share snacks with birds", "Pigeons conduct solemn lunch inspections", "A dignified pigeon guarding a single pretzel", "PIGEON LUNCH BUREAU"),
+            ("After Hours Reading", "readers with overdue library books", "A skeleton librarian works the never-ending late shift", "A skeleton reading behind a stack of library returns", "AFTER HOURS READING DEPT."),
+            ("Raccoon Night Inventory", "night owls who love convenience-store snacks", "A raccoon takes snack inventory far too seriously", "A raccoon examining a paper snack bag with a small clipboard", None),
+            ("Moss Inspection Club", "gardeners who admire things growing slowly", "A snail is the chief inspector of moss", "A snail studying a patch of moss through a magnifying glass", "MOSS INSPECTION CLUB"),
+            ("Lunar Coffee Watch", "amateur astronomers fueled by coffee", "A coffee cup serves as a miniature lunar observatory", "A telescope beside a coffee mug beneath a crescent moon", None),
+            ("Desktop Cat Archives", "programmers whose cats interrupt work", "A cat supervises an obsolete computer archive", "A cat asleep on a chunky retro computer monitor", "DESKTOP CAT ARCHIVES"),
+            ("Cardio Exemption Office", "lifters who dislike cardio", "A tortoise issues official cardio exemptions", "A serious tortoise holding a small dumbbell", "CARDIO EXEMPTION OFFICE"),
+            ("Solo Cast Society", "fly fishers who prefer quiet company", "The club has room for exactly one chair", "A fishing rod beside one folding chair at a calm river", "SOLO CAST SOCIETY"),
+            ("Botanical Night Shift", "plant lovers drawn to gothic illustration", "Moths tend an imaginary moonlit greenhouse", "Two broad-winged moths hovering over a night-blooming flower", None),
+            ("Desert Book Courier", "readers with a Western sense of humor", "A pack mule delivers an unreasonable number of books", "A mule carrying two neatly stacked book panniers", "DESERT BOOK COURIER"),
+            ("Failed Parking Club", "drivers who love tiny old hatchbacks", "An insignificant hatchback receives grand racing treatment", "A small boxy hatchback next to an oversized traffic cone", "FAILED PARKING CLUB"),
+            ("Midnight Stitch Union", "crocheters who promise one last row", "An owl runs the night shift at a yarn workshop", "An owl holding a crochet hook beside a ball of yarn", "MIDNIGHT STITCH UNION"),
+            ("Low Stakes Bowling", "casual bowlers who enjoy the social ritual", "A bowling trophy celebrates simply showing up", "A humble bowling pin resting on a tiny trophy pedestal", None),
+            ("Sourdough Field Station", "home bakers scheduling life around starter", "A jar of starter receives expedition-level attention", "A starter jar beside a kitchen timer and small field notebook", "SOURDOUGH FIELD STATION"),
+            ("Urban Pond Committee", "birdwatchers delighted by ordinary ducks", "Ducks hold a very important puddle meeting", "Three ducks gathered around a small puddle", "URBAN POND COMMITTEE"),
+            ("Weekend Repair Society", "motorcycle tinkerers with unfinished projects", "A patient possum manages an endless repair queue", "A possum examining one loose motorcycle wheel", None),
+            ("Small Hill Expedition", "runners who dramatically dislike hills", "A tiny incline is treated as an alpine expedition", "One running shoe atop a modest rounded hill", "SMALL HILL EXPEDITION"),
+            ("Mushroom Records Office", "foragers who keep meticulous nature notes", "Mushrooms form a tiny botanical archive", "A broad mushroom cap sheltering a field notebook", "MUSHROOM RECORDS OFFICE"),
+            ("Unhurried Pickleball", "recreational pickleball players between snack breaks", "A sloth is the club's most composed player", "A sloth resting a paddle on one shoulder", None),
+            ("Lost Dice Department", "tabletop gamers who lose dice under furniture", "A mouse operates the lost-and-found for runaway dice", "A mouse pushing an oversized plain six-sided die", "LOST DICE DEPARTMENT"),
+            ("Cowboy Compost Crew", "gardeners who like Western imagery", "A worm works a very small ranch", "A worm in a plain cowboy hat beside a compost leaf", "COWBOY COMPOST CREW"),
+            ("Early Exit Social", "introverts who leave parties for their dog", "A dog proudly manages its human's departure schedule", "A dog holding a leash beside a small clock", None),
+            ("Sunday Cloud Survey", "campers who prefer resting to conquering peaks", "A hammock is an official cloud-observation station", "A hammock below one generous cloud", "SUNDAY CLOUD SURVEY"),
+        ]
         concepts = []
-        for index in range(10):
+        for index, (name, audience, premise, visual, slogan) in enumerate(ideas):
             concepts.append(
                 CandidateConcept(
-                    concept_name=f"Trail Ritual {index + 1}",
-                    target_customer="Weekend hikers who enjoy quiet morning routines",
-                    customer_motivation="Wearable identity and an easy outdoors gift",
+                    concept_name=name,
+                    target_customer=audience,
+                    customer_motivation=f"Recognize a familiar ritual and find a specific gift for {audience}",
                     trend_evidence=["Fixture demand signal for deterministic local development"],
-                    why_now="Outdoor micro-adventures remain giftable across seasons",
-                    slogan_if_any="TAKE THE SCENIC ROUTE" if index == 0 else None,
-                    visual_concept="A sunrise nested inside a simple switchback trail silhouette",
-                    design_mode=DesignMode.HYBRID if index == 0 else DesignMode.ILLUSTRATION,
-                    graphic_style="clean retro screen-print geometry",
+                    why_now="Fixture evergreen identity; live research must establish current relevance",
+                    slogan_if_any=slogan,
+                    visual_concept=visual,
+                    design_mode=DesignMode.HYBRID if slogan else DesignMode.ILLUSTRATION,
+                    graphic_style="original vintage hand-drawn club illustration",
                     palette=["#EF5E50", "#FFD166", "#F7F3E8"],
                     recommended_shirt_colors=["#111827", "#1F3A32"],
                     seasonality="year-round with spring and fall peaks",
                     estimated_trend_window="12 weeks",
                     competitive_advantage="Readable one-second silhouette with a specific ritual cue",
-                    risks=["Generic outdoor concepts can be saturated"],
+                    risks=["Fixture scores are synthetic; real demand and competition remain unverified"],
+                    strategy=ConceptStrategy(
+                        micro_niche=audience,
+                        premise=premise,
+                        brand_connection="A specific everyday identity treated as a serious vintage institution",
+                        brand_fit=90 - index,
+                        shareability=88 - index,
+                        etsy_angle=f"An identity gift for {audience}",
+                        amazon_angle=f"A clear, searchable shirt for {audience}",
+                        shopify_angle=f"Odd Hour Press presents {premise.lower()}",
+                    ),
                     scores=ConceptScores(
                         demand=82 - index,
                         trend_velocity=79 - index,
@@ -209,11 +260,15 @@ class OpenAIService:
                             claim="Fixture evidence only; live mode performs current web research",
                             title="Merch fixture source",
                             url="https://example.com/fixture",
+                            kind="inference",
+                            supports=["demand"],
+                            excerpt="Synthetic development fixture; no measured demand or competition.",
+                            limitations=["Fixture only: not evidence of real marketplace performance"],
                         )
                     ],
                 )
             )
-        report = ResearchReport(
+        report = NewResearchReport(
             current_date=current_date,
             market_summary="Deterministic fixture research for local and CI execution.",
             candidates=concepts,
@@ -221,27 +276,82 @@ class OpenAIService:
         return ModelResult(report, self._fake_metadata("research", prompt))
 
     async def select(self, concepts: list[CandidateConcept]) -> ModelResult[SelectionDecision]:
-        concept_data = [item.model_dump(mode="json") for item in concepts]
+        if not concepts:
+            raise ValueError("at least one eligible concept is required")
+        include_ip_risk = self.settings.ip_check_enabled
+        shortlist = selection_candidates(concepts, include_ip_risk)
+        strategy_ranking = any(item.strategy is not None for item in concepts)
+        concept_data = [
+            {
+                **item.model_dump(mode="json"),
+                "canonical_ranking": concept_score_breakdown(item, include_ip_risk),
+            }
+            for item in shortlist
+        ]
         if not self.settings.ip_check_enabled:
             for item in concept_data:
                 item["scores"]["ip_risk"] = 0
         prompt = SELECTION_PROMPT.format(
             concepts=json.dumps(concept_data),
+            ranking_policy=(
+                "This is the top three eligible concepts within five points of the leader. "
+                "Canonical weights: 20% demand, 20% purchase intent, 10% novelty, "
+                "10% low competition, 10% printability, 10% brand fit, 10% shareability, "
+                "5% trend velocity and 5% longevity. Evidence discounts demand, "
+                "competition and velocity toward neutral 50. Choose the strongest premise "
+                "among these close alternatives and explain your choice."
+                if strategy_ranking else
+                "Legacy weights: 25% demand, 20% trend acceleration, 15% purchase intent, "
+                "15% originality, 10% low saturation, 10% print quality potential, and 5% longevity."
+            ),
             selection_penalties=(
                 "IP uncertainty" if self.settings.ip_check_enabled else "weak originality"
             ),
         )
         if self.client:
-            return await self._parse(
+            result = await self._parse(
                 prompt,
                 SelectionDecision,
                 reasoning_effort=self.settings.openai_creative_reasoning_effort,
             )
+            if not strategy_ranking:
+                return result
+            selected = next(
+                (item for item in shortlist if item.concept_name == result.value.selected_concept_name),
+                shortlist[0],
+            )
+            valid_choice = selected.concept_name == result.value.selected_concept_name
+            decision = result.value.model_copy(update={
+                "selected_concept_name": selected.concept_name,
+                "weighted_score": weighted_concept_score(selected, include_ip_risk),
+                "rationale": (
+                    result.value.rationale if valid_choice else
+                    "Model selected outside the eligible shortlist; used the canonical leader."
+                ),
+                "rejected_concepts": [
+                    RejectedConcept(
+                        concept_name=item.concept_name,
+                        reason=(
+                            "Not chosen after comparing the leading premises"
+                            if item in shortlist else "Below the commercial shortlist"
+                        ),
+                    )
+                    for item in concepts if item.concept_name != selected.concept_name
+                ],
+            })
+            return ModelResult(decision, {
+                **result.metadata,
+                "selection_shortlist": [item.concept_name for item in shortlist],
+                "selection_fallback": not valid_choice,
+            })
 
         def score(item: CandidateConcept) -> float:
             return weighted_concept_score(item, self.settings.ip_check_enabled)
 
-        ranked = sorted(concepts, key=score, reverse=True)
+        ranked = (
+            sorted(concepts, key=lambda item: (-score(item), item.concept_name.casefold()))
+            if strategy_ranking else sorted(concepts, key=score, reverse=True)
+        )
         decision = SelectionDecision(
             selected_concept_name=ranked[0].concept_name,
             rationale="Highest deterministic weighted commercial score among eligible concepts.",
@@ -251,7 +361,11 @@ class OpenAIService:
                 for item in ranked[1:]
             ],
         )
-        return ModelResult(decision, self._fake_metadata("selection", prompt))
+        metadata = self._fake_metadata("selection", prompt)
+        if strategy_ranking:
+            metadata["selection_shortlist"] = [item.concept_name for item in shortlist]
+            metadata["selection_fallback"] = False
+        return ModelResult(decision, metadata)
 
     async def ip_screen(self, concept: CandidateConcept) -> ModelResult[IPScreeningReport]:
         prompt = IP_PROMPT.format(concept=concept.model_dump_json(indent=2))
@@ -277,10 +391,17 @@ class OpenAIService:
             product_template=json.dumps(product_template),
         )
         if self.client:
-            return await self._parse(
+            result = await self._parse(
                 prompt,
                 CreativeBrief,
                 reasoning_effort=self.settings.openai_creative_reasoning_effort,
+            )
+            return ModelResult(
+                result.value.model_copy(update={
+                    "strategy": concept.strategy,
+                    "slogan": concept.slogan_if_any,
+                }),
+                result.metadata,
             )
         brief = CreativeBrief(
             concept_name=concept.concept_name,
@@ -289,12 +410,13 @@ class OpenAIService:
             slogan=concept.slogan_if_any,
             design_mode=concept.design_mode,
             visual_concept=concept.visual_concept,
-            composition="Centered sunrise and trail mark with slogan beneath",
+            composition="Centered primary illustration with generous spacing and any exact slogan beneath",
             graphic_style=concept.graphic_style,
             palette=concept.palette,
             shirt_colors=concept.recommended_shirt_colors,
             typography_style="bold geometric sans",
-            generation_brief="Original sunrise nested in a switchback trail, isolated, no text",
+            generation_brief=f"Original illustration: {concept.visual_concept}. Isolated, no text or texture.",
+            strategy=concept.strategy,
         )
         return ModelResult(brief, self._fake_metadata("creative", prompt))
 
@@ -317,7 +439,8 @@ class OpenAIService:
                 reasoning_effort=self.settings.openai_creative_reasoning_effort,
             )
             return ModelResult(
-                result.value, {**result.metadata, "recovery_context": context.to_dict()}
+                result.value.model_copy(update={"strategy": brief.strategy, "slogan": brief.slogan}),
+                {**result.metadata, "recovery_context": context.to_dict()},
             )
         if context.strategy == "structural_simplification":
             composition = (

@@ -13,11 +13,13 @@ from merch.config import get_settings
 from merch.database import get_engine, session_scope
 from merch.defaults import fixture_product_template
 from merch.domain.artwork_recovery import RecoveryContext
+from merch.domain.prepress import largest_generation_size
 from merch.models import AuditEvent, Base
-from merch.pipeline import create_run, rewrite_failed_brief_run
+from merch.pipeline import create_run, generate_package_run, rewrite_failed_brief_run
 from merch.repository import ConfigurationRepository, RunRepository
 from merch.schemas import CandidateConcept, CreativeBrief, QAIssue, QAReport, RunInput, RunStatus
 from merch.services.openai_service import ModelResult, OpenAIService
+from merch.temporal import retry_failed_artwork_run
 
 
 async def failed_run(version: int = 1) -> tuple[str, CreativeBrief]:
@@ -59,6 +61,89 @@ def attempts_for(run_id: str) -> list[dict[str, Any]]:
             AuditEvent.run_id == run_id, AuditEvent.action == "artwork.brief_rewrite_attempt",
         ).order_by(AuditEvent.created_at, AuditEvent.id))
         return [event.detail for event in events]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("automatic", [False, True])
+async def test_historical_artwork_recovery_keeps_saved_garment_and_palette(
+    isolated_app: Path, monkeypatch: pytest.MonkeyPatch, automatic: bool,
+) -> None:
+    run_id, brief = await failed_run()
+    saved_template = fixture_product_template()
+    active = saved_template.model_copy(update={
+        "blueprint_id": 706, "print_provider_id": 39,
+        "print_width": 4200, "print_height": 4800,
+        "variants": [item.model_copy(update={"color": "Pepper"}) for item in saved_template.variants],
+    })
+    with session_scope() as session:
+        RunRepository(session).get(run_id).template_snapshot = saved_template.model_dump(mode="json")
+        ConfigurationRepository(session).save_template(active)
+
+    if automatic:
+        assert await rewrite_failed_brief_run(run_id) == RunStatus.PENDING.value
+    else:
+        class Client:
+            async def start_workflow(self, workflow: Any, value: RunInput, **kwargs: Any) -> None:
+                pass
+
+        async def client(settings: Any) -> Client:
+            return Client()
+
+        monkeypatch.setattr("merch.temporal.temporal_client", client)
+        await retry_failed_artwork_run(run_id, revised_brief=brief.model_copy(update={
+            "composition": "Broad standalone trail shapes with clear gaps and no enclosing border",
+        }))
+    with session_scope() as session:
+        run = RunRepository(session).get(run_id)
+        assert run.template_snapshot == saved_template.model_dump(mode="json")
+        assert CreativeBrief.model_validate(run.creative_brief).shirt_colors == brief.shirt_colors
+
+    class GenerationReached(Exception):
+        pass
+
+    async def artwork(
+        self: OpenAIService, current_brief: CreativeBrief, width: int, height: int,
+    ) -> tuple[bytes, dict[str, Any]]:
+        assert (width, height) == largest_generation_size(saved_template.print_width, saved_template.print_height)
+        assert current_brief.shirt_colors == brief.shirt_colors
+        raise GenerationReached
+
+    monkeypatch.setattr(OpenAIService, "artwork", artwork)
+    with pytest.raises(GenerationReached):
+        await generate_package_run(run_id, regenerate=not automatic, preserve_brief=True)
+    with session_scope() as session:
+        assert RunRepository(session).get(run_id).template_snapshot == saved_template.model_dump(mode="json")
+        assert ConfigurationRepository(session).get_template() == active
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_fields", [("strategy",), ("strategy", "artwork_distress_level")])
+async def test_legacy_brief_defaults_do_not_supersede_automatic_recovery(
+    isolated_app: Path, missing_fields: tuple[str, ...],
+) -> None:
+    run_id, original = await failed_run()
+    with session_scope() as session:
+        run = RunRepository(session).get(run_id)
+        assert run.creative_brief is not None and run.selected_concept is not None
+        run.creative_brief = {
+            key: value for key, value in run.creative_brief.items() if key not in missing_fields
+        }
+        run.selected_concept = {
+            key: value for key, value in run.selected_concept.items() if key != "strategy"
+        }
+        assert CreativeBrief.model_validate(run.creative_brief).model_dump(mode="json") != run.creative_brief
+
+    assert await rewrite_failed_brief_run(run_id) == RunStatus.PENDING.value
+    assert [attempt["outcome"] for attempt in attempts_for(run_id)] == ["accepted"]
+    with session_scope() as session:
+        run = RunRepository(session).get(run_id)
+        assert run.version == 2
+        revised = CreativeBrief.model_validate(run.creative_brief)
+        assert revised.strategy is None
+        assert revised.slogan == original.slogan
+        assert revised.composition != original.composition
+        assert revised.generation_brief != original.generation_brief
+        assert run.provider_calls[-1]["outcome"] == "accepted"
 
 
 @pytest.mark.asyncio

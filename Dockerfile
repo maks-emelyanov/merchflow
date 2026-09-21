@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_LINK_MODE=copy
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl fonts-noto-core libpango-1.0-0 librsvg2-bin \
+    && apt-get install -y --no-install-recommends ca-certificates curl fontconfig fonts-noto-core fonts-noto-mono fonts-roboto-slab libpango-1.0-0 librsvg2-bin \
     && rm -rf /var/lib/apt/lists/*
 
 ENV UV_CACHE_DIR=/tmp/uv-cache

@@ -118,6 +118,14 @@ class ApprovalInvalid(RuntimeError):
     pass
 
 
+def _same_garment(first: ProductTemplate, second: ProductTemplate) -> bool:
+    return (
+        first.blueprint_id, first.print_provider_id, first.position, first.decoration_method,
+    ) == (
+        second.blueprint_id, second.print_provider_id, second.position, second.decoration_method,
+    )
+
+
 EFFECT_RECOVERY_CODES = {
     "TYPOGRAPHY_LAYOUT", "TYPOGRAPHY_READABILITY", "DISTRESS_PRINTABILITY",
     # Saved artifacts and deterministic QA use this legacy exact-slogan code.
@@ -256,7 +264,16 @@ async def research_run(run_id: str, settings: Settings | None = None) -> None:
             return
         repo.status(run_id, RunStatus.RESEARCHING)
         performance = MetricsRepository(session).summary(90)
-    result = await OpenAIService(settings).research(date.today(), performance)
+        recent_concepts = repo.recent_concepts(run_id)
+        try:
+            template = ConfigurationRepository(session).get_template()
+        except RuntimeError:
+            product_context = {}
+        else:
+            product_context = _prompt_product_context(template)
+    result = await OpenAIService(settings).research(
+        date.today(), performance, product_context=product_context, recent_concepts=recent_concepts,
+    )
     with session_scope() as session:
         repo = RunRepository(session)
         repo.store_research(run_id, result.value.model_dump(mode="json"))
@@ -287,7 +304,10 @@ async def screen_and_select_run(run_id: str, settings: Settings | None = None) -
             max(candidates, key=lambda item: weighted_concept_score(item, False)),
         )
         plain_decision = model_decision.value.model_copy(
-            update={"selected_concept_name": unscored_selected.concept_name}
+            update={
+                "selected_concept_name": unscored_selected.concept_name,
+                "weighted_score": weighted_concept_score(unscored_selected, False),
+            }
         )
         plain_eligibility: dict[str, tuple[bool, str | None, float]] = {
             item.concept_name: (True, None, weighted_concept_score(item, False))
@@ -347,7 +367,10 @@ async def screen_and_select_run(run_id: str, settings: Settings | None = None) -
                 max(remaining, key=weighted_concept_score),
             )
             decision = model_decision.value.model_copy(
-                update={"selected_concept_name": proposed.concept_name}
+                update={
+                    "selected_concept_name": proposed.concept_name,
+                    "weighted_score": weighted_concept_score(proposed),
+                }
             )
         else:
             proposed = max(remaining, key=weighted_concept_score)
@@ -539,6 +562,8 @@ async def _qa_with_color_replacements(
                 continue
         else:
             excluded = sorted(set(excluded) | set(visual_excluded))
+            if visual_excluded:
+                publication = publication_template(template, excluded)
         return ColorQAResult(
             _merge_qa(deterministic, adjusted), publication,
             sorted(set(excluded) & base_colors), sorted(rejected),
@@ -558,6 +583,9 @@ def _prompt_product_context(template: ProductTemplate) -> dict[str, Any]:
         "sizes": sorted({item.size for item in variants}),
         "channels": [item.channel.value for item in template.channels if item.enabled],
         "etsy_production_partner_confirmed": template.etsy_production_partner_confirmed,
+        "garment_facts": (
+            template.garment_facts.model_dump(mode="json") if template.garment_facts else None
+        ),
     }
 
 
@@ -572,12 +600,20 @@ async def generate_package_run(
     storage.ensure_bucket()
     with session_scope() as session:
         repo = RunRepository(session)
+        previous_snapshot = repo.get(run_id).template_snapshot
         record = repo.begin_revision(run_id, regenerate, preserve_brief)
+        if regenerate and previous_snapshot:
+            previous_template = ProductTemplate.model_validate(previous_snapshot)
+            if not _same_garment(previous_template, ConfigurationRepository(session).get_template()):
+                record.template_snapshot = previous_snapshot
         repo.status(run_id, RunStatus.GENERATING)
         if not record.selected_concept:
             raise RuntimeError("selected concept is missing")
         concept = CandidateConcept.model_validate(record.selected_concept)
-        template = ConfigurationRepository(session).get_template()
+        template = (
+            ProductTemplate.model_validate(record.template_snapshot)
+            if record.template_snapshot else ConfigurationRepository(session).get_template()
+        )
         version = record.version
         research_summary = (record.research_report or {}).get("market_summary", "")
         saved_brief = record.creative_brief
@@ -593,10 +629,16 @@ async def generate_package_run(
     qa_colors = template.qa_shirt_colors()
     if saved_brief:
         brief = CreativeBrief.model_validate(saved_brief)
+        if concept.strategy is not None and brief.strategy != concept.strategy:
+            brief = brief.model_copy(update={"strategy": concept.strategy})
+            with session_scope() as session:
+                RunRepository(session).get(run_id).creative_brief = brief.model_dump(mode="json")
     else:
         creative = await ai.creative(concept, prompt_context)
         brief_data = creative.value.model_dump()
         brief_data["shirt_colors"] = sorted(allowed_colors)
+        brief_data["strategy"] = concept.strategy
+        brief_data["slogan"] = concept.slogan_if_any
         brief = CreativeBrief.model_validate(brief_data)
         with session_scope() as session:
             repo = RunRepository(session)
@@ -1028,10 +1070,14 @@ async def rewrite_failed_brief_run(run_id: str, settings: Settings | None = None
                 failures, attempt=used_attempts + 1, previous_strategy=previous_strategy,
             )
             concept = CandidateConcept.model_validate(run.selected_concept)
-            brief = CreativeBrief.model_validate(run.creative_brief)
+            brief_snapshot = dict(run.creative_brief)
+            brief = CreativeBrief.model_validate(brief_snapshot)
+            template = (
+                ProductTemplate.model_validate(run.template_snapshot)
+                if run.template_snapshot else ConfigurationRepository(session).get_template()
+            )
             allowed_colors = sorted({
-                item.color for item in ConfigurationRepository(session).get_template().variants
-                if item.enabled
+                item.color for item in template.variants if item.enabled
             })
             version = run.version
             effects = latest.metadata_json.get("artwork_effects")
@@ -1087,6 +1133,7 @@ async def rewrite_failed_brief_run(run_id: str, settings: Settings | None = None
             "slogan": brief.slogan,
             "design_mode": brief.design_mode,
             "shirt_colors": allowed_colors,
+            "strategy": brief.strategy,
         }
         revised = CreativeBrief.model_validate({**result.value.model_dump(mode="json"), **fixed})
         rejection = None
@@ -1104,7 +1151,9 @@ async def rewrite_failed_brief_run(run_id: str, settings: Settings | None = None
             superseded = (
                 event.detail.get("outcome") != "started" or run.version != version
                 or run.status not in {RunStatus.FAILED.value, RunStatus.AWAITING_BRIEF_REVISION.value}
-                or run.creative_brief != brief.model_dump(mode="json")
+                # Compare the saved representation so schema defaults added by
+                # validation do not make an unchanged legacy brief look newer.
+                or run.creative_brief != brief_snapshot
                 or run.qa_report is not None or run.approvals or run.publishes
             )
             repo.provider_call(run_id, "brief_rewrite", {
@@ -1128,7 +1177,6 @@ async def rewrite_failed_brief_run(run_id: str, settings: Settings | None = None
             run.listings = None
             run.listing_generation_state = None
             run.price_quotes = None
-            run.template_snapshot = None
             run.excluded_shirt_colors = None
             run.publication_template_snapshot = None
             repo.status(run_id, RunStatus.PENDING, "Automatic brief rewrite ready")
@@ -1170,8 +1218,11 @@ def record_approval(run_id: str, signal: ApprovalSignal, settings: Settings | No
         except ValueError as exc:
             raise ApprovalInvalid(f"listing copy failed validation: {exc}") from exc
         template = ConfigurationRepository(session).get_template()
-        if record.template_snapshot and template.model_dump(mode="json") != record.template_snapshot:
-            raise ApprovalInvalid("product template changed; regenerate the review package")
+        if record.template_snapshot:
+            saved_template = ProductTemplate.model_validate(record.template_snapshot)
+            if _same_garment(template, saved_template) and template != saved_template:
+                raise ApprovalInvalid("product template changed; regenerate the review package")
+            template = saved_template
         effective_template = publication_template(
             template, record.excluded_shirt_colors or [], record.publication_template_snapshot
         )
@@ -1250,24 +1301,65 @@ async def revalidate_approval_run(run_id: str, settings: Settings | None = None)
     with session_scope() as session:
         repo = RunRepository(session)
         run = repo.get(run_id)
-        template = ConfigurationRepository(session).get_template()
+        active_template = ConfigurationRepository(session).get_template()
         approved_template = (
             ProductTemplate.model_validate(run.template_snapshot)
             if run.template_snapshot
-            else template
+            else active_template
         )
+        uses_active_template = _same_garment(active_template, approved_template)
+        template = active_template if uses_active_template else approved_template
         excluded_shirt_colors = list(run.excluded_shirt_colors or [])
+        publication_snapshot = run.publication_template_snapshot
         if run.status != RunStatus.PUBLISHING.value:
             raise ApprovalInvalid("run is not in the approved publishing state")
     printify = PrintifyClient(settings)
     try:
         current = await printify.validate_template(template)
-        try:
-            effective_current = await printify.validate_template(
-                publication_template(
-                    current, excluded_shirt_colors, run.publication_template_snapshot
+        if (
+            current.print_width != approved_template.print_width
+            or current.print_height != approved_template.print_height
+            or {
+                (item.variant_id, item.color, item.color_hex, item.size)
+                for item in current.variants if item.enabled
+            } != {
+                (item.variant_id, item.color, item.color_hex, item.size)
+                for item in approved_template.variants if item.enabled
+            }
+        ):
+            with session_scope() as session:
+                configuration = ConfigurationRepository(session)
+                if (
+                    uses_active_template and configuration.get_template() == active_template
+                    and current != active_template
+                ):
+                    configuration.save_template(current)
+                repository = RunRepository(session)
+                run = repository.get(run_id)
+                run.template_snapshot = current.model_dump(mode="json")
+                run.qa_report = None
+                run.excluded_shirt_colors = None
+                run.publication_template_snapshot = None
+                repository.reprice_package(
+                    run_id,
+                    quotes=[],
+                    reason="Shirt options or print area changed; regenerate artwork and QA",
                 )
-            )
+            return False
+        try:
+            publication = publication_template(current, excluded_shirt_colors, publication_snapshot)
+            current_costs = {item.variant_id: item.production_cost_cents for item in current.variants}
+            # Keep the run's QA-approved colors and featured image while applying
+            # the matching garment's current fees and reviewed/catalog costs.
+            publication = current.model_copy(update={
+                "variants": [
+                    item.model_copy(update={
+                        "production_cost_cents": current_costs.get(item.variant_id, item.production_cost_cents),
+                    }) for item in publication.variants
+                ],
+                "featured_variant_id": publication.featured_variant_id,
+            })
+            effective_current = await printify.validate_template(publication)
         except ProviderConfigurationError:
             with session_scope() as session:
                 repository = RunRepository(session)
@@ -1283,37 +1375,13 @@ async def revalidate_approval_run(run_id: str, settings: Settings | None = None)
     finally:
         await printify.close()
     approved_effective = publication_template(
-        approved_template, excluded_shirt_colors, run.publication_template_snapshot
+        approved_template, excluded_shirt_colors, publication_snapshot
     )
     if (
         current.model_dump() == approved_template.model_dump()
         and effective_current.model_dump() == approved_effective.model_dump()
     ):
         return True
-    if (
-        current.print_width != approved_template.print_width
-        or current.print_height != approved_template.print_height
-        or {
-            (item.color, item.color_hex) for item in current.variants if item.enabled
-        }
-        != {
-            (item.color, item.color_hex) for item in approved_template.variants if item.enabled
-        }
-    ):
-        with session_scope() as session:
-            ConfigurationRepository(session).save_template(current)
-            repository = RunRepository(session)
-            run = repository.get(run_id)
-            run.template_snapshot = current.model_dump(mode="json")
-            run.qa_report = None
-            run.excluded_shirt_colors = None
-            run.publication_template_snapshot = None
-            repository.reprice_package(
-                run_id,
-                quotes=[],
-                reason="Shirt colors or print area changed; regenerate artwork and QA",
-            )
-        return False
     quotes = [
         quote_price(
             channel=channel.channel,
@@ -1329,7 +1397,12 @@ async def revalidate_approval_run(run_id: str, settings: Settings | None = None)
         if variant.enabled
     ]
     with session_scope() as session:
-        ConfigurationRepository(session).save_template(current)
+        configuration = ConfigurationRepository(session)
+        if (
+            uses_active_template and configuration.get_template() == active_template
+            and current != active_template
+        ):
+            configuration.save_template(current)
         RunRepository(session).get(run_id).template_snapshot = current.model_dump(mode="json")
         RunRepository(session).get(run_id).publication_template_snapshot = (
             effective_current.model_dump(mode="json")
