@@ -129,6 +129,7 @@ def _run_payload(record: RunRecord) -> dict[str, Any]:
         "version": record.version,
         "scheduled_for": record.scheduled_for,
         "manual": record.manual,
+        "pipeline_version": record.pipeline_version,
         "research_report": record.research_report,
         "selection": record.selection,
         "selected_concept": record.selected_concept,
@@ -149,6 +150,12 @@ def _run_payload(record: RunRecord) -> dict[str, Any]:
         "template_snapshot": record.template_snapshot,
         "excluded_shirt_colors": record.excluded_shirt_colors or [],
         "publication_template_snapshot": record.publication_template_snapshot,
+        "selected_opportunity": record.selected_opportunity,
+        "reference_analysis": record.reference_analysis,
+        "product_plan": record.product_plan,
+        "originality_report": record.originality_report,
+        "seo_evidence": record.seo_evidence,
+        "price_decisions": record.price_decisions,
         "featured_color_selection": featured_color_selection,
         "replacement_shirt_colors": sorted(
             {item["color"] for item in (record.publication_template_snapshot or {}).get("variants", []) if item.get("enabled", True)}
@@ -171,6 +178,17 @@ def _run_payload(record: RunRecord) -> dict[str, Any]:
                 ),
             }
             for item in record.concepts
+        ],
+        "opportunities": [
+            {
+                "id": item.id,
+                "rank": item.rank,
+                "eligible": item.eligible,
+                "rejection_reason": item.rejection_reason,
+                "weighted_score": item.weighted_score,
+                "data": item.data,
+            }
+            for item in record.opportunities
         ],
         "artifacts": [
             {
@@ -215,7 +233,7 @@ def _run_payload(record: RunRecord) -> dict[str, Any]:
 
 def _run_page_payload(record: RunRecord, ip_check_enabled: bool) -> dict[str, Any]:
     payload = _run_payload(record)
-    if ip_check_enabled:
+    if ip_check_enabled or record.pipeline_version == 2:
         return payload
     payload.pop("ip_report", None)
     payload["provider_calls"] = [
@@ -248,6 +266,7 @@ def _load_run(db: Session, run_id: str) -> RunRecord:
             selectinload(RunRecord.artifacts),
             selectinload(RunRecord.approvals),
             selectinload(RunRecord.publishes),
+            selectinload(RunRecord.opportunities),
         )
     )
     record = db.scalar(statement)
@@ -572,6 +591,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for item in RunRepository(db).list_runs()
         ]
 
+    @app.get("/api/catalog")
+    async def catalog(request: Request) -> list[dict[str, Any]]:
+        require_admin(request)
+        from merch.repository import CatalogRepository
+
+        with session_scope() as session:
+            products = CatalogRepository(session).list_products()
+        return [item.model_dump(mode="json") for item in products]
+
+    @app.post("/api/catalog/sync")
+    async def catalog_sync(request: Request) -> dict[str, Any]:
+        require_admin(request)
+        await require_csrf(request)
+        from merch.services.catalog import sync_catalog
+
+        return await sync_catalog(settings)
+
+    @app.get("/api/research/sources/health")
+    async def research_source_health(request: Request) -> dict[str, dict[str, Any]]:
+        require_admin(request)
+        from merch.services.marketplace_research import source_health
+
+        return await source_health(settings)
+
+    @app.get("/api/connectors/printify-browser/health")
+    async def printify_browser_health(request: Request) -> dict[str, Any]:
+        require_admin(request)
+        from merch.services.browser_session import browser_session_health
+
+        return browser_session_health(settings)
+
+    @app.get("/api/research/smoke")
+    async def research_smoke(request: Request, query: str) -> list[dict[str, Any]]:
+        require_admin(request)
+        if not query.strip() or len(query) > 200:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "query is invalid")
+        from merch.services.marketplace_research import collect_marketplace_evidence
+
+        evidence = await collect_marketplace_evidence(query.strip(), settings)
+        return [item.model_dump(mode="json") for item in evidence]
+
     @app.post("/api/runs", status_code=status.HTTP_202_ACCEPTED)
     async def new_run(request: Request) -> dict[str, Any]:
         require_admin(request)
@@ -704,6 +764,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 RunStatus.CANCELLED.value,
                 RunStatus.FAILED.value,
                 RunStatus.NO_SAFE_CANDIDATE.value,
+                RunStatus.NO_QUALIFIED_OPPORTUNITY.value,
             }:
                 raise HTTPException(status.HTTP_409_CONFLICT, "Run is already terminal")
         client = await temporal_client(settings)

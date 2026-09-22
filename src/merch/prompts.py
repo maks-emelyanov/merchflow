@@ -2,6 +2,81 @@ from __future__ import annotations
 
 PROMPT_VERSION = "2026-09-21.2"
 
+MARKETPLACE_FALLBACK_PROMPT = """
+Research the current US marketplace for the exact product query below. Return 3-10
+specific product listings from the requested marketplace, never category pages or
+generic articles. Use current web search and preserve the exact listing URL and the
+marketplace's stable listing identifier. Record visible USD item and shipping prices,
+seller, rating, review count, image URLs, and only sales signals actually supported by
+the result. Mark bestseller badges, sales ranks, and sold counts as explicit; review
+counts, review velocity, and search placement are proxies. Do not infer unit sales or
+invent unavailable shipping. Put search-index age, snippet-only observations,
+unavailable fields, and other caveats in limitations.
+
+Marketplace: {marketplace}
+Product query: {query}
+Current time: {current_time}
+"""
+
+REFERENCE_ANALYSIS_PROMPT = """
+Analyze the attached contact sheet of current marketplace product references for a
+new, substantially transformed print-on-demand design. Extract only non-protectable
+commercial patterns such as broad layout hierarchy, visual density, palette family,
+placement, audience, and theme. Explicitly list exact wording, seller or brand identity,
+logos, characters, distinctive motifs, and recognizable proprietary execution as
+forbidden. Write a transformation brief that changes wording, motifs, composition, and
+execution while retaining only high-level demand patterns. Do not name or imitate an
+artist or brand.
+
+Opportunity: {opportunity}
+Reference IDs: {reference_ids}
+"""
+
+ORIGINALITY_ASSESSMENT_PROMPT = """
+The first tile in the attached comparison sheet is the proposed design; the remaining
+tiles are marketplace references identified below. Judge whether the proposal is a
+substantially original execution. Treat copied or confusingly similar wording, logos,
+characters, distinctive motifs, composition, or trade dress as high copying risk.
+Shared product type, broad subject, common layout archetype, and generic palette alone
+are not copying. Return an originality score from 0-100 and copying risk from 0-100,
+with concrete reasons. Passing policy is originality at least 80 and copying risk at
+most 20.
+
+Reference IDs: {reference_ids}
+"""
+
+CATALOG_ARTWORK_PROMPT = """
+Create a substantially original print design for the supplied catalog product and
+surface. Use the attached marketplace sheet only as a high-level commercial reference;
+do not reproduce its wording, logos, characters, distinctive motifs, composition, or
+seller identity. Follow the transformation brief. Produce no product mockup, watermark,
+signature, or pseudo-writing. Use crisp printable shapes and the surface-specific
+production rules. When the placement is placed or restricted_palette, use a genuinely
+transparent background. When it is full_bleed or repeat, fill the complete canvas and
+extend important background color through the bleed area.
+
+Opportunity: {opportunity}
+Reference analysis: {reference_analysis}
+Surface: {surface}
+"""
+
+ETSY_CATALOG_LISTING_PROMPT = """
+Write one accurate Etsy listing for the supplied catalog product and original design.
+Use only included SEO phrases, naturally and without keyword stuffing. Never mention a
+competitor, seller, marketplace rank, bestseller status, trademark, affiliation, or
+unsupported material, shipping, care, sustainability, safety, or personalization claim.
+The title must be at most 140 characters. Return at most 13 unique phrase tags, each at
+most 20 characters. Lead with product type and buyer intent, then explain the original
+visual premise and appropriate gifting/use context. Preserve the factual option names
+and production method. End the long description with the required AI-assistance and
+Printify production-partner disclosure. The channel must be etsy.
+
+Opportunity: {opportunity}
+Product plan: {product_plan}
+SEO evidence: {seo_evidence}
+Reference analysis: {reference_analysis}
+"""
+
 BRAND_DIRECTION = """
 Odd Hour Press makes smart, strange shirts for specific people: a micro-niche
 identity, an instantly understandable clever or absurd premise, and a recognizable

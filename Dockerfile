@@ -10,6 +10,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 ENV UV_CACHE_DIR=/tmp/uv-cache
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
@@ -19,9 +20,12 @@ COPY alembic ./alembic
 COPY src ./src
 COPY main.py ./
 RUN uv sync --frozen --no-dev
+RUN .venv/bin/playwright install --with-deps chromium \
+    && chmod -R a+rX /ms-playwright
 
 RUN groupadd --system merch && useradd --system --gid merch --home /app merch \
-    && mkdir -p /app/.data && chown merch:merch /app/.data
+    && mkdir -p /app/.data /app/.cache/fontconfig \
+    && chown -R merch:merch /app/.data /app/.cache
 USER merch
 
 EXPOSE 8000

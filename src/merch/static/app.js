@@ -84,12 +84,13 @@ document.addEventListener("DOMContentLoaded", () => {
           title: editor.querySelector(".copy-title").value,
           long_description: editor.querySelector(".copy-description").value,
           tags: editor.querySelector(".copy-tags").value.split("\n").map((tag) => tag.trim()).filter(Boolean),
+          alt_text: editor.querySelector(".copy-alt-text").value,
         }),
       });
       await handle(response);
     }));
     document.getElementById("approve-copy-refresh")?.addEventListener("click", async () => {
-      if (!window.confirm("Apply both reviewed revisions to the existing live listings?")) return;
+      if (!window.confirm("Apply every reviewed revision to the existing live listings?")) return;
       const response = await fetch(`/api/copy-refresh/${batchId}/approve`, {
         method: "POST", headers,
         body: JSON.stringify({expected_version: Number(copyRefresh.dataset.version), digest: copyRefresh.dataset.digest}),

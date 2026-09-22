@@ -79,10 +79,11 @@ def test_replacement_print_areas_rejects_fractional_angle() -> None:
         replacement.replacement_print_areas(areas, "front", "new")
 
 
-def test_print_area_variant_coverage_requires_an_exact_partition() -> None:
+def test_print_area_variant_coverage_requires_exact_enabled_partition() -> None:
     template = fixture_product_template().model_copy(update={"featured_variant_id": 1001})
     expected = [item.variant_id for item in template.variants if item.enabled]
     midpoint = max(1, len(expected) // 2)
+    variants = [{"id": variant_id, "is_enabled": True} for variant_id in expected]
 
     replacement._verify_print_area_variant_coverage(
         [
@@ -90,19 +91,42 @@ def test_print_area_variant_coverage_requires_an_exact_partition() -> None:
             {"variant_ids": expected[midpoint:]},
         ],
         template,
+        variants,
     )
 
+    extra = max(expected) + 1
     invalid_coverage = [
-        [{"variant_ids": expected[:-1]}],
-        [{"variant_ids": expected}, {"variant_ids": [expected[0]]}],
-        [{"variant_ids": [*expected, max(expected) + 1]}],
+        ([{"variant_ids": expected[:-1]}], variants),
+        ([{"variant_ids": expected}, {"variant_ids": [expected[0]]}], variants),
+        ([{"variant_ids": [*expected, extra]}], variants),
+        (
+            [{"variant_ids": [*expected, extra]}],
+            [*variants, {"id": extra, "is_enabled": True}],
+        ),
     ]
-    for print_areas in invalid_coverage:
+    for print_areas, product_variants in invalid_coverage:
         with pytest.raises(
             replacement.ArtworkReplacementError,
             match="exact approved variants",
         ):
-            replacement._verify_print_area_variant_coverage(print_areas, template)
+            replacement._verify_print_area_variant_coverage(
+                print_areas, template, product_variants
+            )
+
+
+def test_print_area_variant_coverage_allows_provider_added_disabled_variants() -> None:
+    template = fixture_product_template().model_copy(update={"featured_variant_id": 1001})
+    expected = [item.variant_id for item in template.variants if item.enabled]
+    disabled = max(expected) + 1
+
+    replacement._verify_print_area_variant_coverage(
+        [{"variant_ids": [*expected, disabled]}],
+        template,
+        [
+            *({"id": variant_id, "is_enabled": True} for variant_id in expected),
+            {"id": disabled, "is_enabled": False},
+        ],
+    )
 
 
 def _context() -> replacement._ReplacementContext:

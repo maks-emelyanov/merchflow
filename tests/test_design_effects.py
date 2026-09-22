@@ -133,6 +133,9 @@ def test_hybrid_prepress_reserves_a_nonoverlapping_bottom_text_band(
     text_bounds = layout["text_bounds"]
     assert illustration_bounds and text_bounds
     assert illustration_bounds[3] < text_bounds[1]
+    assert text_bounds[1] - illustration_bounds[3] == pytest.approx(
+        round(1000 * 0.04), abs=2
+    )
     assert layout["overlap_fraction"] == 0
     assert not [issue for issue in prepared.issues if issue.code == "TYPOGRAPHY_LAYOUT"]
 

@@ -497,13 +497,77 @@ class EtsyStorefrontClient:
     async def inventory(self, listing_id: int) -> dict[str, Any]:
         return await self._get(f"/application/listings/{listing_id}/inventory", "read inventory")
 
-    async def update_inventory(self, listing_id: int, payload: dict[str, Any]) -> None:
+    async def update_inventory(
+        self,
+        listing_id: int,
+        payload: dict[str, Any],
+        *,
+        max_variations_supported: int = 2,
+    ) -> None:
+        if max_variations_supported not in {2, 3}:
+            raise ValueError("Etsy max_variations_supported must be 2 or 3")
+        path = f"/application/listings/{listing_id}/inventory"
+        if max_variations_supported == 3:
+            path += "?max_variations_supported=3"
         response = await self.client.put(
-            f"/application/listings/{listing_id}/inventory",
+            path,
             headers=self._headers(),
             json=payload,
         )
         self._raise_for_status(response, "update inventory")
+
+    async def seller_taxonomy_nodes(self) -> list[dict[str, Any]]:
+        result = await self._get(
+            "/application/seller-taxonomy/nodes", "read seller taxonomy"
+        )
+        return cast(list[dict[str, Any]], result.get("results", []))
+
+    async def taxonomy_properties(self, taxonomy_id: int) -> list[dict[str, Any]]:
+        result = await self._get(
+            f"/application/seller-taxonomy/nodes/{taxonomy_id}/properties",
+            "read taxonomy properties",
+        )
+        return cast(list[dict[str, Any]], result.get("results", []))
+
+    async def shipping_profile(self, shipping_profile_id: int) -> dict[str, Any]:
+        return await self._get(
+            f"/application/shops/{self.settings.etsy_shop_id}/shipping-profiles/"
+            f"{shipping_profile_id}",
+            "read shipping profile",
+        )
+
+    async def return_policy(self, return_policy_id: int) -> dict[str, Any]:
+        return await self._get(
+            f"/application/shops/{self.settings.etsy_shop_id}/policies/return/"
+            f"{return_policy_id}",
+            "read return policy",
+        )
+
+    async def readiness_states(self) -> list[dict[str, Any]]:
+        result = await self._get(
+            f"/application/shops/{self.settings.etsy_shop_id}/readiness-state-definitions",
+            "read readiness states",
+        )
+        return cast(list[dict[str, Any]], result.get("results", []))
+
+    async def create_readiness_state(
+        self,
+        *,
+        minimum_days: int = 2,
+        maximum_days: int = 5,
+    ) -> dict[str, Any]:
+        response = await self.client.post(
+            f"/application/shops/{self.settings.etsy_shop_id}/readiness-state-definitions",
+            headers=self._headers(),
+            data={
+                "readiness_state": "made_to_order",
+                "min_processing_time": minimum_days,
+                "max_processing_time": maximum_days,
+                "processing_time_unit": "days",
+            },
+        )
+        self._raise_for_status(response, "create readiness state")
+        return cast(dict[str, Any], response.json())
 
     async def variation_images(self, listing_id: int) -> list[dict[str, Any]]:
         result = await self._get(

@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     app_env: Literal["local", "test", "production"] = "local"
     provider_mode: Literal["fake", "live"] = "fake"
     publish_mode: Literal["dry_run", "live"] = "dry_run"
+    pipeline_version: Literal[1, 2] = 2
     public_base_url: str = "http://localhost:8000"
     session_secret: SecretStr = SecretStr("local-only-change-me-please")
     admin_password_hash: SecretStr = SecretStr("")
@@ -57,12 +58,30 @@ class Settings(BaseSettings):
     flat_artwork_cleanup_enabled: bool = False
     max_revision_attempts: int = 3
     max_brief_rewrites: int = 8
+    max_opportunity_attempts: int = 3
     etsy_native_publish_grace_seconds: int = 600
+
+    browser_headless: bool = True
+    browser_navigation_timeout_seconds: int = 30
+    browser_max_concurrency_per_domain: int = 1
+    competitor_direct_freshness_hours: int = 24
+    competitor_fallback_freshness_hours: int = 72
+    cost_freshness_hours: int = 24
+    search_fallback_enabled: bool = True
+    research_query_limit: int = 25
+    research_listings_per_source: int = 2
+    research_page_cap: int = 250
+    comparison_postal_code: str = "10001"
+    etsy_max_variations_supported: Literal[2, 3] = 2
+    originality_min_score: int = 80
+    originality_max_copying_risk: int = 20
+    perceptual_hash_block_distance: int = 8
 
     printify_api_token: SecretStr = SecretStr("")
     printify_user_agent: str = "merch-pod/0.1"
     printify_webhook_secret: SecretStr = SecretStr("")
     printify_base_url: str = "https://api.printify.com/v1"
+    printify_dashboard_base_url: str = "https://printify.com"
     printify_shop_shopify: str | None = None
     printify_shop_etsy: str | None = None
     printify_shop_amazon_us: str | None = None
@@ -92,6 +111,10 @@ class Settings(BaseSettings):
     font_file: Path = Path("/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf")
     max_artifact_bytes: int = 100 * 1024 * 1024
     target_margin: float = 0.40
+    etsy_percent_fee: float = 0.095
+    etsy_fixed_fee_cents: int = 45
+    configured_discount_cents: int = 0
+    etsy_customer_shipping_cents: int = 0
     manual_approval_enabled: bool = False
     etsy_production_partner_check_enabled: bool = False
     ip_check_enabled: bool = False
@@ -118,6 +141,53 @@ class Settings(BaseSettings):
             raise ValueError("max brief rewrites must be between 0 and 32")
         return value
 
+    @field_validator("max_opportunity_attempts")
+    @classmethod
+    def valid_opportunity_attempts(cls, value: int) -> int:
+        if not 1 <= value <= 10:
+            raise ValueError("max opportunity attempts must be between 1 and 10")
+        return value
+
+    @field_validator("research_query_limit", "research_listings_per_source", "research_page_cap")
+    @classmethod
+    def positive_research_limit(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("research limits must be positive")
+        return value
+
+    @field_validator(
+        "browser_navigation_timeout_seconds",
+        "competitor_direct_freshness_hours",
+        "competitor_fallback_freshness_hours",
+        "cost_freshness_hours",
+    )
+    @classmethod
+    def positive_time_window(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("browser and freshness time windows must be positive")
+        return value
+
+    @field_validator("browser_max_concurrency_per_domain")
+    @classmethod
+    def bounded_browser_concurrency(cls, value: int) -> int:
+        if not 1 <= value <= 4:
+            raise ValueError("browser concurrency per domain must be between 1 and 4")
+        return value
+
+    @field_validator("originality_min_score", "originality_max_copying_risk")
+    @classmethod
+    def percentage_score(cls, value: int) -> int:
+        if not 0 <= value <= 100:
+            raise ValueError("originality thresholds must be between 0 and 100")
+        return value
+
+    @field_validator("perceptual_hash_block_distance")
+    @classmethod
+    def hash_distance(cls, value: int) -> int:
+        if not 0 <= value <= 64:
+            raise ValueError("perceptual hash distance must be between 0 and 64")
+        return value
+
     @field_validator("etsy_native_publish_grace_seconds")
     @classmethod
     def valid_native_publish_grace(cls, value: int) -> int:
@@ -138,6 +208,14 @@ class Settings(BaseSettings):
                 raise ValueError("MERCH_OPENAI_API_KEY is required for live providers")
         if not 0 < self.target_margin < 1:
             raise ValueError("target margin must be between zero and one")
+        if not 0 <= self.etsy_percent_fee < 1:
+            raise ValueError("Etsy percentage fee must be between zero and one")
+        if min(
+            self.etsy_fixed_fee_cents,
+            self.configured_discount_cents,
+            self.etsy_customer_shipping_cents,
+        ) < 0:
+            raise ValueError("Etsy fixed fee and configured discount cannot be negative")
         return self
 
     def printify_shop(self, channel: str) -> str | None:

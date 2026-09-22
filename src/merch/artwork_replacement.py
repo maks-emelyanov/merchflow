@@ -313,11 +313,25 @@ def _print_area_image_ids(print_areas: Any, position: str) -> list[str]:
 def _verify_print_area_variant_coverage(
     print_areas: Any,
     template: ProductTemplate,
+    product_variants: Any,
 ) -> None:
-    """Require the target print areas to partition the exact approved variants."""
+    """Require exact enabled coverage while tolerating provider-added disabled variants."""
     if not isinstance(print_areas, list) or not print_areas:
         raise ArtworkReplacementError("Printify product has no print areas")
     expected = {item.variant_id for item in template.variants if item.enabled}
+    if not isinstance(product_variants, list) or not product_variants:
+        raise ArtworkReplacementError("Printify product has no variants")
+    variant_states: dict[int, bool] = {}
+    for item in product_variants:
+        if not isinstance(item, dict) or not isinstance(item.get("is_enabled"), bool):
+            raise ArtworkReplacementError("Printify product variants are invalid")
+        try:
+            variant_id = int(item["id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ArtworkReplacementError("Printify product variants are invalid") from exc
+        if variant_id <= 0 or variant_id in variant_states:
+            raise ArtworkReplacementError("Printify product variants are invalid")
+        variant_states[variant_id] = item["is_enabled"]
     found: list[int] = []
     for area in print_areas:
         if not isinstance(area, dict) or not isinstance(area.get("variant_ids"), list):
@@ -333,7 +347,13 @@ def _verify_print_area_variant_coverage(
         if len(variant_ids) != len(set(variant_ids)):
             raise ArtworkReplacementError("Printify print area repeats a variant")
         found.extend(variant_ids)
-    if len(found) != len(set(found)) or set(found) != expected:
+    found_set = set(found)
+    disabled = {variant_id for variant_id, enabled in variant_states.items() if not enabled}
+    if (
+        len(found) != len(found_set)
+        or not expected.issubset(found_set)
+        or not (found_set - expected).issubset(disabled)
+    ):
         raise ArtworkReplacementError(
             "Printify print areas do not cover the exact approved variants"
         )
@@ -436,7 +456,9 @@ def _verify_product_identity(
         raise ArtworkReplacementError(
             "Printify product blueprint or provider differs from the approved template"
         )
-    _verify_print_area_variant_coverage(product.get("print_areas"), context.template)
+    _verify_print_area_variant_coverage(
+        product.get("print_areas"), context.template, product.get("variants")
+    )
     image_ids = _print_area_image_ids(product.get("print_areas"), context.template.position)
     if set(image_ids) != {expected_upload_id}:
         raise ArtworkReplacementError("Printify product artwork differs from the expected checkpoint")

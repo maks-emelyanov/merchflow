@@ -65,7 +65,8 @@ def _listing_fields(listing: MarketplaceListing) -> dict[str, Any]:
 def _invariants(
     product: dict[str, Any], inventory: dict[str, Any],
     images: list[dict[str, Any]], variation_images: list[dict[str, Any]],
-) -> dict[str, str]:
+    *, version: int = 2,
+) -> dict[str, str | int]:
     enabled_variants = sorted(
         (
             int(item["id"]), str(item.get("sku") or ""), int(item.get("price") or 0),
@@ -73,23 +74,51 @@ def _invariants(
         )
         for item in product.get("variants", []) if item.get("is_enabled")
     )
-    front_images = sorted(
-        (
-            str(item.get("mockup_id") or ""), str(item.get("src") or ""),
-            tuple(sorted(int(value) for value in item.get("variant_ids") or [])),
-        )
-        for item in product.get("images", []) if item.get("position") == "front"
-    )
     etsy_images = sorted(
         (int(item.get("listing_image_id") or 0), int(item.get("rank") or 0))
         for item in images
     )
-    return {
+    common: dict[str, str | int] = {
         "printify_variants": _digest(enabled_variants),
-        "printify_mockups": _digest(front_images),
         "etsy_inventory": _digest(inventory.get("products") or []),
         "etsy_images": _digest(etsy_images),
         "etsy_color_links": _digest(variation_images),
+    }
+    if version == 1:
+        front_images = sorted(
+            (
+                str(item.get("mockup_id") or ""), str(item.get("src") or ""),
+                tuple(sorted(int(value) for value in item.get("variant_ids") or [])),
+            )
+            for item in product.get("images", []) if item.get("position") == "front"
+        )
+        return {**common, "printify_mockups": _digest(front_images)}
+    if version != 2:
+        raise ValueError("unsupported copy refresh invariant version")
+    print_areas = sorted(
+        (
+            tuple(sorted(int(value) for value in area.get("variant_ids") or [])),
+            tuple(sorted(
+                (
+                    str(placeholder.get("position") or ""),
+                    tuple(sorted(
+                        (
+                            str(image.get("id") or ""),
+                            image.get("x"), image.get("y"),
+                            image.get("scale"), image.get("angle"),
+                        )
+                        for image in placeholder.get("images") or []
+                    )),
+                )
+                for placeholder in area.get("placeholders") or []
+            )),
+        )
+        for area in product.get("print_areas") or []
+    )
+    return {
+        **common,
+        "schema_version": 2,
+        "printify_print_areas": _digest(print_areas),
     }
 
 
@@ -177,21 +206,31 @@ def _product_context(template: ProductTemplate) -> dict[str, Any]:
     }
 
 
-async def prepare_copy_refresh_batch(settings: Settings | None = None) -> str:
+async def prepare_copy_refresh_batch(
+    settings: Settings | None = None,
+    *,
+    run_id: str | None = None,
+) -> str:
     """Stage one review batch for live published Etsy products without changing them."""
     settings = settings or get_settings()
     if settings.provider_mode != "live" or settings.publish_mode != "live":
         raise ValueError("published copy refresh requires live providers and publishing")
     with session_scope() as session:
-        active = session.scalar(
+        active_query = (
             select(CopyRefreshBatchRecord.id)
             .where(CopyRefreshBatchRecord.status.in_(("preparing", "pending_review", "applying", "verification_required")))
-            .order_by(CopyRefreshBatchRecord.created_at.desc()).limit(1)
+        )
+        if run_id is not None:
+            active_query = active_query.join(CopyRefreshItemRecord).where(
+                CopyRefreshItemRecord.run_id == run_id
+            )
+        active = session.scalar(
+            active_query.order_by(CopyRefreshBatchRecord.created_at.desc()).limit(1)
         )
         if active:
             batch_id = active
         else:
-            targets = list(session.execute(
+            target_query = (
                 select(PublishRecord, RunRecord)
                 .join(RunRecord, PublishRecord.run_id == RunRecord.id)
                 .where(
@@ -199,9 +238,15 @@ async def prepare_copy_refresh_batch(settings: Settings | None = None) -> str:
                     PublishRecord.status == "succeeded",
                     RunRecord.status == "published",
                 )
-            ))
+            )
+            if run_id is not None:
+                target_query = target_query.where(RunRecord.id == run_id)
+            targets = list(session.execute(target_query))
             if not targets:
-                raise ValueError("no live published Etsy products are available for copy refresh")
+                suffix = f" for run {run_id}" if run_id is not None else ""
+                raise ValueError(
+                    f"no live published Etsy products are available for copy refresh{suffix}"
+                )
             batch = CopyRefreshBatchRecord(status="preparing", version=1)
             session.add(batch)
             session.flush()
@@ -384,6 +429,7 @@ def edit_copy_refresh_item(batch_id: str, item_id: str, edit: CopyRefreshEdit) -
             "title": edit.title,
             "long_description": edit.long_description,
             "tags": edit.tags,
+            "alt_text": edit.alt_text or item.after_json["alt_text"],
         })
         generation = item.generation_json or {}
         original = MarketplaceListingSet.model_validate(
@@ -529,7 +575,10 @@ async def _apply_item(
         or listing.get("state") != "active"
     ):
         raise StorefrontVerificationError("Etsy identity, active state, or Printify link changed")
-    if _invariants(product, inventory, images, variation_images) != source["baseline"]:
+    invariant_version = int(source["baseline"].get("schema_version") or 1)
+    if _invariants(
+        product, inventory, images, variation_images, version=invariant_version
+    ) != source["baseline"]:
         raise StorefrontVerificationError("variants, prices, mockups, inventory, or photos changed")
     _verify_approved_state(source, product, inventory, images)
     if _copy_fields(product) not in (source["before"]["printify"], target):
@@ -581,7 +630,9 @@ async def _apply_item(
         _copy_fields(product) != target or _copy_fields(listing) != target
         or str((product.get("external") or {}).get("id") or "") != str(source["listing_id"])
         or listing.get("state") != "active"
-        or _invariants(product, inventory, images, variation_images) != source["baseline"]
+        or _invariants(
+            product, inventory, images, variation_images, version=invariant_version
+        ) != source["baseline"]
     ):
         raise StorefrontVerificationError("final Etsy and Printify copy readback differs")
     _verify_approved_state(source, product, inventory, images)

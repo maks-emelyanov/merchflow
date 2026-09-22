@@ -10,7 +10,14 @@ import httpx
 
 from merch.config import Settings
 from merch.domain.print_areas import largest_compatible_print_area, variant_print_dimensions
-from merch.schemas import Channel, MarketplaceListing, PriceQuote, ProductTemplate
+from merch.schemas import (
+    Channel,
+    MarketplaceListing,
+    PriceDecision,
+    PriceQuote,
+    ProductPlanV2,
+    ProductTemplate,
+)
 
 
 class ProviderConfigurationError(RuntimeError):
@@ -87,6 +94,15 @@ class PrintifyClient:
             await self._request(
                 "GET",
                 f"/catalog/blueprints/{blueprint_id}/print_providers/{provider_id}/variants.json",
+            ),
+        )
+
+    async def shipping(self, blueprint_id: int, provider_id: int) -> dict[str, Any]:
+        return cast(
+            dict[str, Any],
+            await self._request(
+                "GET",
+                f"/catalog/blueprints/{blueprint_id}/print_providers/{provider_id}/shipping.json",
             ),
         )
 
@@ -209,6 +225,88 @@ class PrintifyClient:
                     ],
                 }
             ],
+        }
+
+    @staticmethod
+    def catalog_product_fingerprint(
+        plan: ProductPlanV2,
+        listing: MarketplaceListing,
+        prices: list[PriceDecision],
+        artwork_upload_ids: dict[str, str],
+    ) -> str:
+        canonical = {
+            "schema_version": 2,
+            "blueprint_id": plan.blueprint_id,
+            "provider_id": plan.print_provider_id,
+            "title": listing.title,
+            "description": listing.long_description,
+            "variants": sorted(
+                (item.variant_id, item.item_price_cents) for item in prices
+            ),
+            "featured_variant_id": plan.featured_variant_id,
+            "artwork": sorted(artwork_upload_ids.items()),
+        }
+        return hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+
+    def catalog_product_payload(
+        self,
+        plan: ProductPlanV2,
+        listing: MarketplaceListing,
+        prices: list[PriceDecision],
+        artwork_upload_ids: dict[str, str],
+    ) -> dict[str, Any]:
+        price_by_variant = {item.variant_id: item.item_price_cents for item in prices}
+        if set(price_by_variant) != {item.variant_id for item in plan.variants}:
+            raise ValueError("catalog plan variants and price decisions differ")
+        artwork_by_signature = {
+            item.surface_signature: artwork_upload_ids.get(item.surface_signature)
+            for item in plan.surface_artworks
+        }
+        if not all(artwork_by_signature.values()):
+            raise ValueError("catalog plan is missing an uploaded surface artwork")
+        grouped: dict[tuple[str, ...], list[int]] = {}
+        surfaces_by_group: dict[tuple[str, ...], list[Any]] = {}
+        for variant in plan.variants:
+            signatures = tuple(sorted(surface.signature for surface in variant.surfaces))
+            grouped.setdefault(signatures, []).append(variant.variant_id)
+            surfaces_by_group.setdefault(signatures, variant.surfaces)
+        print_areas = []
+        for signatures, variant_ids in grouped.items():
+            surface_by_signature = {
+                surface.signature: surface for surface in surfaces_by_group[signatures]
+            }
+            print_areas.append({
+                "variant_ids": sorted(variant_ids),
+                "placeholders": [
+                    {
+                        "position": surface_by_signature[signature].position,
+                        "images": [{
+                            "id": artwork_by_signature[signature],
+                            "x": 0.5,
+                            "y": 0.5,
+                            "scale": 1.0,
+                            "angle": 0,
+                        }],
+                    }
+                    for signature in signatures
+                ],
+            })
+        return {
+            "title": listing.title,
+            "description": listing.long_description,
+            "tags": listing.tags,
+            "blueprint_id": plan.blueprint_id,
+            "print_provider_id": plan.print_provider_id,
+            "variants": [
+                {
+                    "id": variant.variant_id,
+                    "price": price_by_variant[variant.variant_id],
+                    "is_enabled": True,
+                    "is_default": variant.variant_id == plan.featured_variant_id,
+                }
+                for variant in plan.variants
+            ],
+            "print_areas": print_areas,
         }
 
     async def create_product(self, shop_id: str, payload: dict[str, Any]) -> dict[str, Any]:

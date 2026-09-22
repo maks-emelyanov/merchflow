@@ -78,7 +78,7 @@ def test_copy_refresh_review_is_admin_only_and_shows_exact_draft(isolated_app) -
         page = client.get("/copy-refresh")
         assert page.status_code == 200
         assert "Old trail shirt" in page.text and "New trail shirt" in page.text
-        assert "Approve and apply both revisions" in page.text
+        assert "Approve and apply reviewed revisions" in page.text
         assert client.post(f"/api/copy-refresh/{batch_id}/approve", json={
             "expected_version": 1, "digest": "a" * 64
         }).status_code == 403

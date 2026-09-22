@@ -137,6 +137,51 @@ def connections() -> None:
     typer.echo(asyncio.run(health_connectors()))
 
 
+@app.command("catalog-sync")
+def catalog_sync() -> None:
+    """Synchronize the complete supported Printify blueprint/provider catalog."""
+    from merch.services.catalog import sync_catalog
+
+    typer.echo(json.dumps(asyncio.run(sync_catalog()), indent=2, default=str))
+
+
+@app.command("connect-browser")
+def connect_browser(provider: str) -> None:
+    """Open an interactive provider login and save encrypted browser session state."""
+    if provider.casefold() != "printify":
+        raise typer.BadParameter("the only browser session currently supported is printify")
+    from merch.services.browser_session import connect_printify_browser
+
+    typer.echo(
+        json.dumps(asyncio.run(connect_printify_browser()), indent=2, default=str)
+    )
+
+
+@app.command("session-health")
+def session_health() -> None:
+    """Inspect the encrypted Printify browser session without changing it."""
+    from merch.services.browser_session import browser_session_health
+
+    typer.echo(json.dumps(browser_session_health(), indent=2, default=str))
+
+
+@app.command("source-health")
+def marketplace_source_health() -> None:
+    """Check direct-collector policy access and configured fallback availability."""
+    from merch.services.marketplace_research import source_health
+
+    typer.echo(json.dumps(asyncio.run(source_health()), indent=2, default=str))
+
+
+@app.command("research-smoke")
+def research_smoke(query: str) -> None:
+    """Collect listing-specific evidence without creating or publishing a product."""
+    from merch.services.marketplace_research import collect_marketplace_evidence
+
+    evidence = asyncio.run(collect_marketplace_evidence(query))
+    typer.echo(json.dumps([item.model_dump(mode="json") for item in evidence], indent=2))
+
+
 @app.command("repair-etsy-listing")
 def repair_etsy_listing(run_id: str) -> None:
     """Recheck a completed Etsy run and set its selectors to Size and Color."""
@@ -201,9 +246,11 @@ def reconcile_published_artwork_command(
 
 
 @app.command("prepare-copy-refresh")
-def prepare_copy_refresh() -> None:
+def prepare_copy_refresh(
+    run_id: Annotated[str | None, typer.Option("--run-id")] = None,
+) -> None:
     """Stage a reviewable copy update for mapped live Etsy listings."""
-    batch_id = asyncio.run(prepare_copy_refresh_batch())
+    batch_id = asyncio.run(prepare_copy_refresh_batch(run_id=run_id))
     typer.echo(f"Copy refresh ready for review: /copy-refresh (batch {batch_id})")
 
 

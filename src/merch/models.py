@@ -51,6 +51,13 @@ class RunRecord(Base):
     excluded_shirt_colors: Mapped[list[str] | None] = mapped_column(JSON)
     publication_template_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     listing_generation_state: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    pipeline_version: Mapped[int] = mapped_column(Integer, default=1)
+    selected_opportunity: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    reference_analysis: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    product_plan: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    originality_report: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    seo_evidence: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    price_decisions: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
     provider_calls: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -68,6 +75,9 @@ class RunRecord(Base):
         back_populates="run", cascade="all, delete-orphan"
     )
     publishes: Mapped[list[PublishRecord]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+    opportunities: Mapped[list[OpportunityRecord]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
     )
 
@@ -253,6 +263,102 @@ class ConnectorCredentialRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+
+class BrowserSessionRecord(Base):
+    __tablename__ = "browser_sessions"
+
+    source: Mapped[str] = mapped_column(String(64), primary_key=True)
+    encrypted_state: Mapped[str] = mapped_column(Text)
+    healthy: Mapped[bool] = mapped_column(Boolean, default=True)
+    detail: Mapped[str] = mapped_column(Text, default="connected")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class CatalogProductRecord(Base):
+    __tablename__ = "catalog_products"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    blueprint_id: Mapped[int] = mapped_column(Integer, index=True)
+    print_provider_id: Mapped[int] = mapped_column(Integer, index=True)
+    title: Mapped[str] = mapped_column(String(512))
+    data: Mapped[dict[str, Any]] = mapped_column(JSON)
+    source_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    variants: Mapped[list[CatalogVariantRecord]] = relationship(
+        back_populates="product", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "blueprint_id", "print_provider_id", name="uq_catalog_blueprint_provider"
+        ),
+    )
+
+
+class CatalogVariantRecord(Base):
+    __tablename__ = "catalog_variants"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    product_key: Mapped[str] = mapped_column(
+        ForeignKey("catalog_products.key", ondelete="CASCADE"), index=True
+    )
+    variant_id: Mapped[int] = mapped_column(Integer, index=True)
+    available: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    data: Mapped[dict[str, Any]] = mapped_column(JSON)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    product: Mapped[CatalogProductRecord] = relationship(back_populates="variants")
+
+    __table_args__ = (
+        UniqueConstraint("product_key", "variant_id", name="uq_catalog_product_variant"),
+    )
+
+
+class CostObservationRecord(Base):
+    __tablename__ = "cost_observations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    account_plan: Mapped[str] = mapped_column(String(64), default="unknown", index=True)
+    blueprint_id: Mapped[int] = mapped_column(Integer, index=True)
+    print_provider_id: Mapped[int] = mapped_column(Integer, index=True)
+    variant_id: Mapped[int] = mapped_column(Integer, index=True)
+    cost_cents: Mapped[int] = mapped_column(Integer)
+    currency: Mapped[str] = mapped_column(String(3), default="USD")
+    source_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class CompetitorListingRecord(Base):
+    __tablename__ = "competitor_listing_snapshots"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    marketplace: Mapped[str] = mapped_column(String(32), index=True)
+    external_listing_id: Mapped[str] = mapped_column(String(256), index=True)
+    url: Mapped[str] = mapped_column(Text)
+    fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    data: Mapped[dict[str, Any]] = mapped_column(JSON)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class OpportunityRecord(Base):
+    __tablename__ = "product_opportunities"
+    __table_args__ = (UniqueConstraint("run_id", "rank", name="uq_opportunity_run_rank"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_runs.id", ondelete="CASCADE"), index=True
+    )
+    rank: Mapped[int] = mapped_column(Integer)
+    weighted_score: Mapped[float] = mapped_column(Float)
+    eligible: Mapped[bool] = mapped_column(Boolean, default=True)
+    rejection_reason: Mapped[str | None] = mapped_column(Text)
+    data: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    run: Mapped[RunRecord] = relationship(back_populates="opportunities")
 
 
 class ProductTemplateRecord(Base):

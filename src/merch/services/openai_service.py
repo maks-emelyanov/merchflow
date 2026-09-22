@@ -22,12 +22,17 @@ from merch.domain.prepress import make_fixture_art
 from merch.prompts import (
     ARTWORK_PROMPT,
     BRIEF_REWRITE_PROMPT,
+    CATALOG_ARTWORK_PROMPT,
     CREATIVE_PROMPT,
+    ETSY_CATALOG_LISTING_PROMPT,
     IP_PROMPT,
     LISTING_POLISH_PROMPT,
     LISTING_PROMPT,
+    MARKETPLACE_FALLBACK_PROMPT,
+    ORIGINALITY_ASSESSMENT_PROMPT,
     PROMPT_VERSION,
     QA_PROMPT,
+    REFERENCE_ANALYSIS_PROMPT,
     RESEARCH_PROMPT,
     REVISION_PROMPT,
     SELECTION_PROMPT,
@@ -45,12 +50,22 @@ from merch.schemas import (
     IPScreeningReport,
     MarketplaceListing,
     MarketplaceListingSet,
+    MarketplaceSearchFallback,
+    MarketplaceSource,
     NewResearchReport,
+    OriginalityVisionAssessment,
+    PrintSurface,
+    ProductOpportunity,
+    ProductPlanV2,
     QAIssue,
     QAReport,
+    ReferenceAnalysis,
     RejectedConcept,
     ResearchReport,
+    SalesSignal,
+    SearchFallbackListing,
     SelectionDecision,
+    SEOEvidence,
     ShirtColorRanking,
     ShirtColorScore,
     TypographyProposal,
@@ -328,6 +343,56 @@ class OpenAIService:
         )
         return ModelResult(report, self._fake_metadata("research", prompt))
 
+    async def marketplace_fallback(
+        self,
+        marketplace: MarketplaceSource,
+        query: str,
+        *,
+        current_time: str,
+    ) -> ModelResult[MarketplaceSearchFallback]:
+        prompt = MARKETPLACE_FALLBACK_PROMPT.format(
+            marketplace=marketplace.value,
+            query=query,
+            current_time=current_time,
+        )
+        if self.client:
+            return await self._parse(
+                prompt,
+                MarketplaceSearchFallback,
+                web_search=True,
+                model=self.settings.openai_research_model,
+            )
+        observed = __import__("datetime").datetime.fromisoformat(current_time)
+        listings = [
+            SearchFallbackListing(
+                external_listing_id=f"fixture-{marketplace.value}-{index}",
+                url=f"https://example.com/{marketplace.value}/{index}",
+                title=f"Fixture popular {query} {index}",
+                seller=f"Fixture seller {index}",
+                displayed_price_cents=1999 + index * 100,
+                shipping_price_cents=0,
+                rating=4.7,
+                review_count=100 + index,
+                sales_signals=[
+                    SalesSignal(
+                        kind=("bestseller_badge" if index == 1 else "review_count"),
+                        value=float(1 if index == 1 else 100 + index),
+                        label=("Visible bestseller badge" if index == 1 else "Visible reviews"),
+                        explicit=index == 1,
+                        observed_at=observed,
+                    )
+                ],
+                limitations=["Synthetic fixture evidence"],
+            )
+            for index in range(1, 4)
+        ]
+        return ModelResult(
+            MarketplaceSearchFallback(
+                marketplace=marketplace, query=query, listings=listings
+            ),
+            self._fake_metadata("marketplace_fallback", prompt),
+        )
+
     async def select(self, concepts: list[CandidateConcept]) -> ModelResult[SelectionDecision]:
         if not concepts:
             raise ValueError("at least one eligible concept is required")
@@ -434,6 +499,171 @@ class OpenAIService:
         return ModelResult(
             screen_concept(concept, self.settings.ip_risk_threshold),
             self._fake_metadata("ip_screen", prompt),
+        )
+
+    async def analyze_references(
+        self, opportunity: ProductOpportunity, reference_sheet: bytes
+    ) -> ModelResult[ReferenceAnalysis]:
+        reference_ids = [
+            item.external_listing_id for item in opportunity.comparable_listings[:3]
+        ]
+        prompt = REFERENCE_ANALYSIS_PROMPT.format(
+            opportunity=opportunity.model_dump_json(indent=2),
+            reference_ids=json.dumps(reference_ids),
+        )
+        if self.client:
+            return await self._parse(
+                prompt,
+                ReferenceAnalysis,
+                image=reference_sheet,
+                reasoning_effort=self.settings.openai_creative_reasoning_effort,
+            )
+        analysis = ReferenceAnalysis(
+            reusable_patterns=[
+                "Clear primary focal hierarchy",
+                "Product-appropriate centered placement",
+                "Limited high-contrast palette",
+            ],
+            forbidden_elements=[
+                *(item.title for item in opportunity.comparable_listings[:3]),
+                *(item.seller for item in opportunity.comparable_listings[:3] if item.seller),
+            ],
+            transformation_brief=(
+                f"Create new wording, motifs, composition, and line work for "
+                f"{opportunity.visual_direction}; retain only broad demand patterns."
+            ),
+            reference_listing_ids=reference_ids,
+        )
+        return ModelResult(analysis, self._fake_metadata("reference_analysis", prompt))
+
+    async def catalog_artwork(
+        self,
+        opportunity: ProductOpportunity,
+        analysis: ReferenceAnalysis,
+        surface: PrintSurface,
+        reference_sheet: bytes,
+    ) -> tuple[bytes, dict[str, Any]]:
+        prompt = CATALOG_ARTWORK_PROMPT.format(
+            opportunity=opportunity.model_dump_json(indent=2),
+            reference_analysis=analysis.model_dump_json(indent=2),
+            surface=surface.model_dump_json(indent=2),
+        )
+        if self.client:
+            upload = io.BytesIO(reference_sheet)
+            upload.name = "marketplace-references.png"
+            background: Literal["transparent", "opaque"] = (
+                "transparent"
+                if surface.placement in {"placed", "restricted_palette"}
+                else "opaque"
+            )
+            try:
+                result = await self.client.images.edit(
+                    model=self.settings.openai_image_model,
+                    image=upload,
+                    prompt=prompt,
+                    size=f"{surface.width}x{surface.height}",
+                    quality=self.settings.openai_image_quality,
+                    background=background,
+                    output_format="png",
+                )
+            except APIStatusError as exc:
+                self._handle_api_error(exc)
+                raise
+            if not result.data or not result.data[0].b64_json:
+                raise RuntimeError("OpenAI returned no catalog artwork")
+            usage = result.usage.model_dump() if result.usage else None
+            return base64.b64decode(result.data[0].b64_json), {
+                "model": self.settings.openai_image_model,
+                "quality": result.quality or self.settings.openai_image_quality,
+                "size": result.size or f"{surface.width}x{surface.height}",
+                "usage": usage,
+                "estimated_cost_usd": estimate_image_cost(
+                    self.settings.openai_image_model, usage
+                ),
+                "prompt": prompt,
+                "prompt_version": PROMPT_VERSION,
+                "schema_name": "CatalogRasterArtwork",
+                "schema_version": "2",
+            }
+        fixture = make_fixture_art(surface.width, surface.height)
+        if surface.placement in {"full_bleed", "repeat"}:
+            with Image.open(io.BytesIO(fixture)) as source:
+                flattened = Image.new("RGBA", source.size, "#274C77")
+                flattened.alpha_composite(source.convert("RGBA"))
+                output = io.BytesIO()
+                flattened.convert("RGB").save(output, format="PNG")
+                fixture = output.getvalue()
+        return fixture, self._fake_metadata("catalog_artwork", prompt)
+
+    async def originality_assessment(
+        self, comparison_sheet: bytes, reference_ids: list[str]
+    ) -> ModelResult[OriginalityVisionAssessment]:
+        prompt = ORIGINALITY_ASSESSMENT_PROMPT.format(
+            reference_ids=json.dumps(reference_ids)
+        )
+        if self.client:
+            return await self._parse(
+                prompt,
+                OriginalityVisionAssessment,
+                image=comparison_sheet,
+                reasoning_effort=self.settings.openai_creative_reasoning_effort,
+            )
+        return ModelResult(
+            OriginalityVisionAssessment(
+                originality_score=95,
+                copying_risk=5,
+                reasons=["Fixture artwork is structurally distinct from fixture references"],
+            ),
+            self._fake_metadata("originality_assessment", prompt),
+        )
+
+    async def etsy_catalog_listing(
+        self,
+        opportunity: ProductOpportunity,
+        plan: ProductPlanV2,
+        seo: SEOEvidence,
+        analysis: ReferenceAnalysis,
+    ) -> ModelResult[MarketplaceListingSet]:
+        prompt = ETSY_CATALOG_LISTING_PROMPT.format(
+            opportunity=opportunity.model_dump_json(indent=2),
+            product_plan=plan.model_dump_json(indent=2),
+            seo_evidence=seo.model_dump_json(indent=2),
+            reference_analysis=analysis.model_dump_json(indent=2),
+        )
+        if self.client:
+            result = await self._parse(
+                prompt, MarketplaceListing, model=self.settings.openai_listing_model
+            )
+            listing = result.value.model_copy(update={"channel": Channel.ETSY})
+            return ModelResult(MarketplaceListingSet(listings=[listing]), result.metadata)
+        included = [item.phrase for item in seo.keywords if item.included]
+        tags = [item[:20] for item in included[:13]] or ["original gift"]
+        title = f"{opportunity.concept_name} {plan.product_title}"[:140]
+        disclosure = (
+            "Seller-prompted AI assisted the original artwork; "
+            "Printify is the production partner."
+        )
+        listing = MarketplaceListing(
+            channel=Channel.ETSY,
+            title=title,
+            short_description=(
+                f"An original {plan.product_title} for {opportunity.target_customer}."
+            ),
+            long_description=(
+                f"A trend-led but original {plan.product_title} built around "
+                f"{opportunity.visual_direction}\n\n{disclosure}"
+            ),
+            tags=tags,
+            bullet_points=["Original transformed artwork", "Printed to order"],
+            alt_text=f"Original artwork on {plan.product_title}",
+            target_customer=opportunity.target_customer,
+            gift_occasions=["birthday", "holiday"],
+            seo_meta_title=title,
+            seo_meta_description=f"Original {plan.product_title} printed to order.",
+        )
+        return ModelResult(
+            MarketplaceListingSet(listings=[listing]),
+            self._fake_metadata("etsy_catalog_listing", prompt),
         )
 
     async def creative(

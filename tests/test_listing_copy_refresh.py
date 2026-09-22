@@ -59,6 +59,32 @@ def test_listing_limits_and_disclosure() -> None:
         ]))
 
 
+def test_copy_refresh_invariants_ignore_mockup_url_rotation_but_lock_artwork() -> None:
+    product = {
+        "variants": [{"id": 1001, "sku": "sku-1", "price": 2599,
+                      "is_enabled": True, "is_default": True}],
+        "images": [{"position": "front", "mockup_id": "mockup-1",
+                    "src": "https://images.example/old.png", "variant_ids": [1001]}],
+        "print_areas": [{
+            "variant_ids": [1001],
+            "placeholders": [{"position": "front", "images": [{
+                "id": "artwork-1", "x": 0.5, "y": 0.5, "scale": 1, "angle": 0,
+            }]}],
+        }],
+    }
+    inventory = {"products": []}
+    images = [{"listing_image_id": 9, "rank": 1}]
+    baseline = _invariants(product, inventory, images, [])
+
+    rotated = copy.deepcopy(product)
+    rotated["images"][0]["src"] = "https://images.example/new.png"
+    assert _invariants(rotated, inventory, images, []) == baseline
+
+    changed_artwork = copy.deepcopy(product)
+    changed_artwork["print_areas"][0]["placeholders"][0]["images"][0]["id"] = "artwork-2"
+    assert _invariants(changed_artwork, inventory, images, []) != baseline
+
+
 @pytest.mark.parametrize("interrupt", ["printify", "etsy"])
 @pytest.mark.asyncio
 async def test_copy_refresh_resumes_after_remote_write(
@@ -210,7 +236,11 @@ def test_copy_refresh_edit_invalidates_previous_approval(isolated_app) -> None:
         expected_version=1, title="New Trail Graphic T-Shirt",
         long_description="A sunrise trail shirt for hikers. " + ETSY_DISCLOSURE,
         tags=["trail shirt", "hiking gift"],
+        alt_text="Text-free sunrise above a winding mountain trail",
     ))
     assert result["version"] == 2 and result["digest"] != old_digest
+    assert result["items"][0]["after"]["alt_text"] == (
+        "Text-free sunrise above a winding mountain trail"
+    )
     with pytest.raises(ValueError, match="changed"):
         approve_copy_refresh_batch(batch_id, 1, old_digest)

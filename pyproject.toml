@@ -21,6 +21,7 @@ dependencies = [
   "opentelemetry-instrumentation-httpx>=0.58b0",
   "opentelemetry-sdk>=1.37.0",
   "pillow>=11.3.0",
+  "playwright>=1.55.0",
   "prometheus-client>=0.22.0",
   "psycopg[binary]>=3.2.9",
   "pydantic>=2.11.0",
@@ -41,7 +42,6 @@ dev = [
   "pytest-cov>=6.2.0",
   "pytest-playwright>=0.7.0",
   "respx>=0.22.0",
-  "playwright>=1.55.0",
   "ruff>=0.12.0",
 ]
 

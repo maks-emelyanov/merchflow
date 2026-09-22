@@ -14,7 +14,7 @@ from typing import cast
 import httpx
 from PIL import Image, ImageCms, ImageColor, ImageDraw, ImageFilter
 
-from merch.domain.design_effects import apply_design_effects
+from merch.domain.design_effects import apply_design_effects, typography_layer
 from merch.domain.fonts import DEFAULT_FONT_FAMILY, DEFAULT_FONT_FILE
 from merch.schemas import QAIssue, QAReport, TypographySpec
 
@@ -100,13 +100,30 @@ def prepare_artwork(
         content_width = bounds[2] - bounds[0]
         content_height = bounds[3] - bounds[1]
         if content_width / image.width < 0.68 or content_height / image.height < 0.68:
-            image = image.crop(bounds)
             fit_fraction = 0.78
         else:
             fit_fraction = 0.88
+        # Generated transparent canvases often carry asymmetric outer padding.
+        # Always fit the visible art itself so placement and footprint are based
+        # on printed content rather than model-chosen transparent margins.
+        image = image.crop(bounds)
     else:
         fit_fraction = 0.88
     placement = typography.vertical_placement if typography else "center"
+    use_registry = font_family == DEFAULT_FONT_FAMILY and font_file == DEFAULT_FONT_FILE
+    preview_text_bounds: tuple[int, int, int, int] | None = None
+    if typography and placement in {"top", "bottom"}:
+        _, preview_metadata, _ = typography_layer(
+            (target_width, target_height),
+            typography,
+            None if use_registry else font_family,
+            None if use_registry else font_file,
+        )
+        raw_preview_bounds = preview_metadata.get("bounds")
+        if isinstance(raw_preview_bounds, list) and len(raw_preview_bounds) == 4:
+            preview_text_bounds = cast(
+                tuple[int, int, int, int], tuple(int(value) for value in raw_preview_bounds)
+            )
     if placement in {"top", "bottom"}:
         text_height = min(0.30, typography.relative_height) if typography else 0.0
         reserved_fraction = min(0.38, max(0.20, text_height + 0.08))
@@ -114,9 +131,17 @@ def prepare_artwork(
         separation = round(target_height * 0.04)
         if placement == "bottom":
             region_top = outer_margin
-            region_bottom = round(target_height * (1 - reserved_fraction)) - separation
+            region_bottom = (
+                preview_text_bounds[1] - separation
+                if preview_text_bounds is not None
+                else round(target_height * (1 - reserved_fraction)) - separation
+            )
         else:
-            region_top = round(target_height * reserved_fraction) + separation
+            region_top = (
+                preview_text_bounds[3] + separation
+                if preview_text_bounds is not None
+                else round(target_height * reserved_fraction) + separation
+            )
             region_bottom = target_height - outer_margin
         height_limit = max(1, round((region_bottom - region_top) * 0.92))
     else:
@@ -165,14 +190,22 @@ def prepare_artwork(
         (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
         Image.Resampling.LANCZOS,
     )
+    resized_visible = image.getchannel("A").point(lambda value: 255 if value >= 64 else 0)
+    visible_bounds = resized_visible.getbbox() or (0, 0, image.width, image.height)
+    visible_width = visible_bounds[2] - visible_bounds[0]
+    visible_height = visible_bounds[3] - visible_bounds[1]
+    image_x = (target_width - visible_width) // 2 - visible_bounds[0]
     canvas = Image.new("RGBA", (target_width, target_height), (0, 0, 0, 0))
-    image_position = (
-        (target_width - image.width) // 2,
-        region_top + (region_bottom - region_top - image.height) // 2,
-    )
+    image_y = {
+        "top": region_top - visible_bounds[1],
+        "bottom": region_bottom - visible_bounds[3],
+        "center": (
+            region_top + (region_bottom - region_top - visible_height) // 2 - visible_bounds[1]
+        ),
+    }[placement]
+    image_position = (image_x, image_y)
     canvas.alpha_composite(image, image_position)
     illustration_bounds = list(canvas.getchannel("A").getbbox() or ())
-    use_registry = font_family == DEFAULT_FONT_FAMILY and font_file == DEFAULT_FONT_FILE
     canvas, effects, issues = apply_design_effects(
         canvas,
         typography,

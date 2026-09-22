@@ -46,6 +46,12 @@ from merch.schemas import (
 logger = logging.getLogger(__name__)
 
 with workflow.unsafe.imports_passed_through():
+    from merch.catalog_pipeline import (
+        attempt_catalog_opportunity,
+        finish_no_qualified_opportunity,
+        research_catalog_run,
+    )
+    from merch.catalog_publisher import publish_catalog_run
     from merch.copy_refresh import apply_copy_refresh_batch, prepare_copy_refresh_batch
     from merch.pipeline import (
         ApprovalInvalid,
@@ -106,6 +112,29 @@ async def temporal_client(settings: Settings | None = None) -> Client:
 @activity.defn(name="research_run")
 async def research_activity(run_id: str) -> None:
     await research_run(run_id)
+
+
+@activity.defn(name="research_catalog_run")
+async def research_catalog_activity(run_id: str) -> int:
+    return await research_catalog_run(run_id)
+
+
+@activity.defn(name="attempt_catalog_opportunity")
+async def attempt_catalog_activity(input: dict[str, object]) -> bool:
+    rank = input["rank"]
+    if not isinstance(rank, int):
+        raise ValueError("catalog opportunity rank must be an integer")
+    return await attempt_catalog_opportunity(str(input["run_id"]), rank)
+
+
+@activity.defn(name="publish_catalog_run")
+async def publish_catalog_activity(run_id: str) -> str:
+    return await publish_catalog_run(run_id)
+
+
+@activity.defn(name="finish_no_qualified_opportunity")
+async def finish_no_qualified_activity(run_id: str) -> None:
+    finish_no_qualified_opportunity(run_id)
 
 
 @activity.defn(name="screen_and_select_run")
@@ -198,13 +227,19 @@ async def _start_daily_workflow(
 ) -> str:
     run_date = scheduled.astimezone(ZoneInfo(settings.schedule_timezone)).date().isoformat()
     run_id = uuid5(NAMESPACE_URL, f"merch-daily-{run_date}")
-    value = RunInput(run_id=run_id, scheduled_for=scheduled, manual=False)
+    value = RunInput(
+        run_id=run_id,
+        scheduled_for=scheduled,
+        manual=False,
+        pipeline_version=settings.pipeline_version,
+        max_opportunity_attempts=settings.max_opportunity_attempts,
+    )
     workflow_id = f"merch-daily-{run_date}"
     create_run(value, workflow_id)
     client = client or await temporal_client(settings)
     try:
         await client.start_workflow(
-            MerchWorkflow.run,
+            (CatalogMerchWorkflow.run if value.pipeline_version == 2 else MerchWorkflow.run),
             value,
             id=workflow_id,
             task_queue=settings.temporal_task_queue,
@@ -482,6 +517,72 @@ class MerchWorkflow:
 
 
 @workflow.defn
+class CatalogMerchWorkflow:
+    """Research 25 opportunities and release the first of three that passes all gates."""
+
+    @workflow.run
+    async def run(self, input: RunInput) -> str:
+        run_id = str(input.run_id)
+        try:
+            count = cast(
+                int,
+                await workflow.execute_activity(
+                    "research_catalog_run",
+                    run_id,
+                    start_to_close_timeout=timedelta(hours=4),
+                    retry_policy=ACTIVITY_RETRY,
+                    result_type=int,
+                ),
+            )
+            if count == 0:
+                return RunStatus.NO_QUALIFIED_OPPORTUNITY.value
+            attempts = min(count, input.max_opportunity_attempts)
+            for rank in range(1, attempts + 1):
+                ready = await workflow.execute_activity(
+                    "attempt_catalog_opportunity",
+                    {"run_id": run_id, "rank": rank},
+                    start_to_close_timeout=timedelta(hours=2),
+                    retry_policy=ACTIVITY_RETRY,
+                    result_type=bool,
+                )
+                if not ready:
+                    continue
+                outcome = cast(
+                    str,
+                    await workflow.execute_activity(
+                        "publish_catalog_run",
+                        run_id,
+                        start_to_close_timeout=timedelta(minutes=45),
+                        retry_policy=ACTIVITY_RETRY,
+                        result_type=str,
+                    ),
+                )
+                if outcome == "hard_gate_failed":
+                    continue
+                if outcome == PublishStatus.RECONCILIATION_REQUIRED.value:
+                    return RunStatus.VERIFICATION_REQUIRED.value
+                if outcome in {
+                    PublishStatus.SUCCEEDED.value, PublishStatus.DRY_RUN.value,
+                }:
+                    return RunStatus.PUBLISHED.value
+                raise RuntimeError(f"unexpected catalog publication outcome: {outcome}")
+            await workflow.execute_activity(
+                "finish_no_qualified_opportunity",
+                run_id,
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            return RunStatus.NO_QUALIFIED_OPPORTUNITY.value
+        except Exception as exc:
+            reason = str(exc.__cause__) if exc.__cause__ else str(exc)
+            await workflow.execute_activity(
+                "mark_failed",
+                {"run_id": run_id, "error": reason},
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            raise
+
+
+@workflow.defn
 class RetryPublishWorkflow:
     @workflow.run
     async def run(self, input: PublishInput) -> str:
@@ -541,12 +642,18 @@ class DailyLauncherWorkflow:
 async def start_manual_run(settings: Settings | None = None) -> RunInput:
     settings = settings or get_settings()
     now = datetime.now(UTC)
-    value = RunInput(run_id=uuid4(), scheduled_for=now, manual=True)
+    value = RunInput(
+        run_id=uuid4(),
+        scheduled_for=now,
+        manual=True,
+        pipeline_version=settings.pipeline_version,
+        max_opportunity_attempts=settings.max_opportunity_attempts,
+    )
     workflow_id = f"merch-manual-{value.run_id}"
     create_run(value, workflow_id)
     client = await temporal_client(settings)
     await client.start_workflow(
-        MerchWorkflow.run,
+        (CatalogMerchWorkflow.run if value.pipeline_version == 2 else MerchWorkflow.run),
         value,
         id=workflow_id,
         task_queue=settings.temporal_task_queue,
@@ -815,10 +922,14 @@ async def run_worker(settings: Settings | None = None) -> None:
     worker = Worker(
         client,
         task_queue=settings.temporal_task_queue,
-        workflows=[MerchWorkflow, RetryPublishWorkflow, AnalyticsWorkflow, DailyLauncherWorkflow,
+        workflows=[MerchWorkflow, CatalogMerchWorkflow, RetryPublishWorkflow, AnalyticsWorkflow, DailyLauncherWorkflow,
                    CopyRefreshPrepareWorkflow, CopyRefreshApplyWorkflow],
         activities=[
             research_activity,
+            research_catalog_activity,
+            attempt_catalog_activity,
+            publish_catalog_activity,
+            finish_no_qualified_activity,
             screen_activity,
             generate_activity,
             rewrite_failed_brief_activity,

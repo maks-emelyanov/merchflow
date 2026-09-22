@@ -2,11 +2,25 @@
 {% block title %}Run {{ run.id }}{% endblock %}
 {% block content %}
 <div class="hero">
-  <div><p class="eyebrow">{{ run.scheduled_for.strftime('%B %d, %Y') }} · version {{ run.version }}</p><h1>{{ (run.selected_concept or {}).get('concept_name', 'Production run') }}</h1></div>
+  <div><p class="eyebrow">{{ run.scheduled_for.strftime('%B %d, %Y') }} · version {{ run.version }}</p><h1>{{ (payload.selected_opportunity or payload.selected_concept or {}).get('concept_name', 'Production run') }}</h1></div>
   <span class="status status-{{ run.status }}">{{ run.status|replace('_', ' ') }}</span>
 </div>
 {% if run.error %}<p class="error">{{ run.error }}</p>{% endif %}
 {% if payload.listing_generation_state and payload.listing_generation_state.warning %}<p class="warning">{{ payload.listing_generation_state.warning }}</p>{% endif %}
+{% if payload.pipeline_version == 2 %}
+<section class="panel"><p class="eyebrow">Catalog opportunity engine · Etsy only</p><h2>{{ (payload.product_plan or {}).get('product_title', 'Researching Printify catalog') }}</h2>
+  {% if payload.selected_opportunity %}<p>{{ payload.selected_opportunity.match_rationale }}</p><p><strong>Opportunity score:</strong> {{ '%.1f'|format(payload.selected_opportunity.weighted_score) }}/100</p>{% endif %}
+  {% if payload.qa_report %}<p><strong>Package digest:</strong> <code>{{ payload.qa_report.get('package_digest', '') }}</code></p><ul>{% for gate, passed in payload.qa_report.get('gates', {}).items() %}<li>{{ gate|replace('_', ' ')|title }}: {{ 'passed' if passed else 'blocked' }}</li>{% endfor %}</ul>{% endif %}
+</section>
+{% if payload.product_plan %}<section class="panel"><h2>Product and print plan</h2><p>Blueprint {{ payload.product_plan.blueprint_id }} · provider {{ payload.product_plan.print_provider_id }} · {{ payload.product_plan.variants|length }} variants · featured variant {{ payload.product_plan.featured_variant_id }}</p>
+  <div class="art-grid">{% for surface in payload.product_plan.surface_artworks %}<figure><div class="checker"><img src="/artifacts/{{ surface.artifact_id }}" alt="Artwork for {{ surface.surface_signature }}"></div><figcaption>{{ surface.surface_signature }}<br>{{ surface.placement|replace('_', ' ') }}</figcaption></figure>{% endfor %}</div>
+</section>{% endif %}
+<div class="columns">
+  <section class="panel"><h2>Originality and IP</h2>{% if payload.ip_report %}<p><strong>IP:</strong> {{ payload.ip_report.status }} · risk {{ payload.ip_report.risk_score }}/100</p>{% endif %}{% if payload.originality_report %}<p><strong>Originality:</strong> {{ payload.originality_report.originality_score }}/100 · copying risk {{ payload.originality_report.copying_risk }}/100 · {{ 'passed' if payload.originality_report.passed else 'blocked' }}</p>{% endif %}<p class="muted">Automated screening is not legal clearance.</p></section>
+  <section class="panel"><h2>Pricing decisions</h2><ul>{% for price in payload.price_decisions or [] %}<li>Variant {{ price.variant_id }} · ${{ '%.2f'|format(price.item_price_cents / 100) }} + ${{ '%.2f'|format(price.customer_shipping_cents / 100) }} shipping · {{ '%.0f'|format(price.contribution_margin * 100) }}% margin · undercut {{ price.undercut_status }}</li>{% else %}<li>Pricing pending.</li>{% endfor %}</ul></section>
+</div>
+<section class="panel"><h2>Ranked catalog opportunities</h2><ol class="ranking">{% for opportunity in payload.opportunities|sort(attribute='rank') %}<li><strong>#{{ opportunity.rank }} {{ opportunity.data.concept_name }}</strong> · {{ '%.1f'|format(opportunity.weighted_score) }} · {{ 'eligible' if opportunity.eligible else opportunity.rejection_reason }}<details><summary>Comparable-listing evidence</summary><p>{{ opportunity.data.match_rationale }}</p><ul>{% for listing in opportunity.data.comparable_listings %}<li><a href="{{ listing.url }}" target="_blank" rel="noopener noreferrer">{{ listing.marketplace|replace('_', ' ')|title }} · {{ listing.title }}</a> · confidence {{ listing.confidence }}/100 · {{ listing.source_method|replace('_', ' ') }}{% for limit in listing.limitations %}<p class="muted">{{ limit }}</p>{% endfor %}</li>{% endfor %}</ul></details></li>{% endfor %}</ol></section>
+{% endif %}
 {% set strategy = (payload.selected_concept or {}).get('strategy') %}
 {% if strategy %}
 <section class="panel"><p class="eyebrow">Odd Hour Press · Design direction</p><h2>{{ strategy.micro_niche }}</h2>
@@ -63,7 +77,7 @@
 
 <div class="columns">
   <section class="panel"><h2>QA{% if ip_check_enabled %} and IP evidence{% endif %}</h2>
-    {% if payload.qa_report %}<p><strong>QA:</strong> {{ 'passed' if payload.qa_report.passed else 'failed' }} at {{ payload.qa_report.width }}×{{ payload.qa_report.height }}</p><ul>{% for issue in payload.qa_report.issues %}<li>{{ issue.severity }} · {{ issue.message }}</li>{% else %}<li>No issues recorded.</li>{% endfor %}</ul>{% endif %}
+    {% if payload.qa_report and payload.pipeline_version == 1 %}<p><strong>QA:</strong> {{ 'passed' if payload.qa_report.passed else 'failed' }} at {{ payload.qa_report.width }}×{{ payload.qa_report.height }}</p><ul>{% for issue in payload.qa_report.issues %}<li>{{ issue.severity }} · {{ issue.message }}</li>{% else %}<li>No issues recorded.</li>{% endfor %}</ul>{% endif %}
     {% if payload.excluded_shirt_colors %}<p class="warning"><strong>Excluded after contrast QA:</strong> {{ payload.excluded_shirt_colors|join(', ') }}. All sizes in those colors are removed from this product.</p>{% endif %}
     {% if payload.replacement_shirt_colors %}<p><strong>Catalog replacements that passed contrast QA:</strong> {{ payload.replacement_shirt_colors|join(', ') }}. These colors are included in the approved prices and publication.</p>{% endif %}
     {% if ip_check_enabled and payload.ip_report %}<p><strong>IP screen:</strong> {{ payload.ip_report.status }} · risk {{ payload.ip_report.risk_score }}/100</p><p class="warning">This evidence is not legal clearance.</p><ul>{% for match in payload.ip_report.matches %}<li>{{ match.source }} — {{ match.explanation }}</li>{% endfor %}</ul><a href="{{ payload.ip_report.uspto_search_url }}" rel="noreferrer">Open USPTO search</a>{% endif %}

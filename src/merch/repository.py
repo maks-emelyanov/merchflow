@@ -14,9 +14,15 @@ from merch.models import (
     ApprovalRecord,
     ArtifactRecord,
     AuditEvent,
+    BrowserSessionRecord,
+    CatalogProductRecord,
+    CatalogVariantRecord,
+    CompetitorListingRecord,
     ConceptRecord,
     ConnectorStateRecord,
+    CostObservationRecord,
     DailyMetricRecord,
+    OpportunityRecord,
     ProductMappingRecord,
     ProductTemplateRecord,
     PublishRecord,
@@ -25,11 +31,19 @@ from merch.models import (
 from merch.schemas import (
     ApprovalSignal,
     CandidateConcept,
+    CatalogProduct,
+    CompetitorListingSnapshot,
     DailyPerformance,
+    OriginalityReport,
+    PriceDecision,
+    ProductOpportunity,
+    ProductPlanV2,
     ProductTemplate,
+    ReferenceAnalysis,
     RunInput,
     RunStatus,
     RunView,
+    SEOEvidence,
 )
 
 
@@ -67,6 +81,7 @@ class RunRepository:
             workflow_id=workflow_id,
             scheduled_for=value.scheduled_for,
             manual=value.manual,
+            pipeline_version=value.pipeline_version,
             status=RunStatus.PENDING.value,
         )
         self.session.add(record)
@@ -82,6 +97,7 @@ class RunRepository:
                 selectinload(RunRecord.artifacts),
                 selectinload(RunRecord.approvals),
                 selectinload(RunRecord.publishes),
+                selectinload(RunRecord.opportunities),
             )
         record = self.session.scalar(statement)
         if record is None:
@@ -90,12 +106,17 @@ class RunRepository:
 
     def has_audit_action(self, run_id: str, action: str) -> bool:
         """Return whether a durable run event with this exact action exists."""
-        return self.session.scalar(
-            select(AuditEvent.id).where(
-                AuditEvent.run_id == run_id,
-                AuditEvent.action == action,
-            ).limit(1)
-        ) is not None
+        return (
+            self.session.scalar(
+                select(AuditEvent.id)
+                .where(
+                    AuditEvent.run_id == run_id,
+                    AuditEvent.action == action,
+                )
+                .limit(1)
+            )
+            is not None
+        )
 
     def has_current_audit_action(self, run_id: str, action: str, version: int) -> bool:
         """Return whether an action belongs to the package version under review.
@@ -104,11 +125,13 @@ class RunRepository:
         not, so treat one as current only until a later artwork/package revision
         event proves that the operator moved on.
         """
-        events = list(self.session.scalars(
-            select(AuditEvent)
-            .where(AuditEvent.run_id == run_id, AuditEvent.action == action)
-            .order_by(AuditEvent.created_at.desc())
-        ))
+        events = list(
+            self.session.scalars(
+                select(AuditEvent)
+                .where(AuditEvent.run_id == run_id, AuditEvent.action == action)
+                .order_by(AuditEvent.created_at.desc())
+            )
+        )
         if not events:
             return False
         event = events[0]
@@ -116,7 +139,7 @@ class RunRepository:
         if event_version is not None:
             try:
                 return int(event_version) == version
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 return False
         invalidating_actions = {
             "artwork.brief_rewritten",
@@ -124,13 +147,18 @@ class RunRepository:
             "artwork.safe_layout_fallback",
             "run.artwork_retried",
         }
-        return self.session.scalar(
-            select(AuditEvent.id).where(
-                AuditEvent.run_id == run_id,
-                AuditEvent.created_at > event.created_at,
-                AuditEvent.action.in_(invalidating_actions),
-            ).limit(1)
-        ) is None
+        return (
+            self.session.scalar(
+                select(AuditEvent.id)
+                .where(
+                    AuditEvent.run_id == run_id,
+                    AuditEvent.created_at > event.created_at,
+                    AuditEvent.action.in_(invalidating_actions),
+                )
+                .limit(1)
+            )
+            is None
+        )
 
     def list_runs(self, limit: int = 100) -> list[RunRecord]:
         return list(
@@ -154,15 +182,17 @@ class RunRepository:
             concept = record.selected_concept
             if not concept:
                 continue
-            result.append({
-                "date": record.created_at.date().isoformat(),
-                "status": record.status,
-                "concept_name": concept.get("concept_name"),
-                "target_customer": concept.get("target_customer"),
-                "slogan": concept.get("slogan_if_any"),
-                "visual_concept": concept.get("visual_concept"),
-                "strategy": concept.get("strategy"),
-            })
+            result.append(
+                {
+                    "date": record.created_at.date().isoformat(),
+                    "status": record.status,
+                    "concept_name": concept.get("concept_name"),
+                    "target_customer": concept.get("target_customer"),
+                    "slogan": concept.get("slogan_if_any"),
+                    "visual_concept": concept.get("visual_concept"),
+                    "strategy": concept.get("strategy"),
+                }
+            )
             if len(result) == 30:
                 break
         return result
@@ -218,7 +248,8 @@ class RunRepository:
             **decision,
             "score_breakdowns": {
                 concept.data["concept_name"]: concept_score_breakdown(
-                    CandidateConcept.model_validate(concept.data), include_ip_risk=ip_report is not None,
+                    CandidateConcept.model_validate(concept.data),
+                    include_ip_risk=ip_report is not None,
                 )
                 for concept in record.concepts
             },
@@ -231,6 +262,83 @@ class RunRepository:
             concept.rejection_reason = reason
             concept.weighted_score = score
             concept.selected = concept.data["concept_name"] == selected.concept_name
+
+    def store_opportunities(self, run_id: str, opportunities: list[ProductOpportunity]) -> None:
+        record = self.get(run_id, full=True)
+        record.pipeline_version = 2
+        self.session.query(OpportunityRecord).filter(OpportunityRecord.run_id == run_id).delete()
+        for rank, opportunity in enumerate(opportunities, start=1):
+            self.session.add(
+                OpportunityRecord(
+                    run_id=run_id,
+                    rank=rank,
+                    weighted_score=opportunity.weighted_score,
+                    eligible=opportunity.eligible,
+                    rejection_reason=opportunity.rejection_reason,
+                    data=opportunity.model_dump(mode="json"),
+                )
+            )
+
+    def select_opportunity(self, run_id: str, opportunity: ProductOpportunity) -> None:
+        record = self.get(run_id)
+        prior_id = (record.selected_opportunity or {}).get("opportunity_id")
+        if prior_id != opportunity.opportunity_id:
+            record.reference_analysis = None
+            record.product_plan = None
+            record.originality_report = None
+            record.seo_evidence = None
+            record.price_decisions = None
+            record.listings = None
+            record.ip_report = None
+            record.qa_report = None
+        record.selected_opportunity = opportunity.model_dump(mode="json")
+        for item in self.session.scalars(
+            select(OpportunityRecord).where(OpportunityRecord.run_id == run_id)
+        ):
+            if item.data.get("opportunity_id") == opportunity.opportunity_id:
+                item.eligible = True
+            elif item.rejection_reason is None:
+                item.rejection_reason = "lower ranked qualifying opportunity"
+
+    def reject_opportunity(self, run_id: str, opportunity_id: str, reason: str) -> None:
+        item = next(
+            (
+                candidate
+                for candidate in self.session.scalars(
+                    select(OpportunityRecord).where(OpportunityRecord.run_id == run_id)
+                )
+                if candidate.data.get("opportunity_id") == opportunity_id
+            ),
+            None,
+        )
+        if item is not None:
+            item.eligible = False
+            item.rejection_reason = reason
+        record = self.get(run_id)
+        if (record.selected_opportunity or {}).get("opportunity_id") == opportunity_id:
+            record.selected_opportunity = None
+
+    def store_v2_package(
+        self,
+        run_id: str,
+        *,
+        opportunity: ProductOpportunity,
+        reference_analysis: ReferenceAnalysis,
+        plan: ProductPlanV2,
+        originality: OriginalityReport,
+        seo: SEOEvidence,
+        prices: list[PriceDecision],
+        listings: dict[str, Any],
+    ) -> None:
+        record = self.get(run_id)
+        record.pipeline_version = 2
+        record.selected_opportunity = opportunity.model_dump(mode="json")
+        record.reference_analysis = reference_analysis.model_dump(mode="json")
+        record.product_plan = plan.model_dump(mode="json")
+        record.originality_report = originality.model_dump(mode="json")
+        record.seo_evidence = seo.model_dump(mode="json")
+        record.price_decisions = [item.model_dump(mode="json") for item in prices]
+        record.listings = listings
 
     def begin_revision(
         self, run_id: str, regenerate: bool, preserve_brief: bool = False
@@ -412,12 +520,9 @@ class RunRepository:
             )
             self.session.add(record)
         external = response.get("external") or {}
-        record.marketplace_product_id = external.get("id") or response.get(
-            "external_id"
-        )
-        record.marketplace_listing_id = (
-            external.get("listing_id")
-            or (record.marketplace_product_id if channel == "etsy" else None)
+        record.marketplace_product_id = external.get("id") or response.get("external_id")
+        record.marketplace_listing_id = external.get("listing_id") or (
+            record.marketplace_product_id if channel == "etsy" else None
         )
         record.asin = response.get("asin")
         record.skus = [
@@ -453,13 +558,18 @@ class ConfigurationRepository:
     ) -> ProductTemplateRecord:
         current = lock_active_template(self.session)
         if current is None or current.version != expected_version:
-            raise ValueError("Active template changed during setup; preview the current catalog again")
+            raise ValueError(
+                "Active template changed during setup; preview the current catalog again"
+            )
         if ProductTemplate.model_validate(current.data) == template:
             return current
         terminal = {
-            RunStatus.PUBLISHED.value, RunStatus.REJECTED.value,
-            RunStatus.CANCELLED.value, RunStatus.FAILED.value,
+            RunStatus.PUBLISHED.value,
+            RunStatus.REJECTED.value,
+            RunStatus.CANCELLED.value,
+            RunStatus.FAILED.value,
             RunStatus.NO_SAFE_CANDIDATE.value,
+            RunStatus.NO_QUALIFIED_OPPORTUNITY.value,
         }
         active = self.session.scalar(
             select(RunRecord.id).where(RunRecord.status.not_in(terminal)).limit(1)
@@ -487,6 +597,194 @@ class ConfigurationRepository:
         self.session.add(record)
         self.session.flush()
         return record
+
+
+class CatalogRepository:
+    def __init__(self, session: Session):
+        self.session = session
+
+    @staticmethod
+    def product_key(blueprint_id: int, print_provider_id: int) -> str:
+        return f"{blueprint_id}:{print_provider_id}"
+
+    def upsert_product(self, product: CatalogProduct) -> CatalogProductRecord:
+        key = self.product_key(product.blueprint_id, product.print_provider_id)
+        record = self.session.get(CatalogProductRecord, key)
+        if record is None:
+            record = CatalogProductRecord(
+                key=key,
+                blueprint_id=product.blueprint_id,
+                print_provider_id=product.print_provider_id,
+                title=product.title,
+                data=product.model_dump(mode="json"),
+                source_fingerprint=product.source_fingerprint,
+                synced_at=product.synced_at,
+            )
+            self.session.add(record)
+        else:
+            record.title = product.title
+            record.data = product.model_dump(mode="json")
+            record.source_fingerprint = product.source_fingerprint
+            record.synced_at = product.synced_at
+            self.session.query(CatalogVariantRecord).filter(
+                CatalogVariantRecord.product_key == key
+            ).delete()
+        for variant in product.variants:
+            self.session.add(
+                CatalogVariantRecord(
+                    id=f"{key}:{variant.variant_id}",
+                    product_key=key,
+                    variant_id=variant.variant_id,
+                    available=variant.available,
+                    data=variant.model_dump(mode="json"),
+                    synced_at=product.synced_at,
+                )
+            )
+        self.session.flush()
+        return record
+
+    def get(self, blueprint_id: int, print_provider_id: int) -> CatalogProduct:
+        record = self.session.get(
+            CatalogProductRecord, self.product_key(blueprint_id, print_provider_id)
+        )
+        if record is None:
+            raise KeyError(f"catalog product {blueprint_id}/{print_provider_id} not found")
+        return CatalogProduct.model_validate(record.data)
+
+    def list_products(self) -> list[CatalogProduct]:
+        return [
+            CatalogProduct.model_validate(item.data)
+            for item in self.session.scalars(
+                select(CatalogProductRecord).order_by(
+                    CatalogProductRecord.blueprint_id,
+                    CatalogProductRecord.print_provider_id,
+                )
+            )
+        ]
+
+    def prune_products(self, active_keys: set[str]) -> int:
+        if not active_keys:
+            raise ValueError("refusing to prune the catalog without an active snapshot")
+        stale = list(
+            self.session.scalars(
+                select(CatalogProductRecord).where(CatalogProductRecord.key.not_in(active_keys))
+            )
+        )
+        for record in stale:
+            self.session.delete(record)
+        return len(stale)
+
+    def observe_cost(
+        self,
+        *,
+        account_plan: str,
+        blueprint_id: int,
+        print_provider_id: int,
+        variant_id: int,
+        cost_cents: int,
+        source_fingerprint: str,
+        evidence: dict[str, Any],
+        observed_at: datetime,
+    ) -> CostObservationRecord:
+        record = CostObservationRecord(
+            account_plan=account_plan,
+            blueprint_id=blueprint_id,
+            print_provider_id=print_provider_id,
+            variant_id=variant_id,
+            cost_cents=cost_cents,
+            currency="USD",
+            source_fingerprint=source_fingerprint,
+            evidence=evidence,
+            observed_at=observed_at,
+        )
+        self.session.add(record)
+        self.session.flush()
+        return record
+
+    def latest_costs(
+        self,
+        blueprint_id: int,
+        print_provider_id: int,
+        *,
+        observed_since: datetime,
+    ) -> dict[int, CostObservationRecord]:
+        records = self.session.scalars(
+            select(CostObservationRecord)
+            .where(
+                CostObservationRecord.blueprint_id == blueprint_id,
+                CostObservationRecord.print_provider_id == print_provider_id,
+                CostObservationRecord.observed_at >= observed_since,
+            )
+            .order_by(CostObservationRecord.observed_at.desc())
+        )
+        latest: dict[int, CostObservationRecord] = {}
+        for record in records:
+            latest.setdefault(record.variant_id, record)
+        return latest
+
+
+class ResearchRepository:
+    def __init__(self, session: Session):
+        self.session = session
+
+    def save_snapshot(self, snapshot: CompetitorListingSnapshot) -> CompetitorListingRecord:
+        payload = snapshot.model_dump(mode="json")
+        fingerprint = (
+            __import__("hashlib").sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        )
+        existing = self.session.scalar(
+            select(CompetitorListingRecord).where(
+                CompetitorListingRecord.fingerprint == fingerprint
+            )
+        )
+        if existing is not None:
+            return existing
+        record = CompetitorListingRecord(
+            marketplace=snapshot.marketplace.value,
+            external_listing_id=snapshot.external_listing_id,
+            url=snapshot.url,
+            fingerprint=fingerprint,
+            data=payload,
+            collected_at=snapshot.collected_at,
+        )
+        self.session.add(record)
+        self.session.flush()
+        return record
+
+
+class BrowserSessionRepository:
+    def __init__(self, session: Session):
+        self.session = session
+
+    def save(
+        self,
+        source: str,
+        encrypted_state: str,
+        *,
+        expires_at: datetime | None = None,
+    ) -> BrowserSessionRecord:
+        record = self.session.get(BrowserSessionRecord, source)
+        if record is None:
+            record = BrowserSessionRecord(source=source, encrypted_state=encrypted_state)
+            self.session.add(record)
+        else:
+            record.encrypted_state = encrypted_state
+        record.healthy = True
+        record.detail = "connected"
+        record.expires_at = expires_at
+        record.updated_at = datetime.now(UTC)
+        self.session.flush()
+        return record
+
+    def get(self, source: str) -> BrowserSessionRecord | None:
+        return self.session.get(BrowserSessionRecord, source)
+
+    def mark_unhealthy(self, source: str, detail: str) -> None:
+        record = self.session.get(BrowserSessionRecord, source)
+        if record is not None:
+            record.healthy = False
+            record.detail = detail[:2000]
+            record.updated_at = datetime.now(UTC)
 
 
 class MetricsRepository:
@@ -528,7 +826,9 @@ class MetricsRepository:
         payload = metric.model_dump(mode="json")
         if identity:
             identity.data = payload
-            identity.concept_id = str(metric.concept_id) if metric.concept_id else identity.concept_id
+            identity.concept_id = (
+                str(metric.concept_id) if metric.concept_id else identity.concept_id
+            )
             identity.imported_at = datetime.now(UTC)
         else:
             self.session.add(
@@ -559,8 +859,7 @@ class MetricsRepository:
         # A one-time CSV import can predate its publication mapping. Resolve
         # those saved observations at read time without requiring a reimport.
         channels = {
-            row.channel for row in rows
-            if not (row.concept_id or row.data.get("concept_id"))
+            row.channel for row in rows if not (row.concept_id or row.data.get("concept_id"))
         }
         mapped_concepts: dict[tuple[str, str], set[str]] = {}
         if channels:
@@ -571,13 +870,17 @@ class MetricsRepository:
                 if not mapping.concept_id:
                     continue
                 external_ids = {
-                    mapping.printify_product_id, mapping.marketplace_product_id,
-                    mapping.marketplace_listing_id, mapping.asin, *(mapping.skus or []),
+                    mapping.printify_product_id,
+                    mapping.marketplace_product_id,
+                    mapping.marketplace_listing_id,
+                    mapping.asin,
+                    *(mapping.skus or []),
                 }
                 for external_id in external_ids:
                     if external_id:
                         mapped_concepts.setdefault(
-                            (mapping.channel, str(external_id)), set(),
+                            (mapping.channel, str(external_id)),
+                            set(),
                         ).add(mapping.concept_id)
         observations = []
         ids = set()
@@ -589,12 +892,16 @@ class MetricsRepository:
                     concept_id = next(iter(matches))
             if concept_id:
                 ids.add(concept_id)
-            observations.append({
-                **row.data, "concept_id": concept_id,
-                "channel": row.channel, "source": row.source,
-                "external_product_id": row.external_product_id,
-                "metric_date": row.metric_date.isoformat(),
-            })
+            observations.append(
+                {
+                    **row.data,
+                    "concept_id": concept_id,
+                    "channel": row.channel,
+                    "source": row.source,
+                    "external_product_id": row.external_product_id,
+                    "metric_date": row.metric_date.isoformat(),
+                }
+            )
         concepts = {
             item.id: {
                 "name": item.data.get("concept_name"),
@@ -604,7 +911,8 @@ class MetricsRepository:
             for item in self.session.scalars(select(ConceptRecord).where(ConceptRecord.id.in_(ids)))
         }
         return json.dumps(
-            summarize_performance(observations, concepts, days), sort_keys=True,
+            summarize_performance(observations, concepts, days),
+            sort_keys=True,
         )
 
     def connector_result(

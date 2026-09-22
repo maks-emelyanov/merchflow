@@ -4,7 +4,9 @@ MerchFlow turns product research into print-ready artwork and verified Etsy list
 
 The engineering focus is recovery and correctness across external APIs: checkpoints preserve completed model calls, bounded revisions recover from artwork defects, uncertain publication requests require reconciliation before replay, and pixel comparisons verify the photos actually served by Etsy. Audit artifacts, Prometheus metrics, and optional OpenTelemetry tracing make the workflow inspectable.
 
-Each daily workflow researches 25 concepts, ranks them, creates and validates one product package, then publishes enabled channels independently through Printify. Odd Hour Press's default direction is specific identity and smart, strange humor expressed through original vintage clubs, companies, and institutions, with room for strong related ideas. Manual release approval, IP screening and attestation, and the Etsy production-partner confirmation check can each be enabled when needed.
+Each new daily v2 workflow synchronizes Printify's supported catalog, researches specific listings on Etsy, Amazon US, TikTok Shop, Walmart, and eBay, ranks 25 product/design opportunities, and tries the top three until one passes every hard gate. New v2 runs publish one verified Etsy product; the original T-shirt and multi-channel workflow remains readable and retryable for historical v1 runs.
+
+See the [catalog v2 operations guide](docs/catalog-v2.md) for setup, hard gates, dry-run acceptance, live rollout, and recovery.
 
 The safe default uses fake model/provider responses and `MERCH_PUBLISH_MODE=dry_run`. Scheduled and manual runs can complete automatically in dry-run mode. Live marketplace mutation requires an explicit `MERCH_PUBLISH_MODE=live` setting; QA, catalog, price, variant, and storefront verification still gate publication.
 
@@ -21,7 +23,7 @@ flowchart LR
     worker --> providers[Configured providers and marketplaces]
 ```
 
-The web process handles review and configuration. Temporal coordinates retries and schedules; the worker creates and validates packages, then publishes each enabled channel. PostgreSQL stores run state and MinIO stores versioned artwork. The default fake provider and dry-run publish modes exercise the workflow without live API calls.
+The web process handles review and configuration. Temporal coordinates retries and schedules; the worker owns Playwright research, encrypted Printify cost sessions, package generation, and Etsy publication. PostgreSQL stores normalized catalog, cost, evidence, opportunity, and run state; MinIO stores immutable page, screenshot, reference, artwork, and verification evidence. The default fake provider and dry-run publish modes exercise the workflow without live API calls.
 
 ## Quick start
 
@@ -52,6 +54,12 @@ The fixture command stops at `awaiting_approval` so its package can be inspected
 
 ## What is implemented
 
+- Catalog-neutral Printify products, variants, arbitrary option maps, multiple print surfaces, method capability rules, US shipping, and account-specific cost observations. Unknown decoration methods fail closed.
+- Purpose-built browser collectors for Etsy, Amazon US, TikTok Shop, Walmart, and eBay, with JSON-LD/OpenGraph extraction, immutable evidence, robots/challenge handling, and clearly labeled listing-specific search fallback.
+- Deterministic 25-opportunity ranking using demand (25%), confidence (15%), purchase intent (15%), projected margin (15%), undercut feasibility (10%), competition gap (10%), trend velocity (5%), and longevity (5%).
+- Reference-pattern analysis, mandatory IP screening, perceptual and wording similarity checks, vision originality thresholds, and repeat checks on representative final mockups.
+- Etsy-only v2 pricing at a 40% contribution-margin floor, using median US delivered competitor prices and per-variant undercut decisions. Generic two/three-axis inventory and taxonomy property support enforce the configured shop capability and Etsy inventory limits.
+
 - Strict Pydantic schemas for research, 25 new candidates, selection, creative/typography briefs, IP evidence, QA, listings, pricing, templates, approval, and normalized analytics. Historical 10-candidate reports remain readable.
 - OpenAI Responses API structured parsing with Astra for selection, creative direction, and visual QA; Terra for research, typography, and listings. Web-search-enabled research and optional IP checks store prompts, response IDs, citations, usage, model and schema versions. Raster generation/editing uses `gpt-image-2.5-sunburst` without asking the model to render text.
 - Exact slogan rendering through SVG/librsvg’s Pango/HarfBuzz stack, with Noto Sans, Noto Serif, Roboto Slab, Noto Serif Display, and Noto Sans Mono. Output is transparent sRGB PNG at exact catalog dimensions with 300-DPI metadata.
@@ -75,7 +83,23 @@ openssl rand -base64 32
 
 Use the first output as `MERCH_ADMIN_PASSWORD_HASH`, one random value as `MERCH_SESSION_SECRET`, and another as `MERCH_CREDENTIAL_ENCRYPTION_KEY`. Production validation refuses to start without all three. Keep provider credentials in your secret manager rather than committing `.env`.
 
-Configure one active product template through `PUT /api/template` (the OpenAPI console is at `/docs`). It must contain the current Printify blueprint/provider, exact front-DTG print dimensions, enabled variant IDs, colors/sizes/current production costs, and one Printify shop ID and fee assumptions per enabled channel. Etsy production-partner confirmation is checked only when `MERCH_ETSY_PRODUCTION_PARTNER_CHECK_ENABLED=true`. Marketplace fees are deliberately not hard-coded. Prices are calculated as:
+The active legacy template still supplies the Etsy Printify shop and imported Etsy shipping, return, readiness, and production-partner profile IDs. New product identity, surfaces, variants, shipping, and costs come from the catalog-wide v2 sync. Import working Etsy defaults from an app-owned listing before live catalog publication.
+
+Connect the authenticated Printify dashboard session without storing a password, then inspect connector/source health and bootstrap the catalog:
+
+```bash
+uv run merch connect-browser printify
+uv run merch session-health
+uv run merch source-health
+uv run merch catalog-sync
+uv run merch research-smoke "ceramic mug"
+```
+
+Browser storage state is encrypted with `MERCH_CREDENTIAL_ENCRYPTION_KEY`. Collectors never bypass login barriers, CAPTCHAs, robots restrictions, or access controls. Search fallback can supply competitor evidence but never Printify costs or Etsy publication verification.
+
+V2 contribution pricing includes item revenue plus configured buyer shipping, less production, Printify shipping, Etsy percentage/fixed fees, and configured discounts. It chooses the highest `.99` delivered total below the comparable median when that preserves the configured 40% margin; otherwise it records why it used the lowest `.99` margin-floor price.
+
+For historical v1 runs, configure one active product template through `PUT /api/template` (the OpenAPI console is at `/docs`). It contains the saved garment, variants, costs, and channel configuration. Legacy prices are calculated as:
 
 ```text
 next .99((production cost + fixed channel fee) / (1 - percentage fee - 0.40))
@@ -85,7 +109,9 @@ Shipping is buyer-paid and excluded. Listing metadata is generated only from thi
 
 The legacy Etsy-only Bella+Canvas 3001 / SwiftPOD installer remains available as `docker compose exec -T web .venv/bin/python -m merch.setup_etsy_tee` so historical deployments can be reproduced. New installations should use the Comfort Colors setup below.
 
-Set `MERCH_IP_CHECK_ENABLED=true` to run deterministic and web-search IP checks and show the IP evidence and attestation checkbox in the run UI. It defaults to `false`. The setting also controls whether IP risk affects candidate ranking. Restart the web and worker processes after changing it.
+For v2 runs, IP screening is mandatory and a passing package receives a system approval bound to its exact digest. `MERCH_IP_CHECK_ENABLED` and `MERCH_MANUAL_APPROVAL_ENABLED` do not weaken or replace those v2 gates.
+
+For historical v1 runs, set `MERCH_IP_CHECK_ENABLED=true` to run deterministic and web-search IP checks and show the IP evidence and attestation checkbox in the run UI. It defaults to `false`. The setting also controls whether IP risk affects v1 candidate ranking. Restart the web and worker processes after changing it.
 
 Manual checks are opt-in. `MERCH_MANUAL_APPROVAL_ENABLED=false`, `MERCH_ETSY_PRODUCTION_PARTNER_CHECK_ENABLED=false`, and `MERCH_IP_CHECK_ENABLED=false` are the defaults. When all three are off, a passing package automatically releases to its enabled channels; the release still checks the exact package version, current Printify catalog, QA, approved prices, and live storefront results. Set `MERCH_MANUAL_APPROVAL_ENABLED=true` to require channel selection and typing `PUBLISH` on the run page. Enabling either IP screening or the Etsy partner check also requires the human release step. These settings take effect after restarting the web and worker.
 
@@ -238,6 +264,10 @@ uv run merch schedule
 uv run merch run
 uv run merch analytics
 uv run merch connections
+uv run merch session-health
+uv run merch source-health
+uv run merch catalog-sync
+uv run merch research-smoke "ceramic mug"
 ```
 
 These last two are opt-in live smoke checks and are read-only. There is no live publish smoke command.
@@ -254,13 +284,13 @@ Publication retries retain product and draft IDs, accepted publish responses, an
 
 ## Operator API
 
-Use **Copy refresh** in the operator console to review a one-time batch of existing mapped Etsy listings. The page compares current and proposed title, description, and tags, lets an admin edit each draft, and requires one approval of the exact batch version before live changes. The worker updates only these fields on the existing Printify products and Etsy listings, then checks identity, link, variants, prices, photos, and copy. Interrupted updates remain reviewable and resume against the same IDs. `docker compose exec -T web .venv/bin/merch prepare-copy-refresh` prepares or resumes drafts from the CLI without changing live copy. Shopify SEO fields are saved in new run packages; this flow does not update Shopify directly.
+Use **Copy refresh** in the operator console to review a one-time batch of existing mapped Etsy listings. The page compares current and proposed title, description, tags, and image alt text, lets an admin edit each draft, and requires one approval of the exact batch version before live changes. The worker updates only title, description, and tags on the existing Printify products and Etsy listings; reviewed alt text is retained for a future gallery replacement. It then checks identity, link, variants, prices, photos, and copy. Interrupted updates remain reviewable and resume against the same IDs. `docker compose exec -T web .venv/bin/merch prepare-copy-refresh` prepares or resumes drafts from the CLI without changing live copy; pass `--run-id <run-id>` to stage only one published run even when another batch is pending. Shopify SEO fields are saved in new run packages; this flow does not update Shopify directly.
 
 Authenticated JSON endpoints are available for run creation/list/detail, package editing, approval, rejection, cancellation, regeneration, per-channel retry, template management, encrypted connector-token storage, health checks, and Etsy CSV import. All state-changing session endpoints require the `X-CSRF-Token` header. Full request/response schemas are in `/docs`.
 
 Saved mockup evidence is available at `GET /api/runs/{run_id}/mockup-evidence/{side}?color={color}`, where `side` is `source` or `actual` and the color is URL-encoded. The endpoint serves only the current report's stored PNG/JPEG bytes after checking their hash; missing evidence returns 404.
 
-Temporal exposes `approve`, `reject`, `regenerate`, and `cancel` signals. Run state covers research, screening, ranking, generation, QA/listing, approval, publishing, partial/full success, rejection, cancellation, no-safe-candidate and failure.
+Temporal exposes `approve`, `reject`, `regenerate`, and `cancel` signals for legacy review workflows. Run state covers research, screening, ranking, generation, QA/listing, approval, publishing, partial/full success, rejection, cancellation, no-safe-candidate, no-qualified-opportunity and failure.
 
 The Printify webhook receiver is `/webhooks/printify`. Configure your public HTTPS URL and shared secret with the Printify webhook API, then set the same value in `MERCH_PRINTIFY_WEBHOOK_SECRET`; the reverse proxy must preserve the request body and `X-Pfy-Signature`. Persisted webhook payloads are recursively stripped of names, email, phone and address fields.
 
