@@ -17,6 +17,7 @@ from temporalio.service import RPCError, RPCStatusCode
 
 from merch.config import Settings
 from merch.temporal import (
+    CATALOG_REFRESH_SCHEDULE_ID,
     DAILY_DESIGN_SCHEDULE_ID,
     TEMPORAL_SCHEDULED_START_TIME,
     DailyLauncherWorkflow,
@@ -47,6 +48,9 @@ async def test_both_daily_schedules_run_at_930_and_keep_pause_state(monkeypatch)
             ScheduleState(paused=True, note="Billing pause")
         ),
         "merch-daily-analytics": FakeHandle(ScheduleState(paused=False)),
+        CATALOG_REFRESH_SCHEDULE_ID: FakeHandle(
+            ScheduleState(paused=True, note="Catalog maintenance pause")
+        ),
     }
 
     class FakeClient:
@@ -59,16 +63,31 @@ async def test_both_daily_schedules_run_at_930_and_keep_pause_state(monkeypatch)
     monkeypatch.setattr("merch.temporal.temporal_client", fake_temporal_client)
     await reconcile_schedules(Settings(_env_file=None))
 
-    for handle in handles.values():
+    for schedule_id, handle in handles.items():
         assert handle.schedule is not None
-        assert handle.schedule.spec.cron_expressions == ["30 9 * * *"]
+        expected_cron = (
+            ["0 2 * * 0"]
+            if schedule_id == CATALOG_REFRESH_SCHEDULE_ID
+            else ["30 9 * * *"]
+        )
+        assert handle.schedule.spec.cron_expressions == expected_cron
         assert handle.schedule.spec.time_zone_name == "America/New_York"
         assert handle.schedule.policy.catchup_window == timedelta(hours=24)
-        assert handle.schedule.policy.overlap == ScheduleOverlapPolicy.BUFFER_ONE
+        expected_overlap = (
+            ScheduleOverlapPolicy.SKIP
+            if schedule_id == CATALOG_REFRESH_SCHEDULE_ID
+            else ScheduleOverlapPolicy.BUFFER_ONE
+        )
+        assert handle.schedule.policy.overlap == expected_overlap
         assert not handle.schedule.policy.pause_on_failure
     assert handles["merch-daily-design"].schedule.state.paused
     assert handles["merch-daily-design"].schedule.state.note == "Billing pause"
     assert not handles["merch-daily-analytics"].schedule.state.paused
+    assert handles[CATALOG_REFRESH_SCHEDULE_ID].schedule.state.paused
+    assert (
+        handles[CATALOG_REFRESH_SCHEDULE_ID].schedule.state.note
+        == "Catalog maintenance pause"
+    )
 
 
 @pytest.mark.asyncio
@@ -92,10 +111,19 @@ async def test_schedule_creation_uses_explicit_catchup_policy(monkeypatch) -> No
     monkeypatch.setattr("merch.temporal.temporal_client", fake_temporal_client)
     await reconcile_schedules(Settings(_env_file=None))
 
-    assert set(created) == {"merch-daily-design", "merch-daily-analytics"}
-    for schedule in created.values():
+    assert set(created) == {
+        "merch-daily-design",
+        "merch-daily-analytics",
+        CATALOG_REFRESH_SCHEDULE_ID,
+    }
+    for schedule_id, schedule in created.items():
         assert schedule.policy.catchup_window == timedelta(hours=24)
-        assert schedule.policy.overlap == ScheduleOverlapPolicy.BUFFER_ONE
+        expected_overlap = (
+            ScheduleOverlapPolicy.SKIP
+            if schedule_id == CATALOG_REFRESH_SCHEDULE_ID
+            else ScheduleOverlapPolicy.BUFFER_ONE
+        )
+        assert schedule.policy.overlap == expected_overlap
         assert not schedule.policy.pause_on_failure
 
 

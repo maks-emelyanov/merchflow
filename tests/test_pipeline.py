@@ -785,6 +785,7 @@ async def test_ip_check_is_disabled_by_default_and_does_not_screen(
 ) -> None:
     settings = get_settings()
     assert settings.ip_check_enabled is False
+    assert settings.originality_check_enabled is False
     Base.metadata.create_all(get_engine())
     value = RunInput(run_id=uuid4(), scheduled_for=datetime.now(UTC), manual=True)
     create_run(value, f"manual-{value.run_id}")

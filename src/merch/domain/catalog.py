@@ -138,14 +138,33 @@ def normalize_catalog_product(
         )
     if not variants:
         raise ValueError(f"Printify product {blueprint_id}/{provider_id} has no printable variants")
+    canonical_variants = [
+        {
+            "variant_id": item.variant_id,
+            "title": item.title,
+            "options": item.options,
+            "surfaces": [
+                surface.model_dump(mode="json")
+                for surface in sorted(item.surfaces, key=lambda value: value.signature)
+            ],
+            "available": item.available,
+            "production_cost_cents": item.production_cost_cents,
+            "shipping_cost_cents": item.shipping_cost_cents,
+        }
+        for item in sorted(variants, key=lambda value: value.variant_id)
+    ]
     canonical = {
-        "blueprint": blueprint,
-        "provider": provider,
-        "variants": variants_payload,
-        "shipping": shipping_payload,
+        "blueprint_id": blueprint_id,
+        "print_provider_id": provider_id,
+        "title": str(blueprint.get("title") or f"Printify blueprint {blueprint_id}"),
+        "description": str(blueprint.get("description") or ""),
+        "brand": str(blueprint["brand"]) if blueprint.get("brand") else None,
+        "model": str(blueprint["model"]) if blueprint.get("model") else None,
+        "tags": sorted(str(item) for item in blueprint.get("tags", [])),
+        "variants": canonical_variants,
     }
     fingerprint = hashlib.sha256(
-        json.dumps(canonical, sort_keys=True, default=str).encode()
+        json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str).encode()
     ).hexdigest()
     return CatalogProduct(
         blueprint_id=blueprint_id,

@@ -10,29 +10,42 @@ import pytest
 from merch.config import get_settings
 from merch.database import get_engine, session_scope
 from merch.defaults import fixture_product_template
-from merch.models import Base
+from merch.models import ArtifactRecord, Base, OpportunityRecord
 from merch.repository import ConfigurationRepository, RunRepository
 from merch.schemas import (
     ApprovalSignal,
     CandidateConcept,
     Channel,
     CreativeBrief,
+    PublishInput,
     PublishStatus,
     RunInput,
     RunStatus,
 )
 from merch.services.openai_service import OpenAIService
-from merch.temporal import MerchWorkflow, retry_failed_artwork_run
+from merch.temporal import (
+    CatalogMerchWorkflow,
+    MerchWorkflow,
+    publish_activity,
+    resume_researched_run,
+    retry_failed_artwork_run,
+)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("patched,successful,expected", [
-    (True, True, RunStatus.PUBLISHED.value),
-    (True, False, RunStatus.AWAITING_BRIEF_REVISION.value),
-    (False, False, RunStatus.REJECTED.value),
-])
+@pytest.mark.parametrize(
+    "patched,successful,expected",
+    [
+        (True, True, RunStatus.PUBLISHED.value),
+        (True, False, RunStatus.AWAITING_BRIEF_REVISION.value),
+        (False, False, RunStatus.REJECTED.value),
+    ],
+)
 async def test_requested_regeneration_recovers_or_preserves_old_workflow_history(
-    monkeypatch: pytest.MonkeyPatch, patched: bool, successful: bool, expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+    patched: bool,
+    successful: bool,
+    expected: str,
 ) -> None:
     workflow = MerchWorkflow()
     calls: list[tuple[str, Any]] = []
@@ -60,7 +73,10 @@ async def test_requested_regeneration_recovers_or_preserves_old_workflow_history
             if generations == 1:
                 return None
             return ApprovalSignal(
-                channels=[Channel.ETSY], expected_version=4, actor="system", ip_attested=False,
+                channels=[Channel.ETSY],
+                expected_version=4,
+                actor="system",
+                ip_attested=False,
             )
         if name == "record_approval":
             assert argument["signal"]["expected_version"] == 4
@@ -99,23 +115,33 @@ async def test_requested_regeneration_recovers_or_preserves_old_workflow_history
     assert generation_calls[1] == {"run_id": str(value.run_id), "regenerate": True}
     if patched:
         assert rewrites == 2
-        assert all(argument == {
-            "run_id": str(value.run_id), "regenerate": False, "preserve_brief": True,
-        } for argument in generation_calls[2:])
+        assert all(
+            argument
+            == {
+                "run_id": str(value.run_id),
+                "regenerate": False,
+                "preserve_brief": True,
+            }
+            for argument in generation_calls[2:]
+        )
     else:
         assert rewrites == 0
         assert generations == 2
     assert names.count("publish_channel") == int(successful)
 
 
-async def _failed_artwork_run(*, legacy: bool = False) -> tuple[str, CreativeBrief, CandidateConcept]:
+async def _failed_artwork_run(
+    *, legacy: bool = False
+) -> tuple[str, CreativeBrief, CandidateConcept]:
     Base.metadata.create_all(get_engine())
     template = fixture_product_template()
     service = OpenAIService(get_settings())
     concept = (await service.research(date.today(), "none")).value.candidates[0]
-    brief = (await service.creative(concept, {})).value.model_copy(update={
-        "shirt_colors": sorted({item.color for item in template.variants if item.enabled}),
-    })
+    brief = (await service.creative(concept, {})).value.model_copy(
+        update={
+            "shirt_colors": sorted({item.color for item in template.variants if item.enabled}),
+        }
+    )
     concept_data = concept.model_dump(mode="json")
     brief_data = brief.model_dump(mode="json")
     if legacy:
@@ -131,8 +157,14 @@ async def _failed_artwork_run(*, legacy: bool = False) -> tuple[str, CreativeBri
         record.creative_brief = brief_data
         record.status = RunStatus.AWAITING_BRIEF_REVISION.value
         repository.add_artifact(
-            run_id, kind="production-v1", revision=1, object_key=f"failed-{run_id}",
-            sha256="0" * 64, width=400, height=500, metadata={},
+            run_id,
+            kind="production-v1",
+            revision=1,
+            object_key=f"failed-{run_id}",
+            sha256="0" * 64,
+            width=400,
+            height=500,
+            metadata={},
         )
     return run_id, CreativeBrief.model_validate(brief_data), concept
 
@@ -156,17 +188,22 @@ async def test_unchanged_legacy_brief_is_rejected_after_schema_defaults(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replace_strategy", [False, True])
 async def test_manual_revision_restores_selected_strategy(
-    isolated_app: Path, monkeypatch: pytest.MonkeyPatch, replace_strategy: bool,
+    isolated_app: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replace_strategy: bool,
 ) -> None:
     run_id, brief, concept = await _failed_artwork_run()
     assert concept.strategy is not None
-    revised = brief.model_copy(update={
-        "composition": "Use an open composition with no surrounding frame",
-        "strategy": (
-            concept.strategy.model_copy(update={"premise": "A different unselected idea"})
-            if replace_strategy else None
-        ),
-    })
+    revised = brief.model_copy(
+        update={
+            "composition": "Use an open composition with no surrounding frame",
+            "strategy": (
+                concept.strategy.model_copy(update={"premise": "A different unselected idea"})
+                if replace_strategy
+                else None
+            ),
+        }
+    )
     starts: list[RunInput] = []
 
     class Client:
@@ -193,20 +230,24 @@ async def test_removing_strategy_is_not_an_artwork_revision(isolated_app: Path) 
     run_id, brief, _ = await _failed_artwork_run()
     with pytest.raises(ValueError, match="Revise the creative brief"):
         await retry_failed_artwork_run(
-            run_id, revised_brief=brief.model_copy(update={"strategy": None}),
+            run_id,
+            revised_brief=brief.model_copy(update={"strategy": None}),
         )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("slogan", ["DIFFERENT PRINTED WORDS", None])
 async def test_manual_strategy_revision_rejects_changed_printed_words(
-    isolated_app: Path, slogan: str | None,
+    isolated_app: Path,
+    slogan: str | None,
 ) -> None:
     run_id, brief, _ = await _failed_artwork_run()
-    revised = brief.model_copy(update={
-        "composition": "An open composition with more separation",
-        "slogan": slogan,
-    })
+    revised = brief.model_copy(
+        update={
+            "composition": "An open composition with more separation",
+            "slogan": slogan,
+        }
+    )
     with pytest.raises(ValueError, match="exact printed slogan"):
         await retry_failed_artwork_run(run_id, revised_brief=revised)
     with session_scope() as session:
@@ -217,7 +258,8 @@ async def test_manual_strategy_revision_rejects_changed_printed_words(
 
 @pytest.mark.asyncio
 async def test_manual_legacy_revision_retains_slogan_edit_behavior(
-    isolated_app: Path, monkeypatch: pytest.MonkeyPatch,
+    isolated_app: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run_id, brief, _ = await _failed_artwork_run(legacy=True)
     revised = brief.model_copy(update={"slogan": "REVISED LEGACY WORDING"})
@@ -234,3 +276,141 @@ async def test_manual_legacy_revision_retains_slogan_edit_behavior(
     with session_scope() as session:
         saved = CreativeBrief.model_validate(RunRepository(session).get(run_id).creative_brief)
         assert saved.slogan == revised.slogan
+
+
+@pytest.mark.asyncio
+async def test_catalog_workflow_reuses_saved_research(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, Any]] = []
+
+    async def execute(name: str, argument: Any, **kwargs: Any) -> Any:
+        calls.append((name, argument))
+        if name == "resume_catalog_research":
+            return 25
+        if name == "attempt_catalog_opportunity":
+            return True
+        if name == "publish_catalog_run":
+            return PublishStatus.SUCCEEDED.value
+        raise AssertionError(f"Unexpected workflow activity: {name}")
+
+    monkeypatch.setattr("merch.temporal.workflow.execute_activity", execute)
+    value = RunInput(
+        run_id=uuid4(),
+        scheduled_for=datetime.now(UTC),
+        manual=True,
+        reuse_research=True,
+        pipeline_version=2,
+        max_opportunity_attempts=3,
+    )
+
+    assert await CatalogMerchWorkflow().run(value) == RunStatus.PUBLISHED.value
+    assert [name for name, _ in calls] == [
+        "resume_catalog_research",
+        "attempt_catalog_opportunity",
+        "publish_catalog_run",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_publish_retry_routes_v2_run_to_catalog_publisher(
+    isolated_app: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    Base.metadata.create_all(get_engine())
+    original = RunInput(
+        run_id=uuid4(),
+        scheduled_for=datetime.now(UTC),
+        manual=True,
+        pipeline_version=2,
+    )
+    with session_scope() as session:
+        repository = RunRepository(session)
+        run = repository.create(original, f"catalog-publish-retry-{original.run_id}")
+        run.status = RunStatus.FAILED.value
+        publish = repository.publish_record(str(original.run_id), Channel.ETSY.value, "saved")
+        publish.status = PublishStatus.FAILED.value
+
+    calls: list[str] = []
+
+    async def catalog_publisher(run_id: str) -> str:
+        calls.append(run_id)
+        return PublishStatus.SUCCEEDED.value
+
+    async def legacy_publisher(run_id: str, channel: Channel) -> PublishStatus:
+        raise AssertionError("v2 retry must not invoke the legacy publisher")
+
+    monkeypatch.setattr("merch.temporal.publish_catalog_run", catalog_publisher)
+    monkeypatch.setattr("merch.temporal.publish_channel_run", legacy_publisher)
+
+    result = await publish_activity(PublishInput(run_id=original.run_id, channel=Channel.ETSY))
+
+    assert result == PublishStatus.SUCCEEDED
+    assert calls == [str(original.run_id)]
+    with session_scope() as session:
+        assert RunRepository(session).get(str(original.run_id)).status == RunStatus.PUBLISHING.value
+
+
+@pytest.mark.asyncio
+async def test_failed_v2_run_can_resume_saved_opportunities(
+    isolated_app: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    Base.metadata.create_all(get_engine())
+    original = RunInput(
+        run_id=uuid4(),
+        scheduled_for=datetime.now(UTC),
+        manual=True,
+        pipeline_version=2,
+    )
+    with session_scope() as session:
+        repository = RunRepository(session)
+        record = repository.create(original, f"catalog-failed-{original.run_id}")
+        record.status = RunStatus.FAILED.value
+        session.add(
+            OpportunityRecord(
+                run_id=str(original.run_id),
+                rank=1,
+                weighted_score=90,
+                eligible=True,
+                data={"opportunity_id": "saved-opportunity"},
+            )
+        )
+        session.add(
+            ArtifactRecord(
+                run_id=str(original.run_id),
+                kind="v2-ref-checkpoint",
+                revision=1,
+                object_key=f"runs/{original.run_id}/reference.png",
+                sha256="0" * 64,
+                content_type="image/png",
+                width=512,
+                height=512,
+                metadata_json={"immutable_evidence": True},
+            )
+        )
+
+    starts: list[tuple[Any, RunInput]] = []
+
+    class Client:
+        async def start_workflow(
+            self,
+            workflow: Any,
+            value: RunInput,
+            **kwargs: Any,
+        ) -> None:
+            starts.append((workflow, value))
+
+    async def client(settings: Any) -> Client:
+        return Client()
+
+    monkeypatch.setattr("merch.temporal.temporal_client", client)
+    resumed = await resume_researched_run(str(original.run_id))
+
+    assert resumed.reuse_research is True
+    assert resumed.pipeline_version == 2
+    assert starts == [(CatalogMerchWorkflow.run, resumed)]
+    with session_scope() as session:
+        record = RunRepository(session).get(str(original.run_id))
+        assert record.status == RunStatus.PENDING.value
+        assert record.workflow_id.startswith(f"merch-resume-{original.run_id}-")

@@ -4,7 +4,12 @@ import asyncio
 import base64
 import hashlib
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, cast
+from weakref import WeakKeyDictionary
 
 import httpx
 
@@ -19,17 +24,68 @@ from merch.schemas import (
     ProductTemplate,
 )
 
+PRINTIFY_MAX_ENABLED_VARIANTS = 100
+PRINTIFY_RANKED_BLUEPRINTS_PATH = "/product-catalog-service/api/v1/blueprints/search"
+
 
 class ProviderConfigurationError(RuntimeError):
     pass
+
+
+class PrintifyHTTPError(ProviderConfigurationError):
+    def __init__(self, method: str, path: str, status_code: int, detail: str | None = None):
+        self.method = method.upper()
+        self.path = path
+        self.status_code = status_code
+        self.status = status_code
+        self.detail = (detail or "").strip()[:1000] or None
+        message = f"Printify rejected {self.method} {self.path} with status {self.status_code}"
+        if self.detail:
+            message = f"{message}: {self.detail}"
+        super().__init__(message)
 
 
 class AmbiguousCreateError(RuntimeError):
     """The remote server may have created a product before the request timed out."""
 
 
+class _RequestPacer:
+    def __init__(self, interval: float, concurrency: int):
+        self.interval = interval
+        self._semaphore = asyncio.Semaphore(concurrency)
+        self._start_lock = asyncio.Lock()
+        self._last_started_at = 0.0
+
+    @asynccontextmanager
+    async def slot(self) -> AsyncIterator[None]:
+        async with self._semaphore:
+            async with self._start_lock:
+                loop = asyncio.get_running_loop()
+                delay = self.interval - (loop.time() - self._last_started_at)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                self._last_started_at = loop.time()
+            yield
+
+
+_CATALOG_PACERS: WeakKeyDictionary[asyncio.AbstractEventLoop, dict[float, _RequestPacer]] = (
+    WeakKeyDictionary()
+)
+
+
+def _catalog_pacer(interval: float) -> _RequestPacer:
+    loop = asyncio.get_running_loop()
+    by_interval = _CATALOG_PACERS.setdefault(loop, {})
+    return by_interval.setdefault(interval, _RequestPacer(interval, concurrency=4))
+
+
 class PrintifyClient:
-    def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        client: httpx.AsyncClient | None = None,
+        public_client: httpx.AsyncClient | None = None,
+    ):
         self.settings = settings
         self.client = client or httpx.AsyncClient(
             base_url=settings.printify_base_url.rstrip("/"),
@@ -40,34 +96,86 @@ class PrintifyClient:
             },
             timeout=httpx.Timeout(60, connect=10),
         )
+        self.public_client = public_client
+        self._request_lock = asyncio.Lock()
+        self._last_request_at = 0.0
 
     async def close(self) -> None:
         await self.client.aclose()
+        if self.public_client is not None and self.public_client is not self.client:
+            await self.public_client.aclose()
+
+    async def _paced_request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        if path.startswith("/catalog/"):
+            async with _catalog_pacer(
+                self.settings.printify_catalog_request_interval_seconds
+            ).slot():
+                return await self.client.request(method, path, **kwargs)
+        async with self._request_lock:
+            loop = asyncio.get_running_loop()
+            elapsed = loop.time() - self._last_request_at
+            delay = self.settings.printify_request_interval_seconds - elapsed
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                return await self.client.request(method, path, **kwargs)
+            finally:
+                self._last_request_at = loop.time()
+
+    @staticmethod
+    def _retry_delay(response: httpx.Response | None, attempt: int) -> float:
+        fallback = float(min(30, 2**attempt))
+        if response is None:
+            return fallback
+        value = response.headers.get("Retry-After")
+        if value is None:
+            return fallback
+        try:
+            delay = float(value)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(value)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=UTC)
+                delay = (retry_at - datetime.now(UTC)).total_seconds()
+            except TypeError, ValueError, OverflowError:
+                return fallback
+        return min(300.0, max(0.1, delay))
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         if not self.settings.printify_api_token.get_secret_value():
             raise ProviderConfigurationError("Printify API token is not configured")
-        attempts = 4 if method.upper() == "GET" else 1
+        attempts = 8 if method.upper() == "GET" else 1
         for attempt in range(attempts):
+            response: httpx.Response | None = None
             try:
-                response = await self.client.request(method, path, **kwargs)
+                response = await self._paced_request(method, path, **kwargs)
                 response.raise_for_status()
                 if response.status_code == 204 or not response.content:
                     return {}
                 return response.json()
             except (httpx.NetworkError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-                retryable_status = isinstance(exc, httpx.HTTPStatusError) and (
-                    exc.response.status_code == 429 or exc.response.status_code >= 500
-                )
-                if isinstance(exc, httpx.HTTPStatusError) and not retryable_status:
-                    raise ProviderConfigurationError(
-                        f"Printify rejected {method} {path} with status {exc.response.status_code}"
-                    ) from exc
-                if attempt + 1 >= attempts or (
-                    isinstance(exc, httpx.HTTPStatusError) and not retryable_status
-                ):
+                if isinstance(exc, httpx.HTTPStatusError):
+                    status_code = exc.response.status_code
+                    detail = exc.response.text
+                    transient_scope_error = (
+                        status_code == 403 and "Invalid scope(s) provided." in detail
+                    )
+                    retryable_status = (
+                        status_code == 429
+                        or status_code >= 500
+                        or transient_scope_error
+                    )
+                    if not retryable_status or attempt + 1 >= attempts:
+                        raise PrintifyHTTPError(
+                            method,
+                            path,
+                            status_code,
+                            detail,
+                        ) from exc
+                elif attempt + 1 >= attempts:
                     raise
-                await asyncio.sleep(min(8, 2**attempt))
+                await asyncio.sleep(self._retry_delay(response, attempt))
         raise RuntimeError("unreachable retry state")
 
     async def shops(self) -> list[dict[str, Any]]:
@@ -75,6 +183,85 @@ class PrintifyClient:
 
     async def blueprints(self) -> list[dict[str, Any]]:
         return cast(list[dict[str, Any]], await self._request("GET", "/catalog/blueprints.json"))
+
+    async def ranked_blueprints(self) -> list[dict[str, Any]]:
+        """Return Printify's public Bestsellers in their current displayed order.
+
+        This request deliberately uses a separate, unauthenticated client so the
+        private API token can never be forwarded to Printify's public catalog host.
+        """
+        if self.public_client is None:
+            self.public_client = httpx.AsyncClient(
+                base_url=self.settings.printify_dashboard_base_url.rstrip("/"),
+                headers={"User-Agent": self.settings.printify_user_agent},
+                timeout=httpx.Timeout(60, connect=10),
+            )
+
+        ranked: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        page = 1
+        total: int | None = None
+        while total is None or len(ranked) < total:
+            params: dict[str, str | list[str]] = {
+                "limit": "100",
+                "tags[]": ["Bestsellers"],
+            }
+            if page > 1:
+                params["page"] = str(page)
+            response: httpx.Response | None = None
+            for attempt in range(8):
+                try:
+                    response = await self.public_client.get(
+                        PRINTIFY_RANKED_BLUEPRINTS_PATH,
+                        params=params,
+                    )
+                    response.raise_for_status()
+                    break
+                except (httpx.NetworkError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                    if isinstance(exc, httpx.HTTPStatusError):
+                        status_code = exc.response.status_code
+                        if status_code != 429 and status_code < 500:
+                            raise PrintifyHTTPError(
+                                "GET",
+                                PRINTIFY_RANKED_BLUEPRINTS_PATH,
+                                status_code,
+                                exc.response.text,
+                            ) from exc
+                    if attempt == 7:
+                        if isinstance(exc, httpx.HTTPStatusError):
+                            raise PrintifyHTTPError(
+                                "GET",
+                                PRINTIFY_RANKED_BLUEPRINTS_PATH,
+                                exc.response.status_code,
+                                exc.response.text,
+                            ) from exc
+                        raise
+                    await asyncio.sleep(self._retry_delay(response, attempt))
+
+            if response is None:
+                raise RuntimeError("Printify ranked catalog returned no response")
+            payload = response.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+                raise ProviderConfigurationError(
+                    "Printify ranked catalog returned an invalid response"
+                )
+            if total is None:
+                raw_total = payload.get("total")
+                total = int(raw_total) if type(raw_total) is int else len(payload["data"])
+            added = 0
+            for value in payload["data"]:
+                if not isinstance(value, dict):
+                    continue
+                blueprint_id = value.get("blueprintId")
+                if type(blueprint_id) is not int or blueprint_id in seen:
+                    continue
+                seen.add(blueprint_id)
+                ranked.append(value)
+                added += 1
+            if not payload["data"] or added == 0 or len(payload["data"]) < 100:
+                break
+            page += 1
+        return ranked
 
     async def blueprint(self, blueprint_id: int) -> dict[str, Any]:
         return cast(
@@ -86,6 +273,18 @@ class PrintifyClient:
         return cast(
             list[dict[str, Any]],
             await self._request("GET", f"/catalog/blueprints/{blueprint_id}/print_providers.json"),
+        )
+
+    async def catalog_print_providers(self) -> list[dict[str, Any]]:
+        return cast(
+            list[dict[str, Any]],
+            await self._request("GET", "/catalog/print_providers.json"),
+        )
+
+    async def catalog_print_provider(self, print_provider_id: int) -> dict[str, Any]:
+        return cast(
+            dict[str, Any],
+            await self._request("GET", f"/catalog/print_providers/{print_provider_id}.json"),
         )
 
     async def variants(self, blueprint_id: int, provider_id: int) -> dict[str, Any]:
@@ -240,9 +439,7 @@ class PrintifyClient:
             "provider_id": plan.print_provider_id,
             "title": listing.title,
             "description": listing.long_description,
-            "variants": sorted(
-                (item.variant_id, item.item_price_cents) for item in prices
-            ),
+            "variants": sorted((item.variant_id, item.item_price_cents) for item in prices),
             "featured_variant_id": plan.featured_variant_id,
             "artwork": sorted(artwork_upload_ids.items()),
         }
@@ -255,6 +452,11 @@ class PrintifyClient:
         prices: list[PriceDecision],
         artwork_upload_ids: dict[str, str],
     ) -> dict[str, Any]:
+        if len(plan.variants) > PRINTIFY_MAX_ENABLED_VARIANTS:
+            raise ValueError(
+                "Printify products support at most "
+                f"{PRINTIFY_MAX_ENABLED_VARIANTS} enabled variants"
+            )
         price_by_variant = {item.variant_id: item.item_price_cents for item in prices}
         if set(price_by_variant) != {item.variant_id for item in plan.variants}:
             raise ValueError("catalog plan variants and price decisions differ")
@@ -275,22 +477,27 @@ class PrintifyClient:
             surface_by_signature = {
                 surface.signature: surface for surface in surfaces_by_group[signatures]
             }
-            print_areas.append({
-                "variant_ids": sorted(variant_ids),
-                "placeholders": [
-                    {
-                        "position": surface_by_signature[signature].position,
-                        "images": [{
-                            "id": artwork_by_signature[signature],
-                            "x": 0.5,
-                            "y": 0.5,
-                            "scale": 1.0,
-                            "angle": 0,
-                        }],
-                    }
-                    for signature in signatures
-                ],
-            })
+            print_areas.append(
+                {
+                    "variant_ids": sorted(variant_ids),
+                    "placeholders": [
+                        {
+                            "position": surface_by_signature[signature].position,
+                            "decoration_method": surface_by_signature[signature].decoration_method,
+                            "images": [
+                                {
+                                    "id": artwork_by_signature[signature],
+                                    "x": 0.5,
+                                    "y": 0.5,
+                                    "scale": 1.0,
+                                    "angle": 0,
+                                }
+                            ],
+                        }
+                        for signature in signatures
+                    ],
+                }
+            )
         return {
             "title": listing.title,
             "description": listing.long_description,
@@ -309,6 +516,81 @@ class PrintifyClient:
             "print_areas": print_areas,
         }
 
+    def catalog_product_update_payload(
+        self,
+        plan: ProductPlanV2,
+        listing: MarketplaceListing,
+        prices: list[PriceDecision],
+        artwork_upload_ids: dict[str, str],
+        remote_product: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = self.catalog_product_payload(plan, listing, prices, artwork_upload_ids)
+        selected_variants = {int(item["id"]): item for item in payload["variants"]}
+        remote_variants = {
+            int(item["id"]): item
+            for item in remote_product.get("variants", [])
+            if item.get("id") is not None
+        }
+        if not selected_variants.keys() <= remote_variants.keys():
+            raise ValueError("Printify product lacks one or more approved variants")
+        payload["variants"] = [
+            selected_variants.get(
+                variant_id,
+                {
+                    "id": variant_id,
+                    "price": int(remote.get("price") or 0),
+                    "is_enabled": False,
+                    "is_default": False,
+                },
+            )
+            for variant_id, remote in remote_variants.items()
+        ]
+        selected_ids = set(selected_variants)
+        writable_image_ids = set(artwork_upload_ids.values())
+        retained_areas = []
+        for area in remote_product.get("print_areas", []):
+            variant_ids = [
+                int(value)
+                for value in area.get("variant_ids", [])
+                if int(value) not in selected_ids
+            ]
+            if variant_ids:
+                placeholders = []
+                for placeholder in area.get("placeholders", []):
+                    images = [
+                        {
+                            key: image[key]
+                            for key in ("id", "x", "y", "scale", "angle", "pattern")
+                            if key in image
+                        }
+                        for image in placeholder.get("images", [])
+                        if str(image.get("id") or "") in writable_image_ids
+                    ]
+                    if not images:
+                        continue
+                    writable_placeholder = {
+                        "position": placeholder["position"],
+                        "images": images,
+                    }
+                    if placeholder.get("decoration_method"):
+                        writable_placeholder["decoration_method"] = placeholder["decoration_method"]
+                    placeholders.append(writable_placeholder)
+                if not placeholders:
+                    raise ValueError("Printify retained variant has no reusable uploaded artwork")
+                retained_areas.append(
+                    {
+                        "variant_ids": variant_ids,
+                        "placeholders": placeholders,
+                    }
+                )
+        payload["print_areas"] = [*payload["print_areas"], *retained_areas]
+        covered_ids = {
+            int(value) for area in payload["print_areas"] for value in area.get("variant_ids", [])
+        }
+        if covered_ids != set(remote_variants):
+            raise ValueError("Printify update print areas do not cover every remote variant")
+        return payload
+
     async def create_product(self, shop_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         if self.settings.publish_mode == "dry_run":
             digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
@@ -320,6 +602,10 @@ class PrintifyClient:
             )
         except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as exc:
             raise AmbiguousCreateError("Printify product creation outcome is unknown") from exc
+        except PrintifyHTTPError as exc:
+            if exc.status_code >= 500:
+                raise AmbiguousCreateError("Printify product creation outcome is unknown") from exc
+            raise
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code >= 500:
                 raise AmbiguousCreateError("Printify product creation outcome is unknown") from exc
@@ -330,17 +616,33 @@ class PrintifyClient:
     ) -> list[dict[str, Any]]:
         if self.settings.publish_mode == "dry_run":
             return []
-        page = await self._request("GET", f"/shops/{shop_id}/products.json?limit=100")
-        matches = []
-        for product in page.get("data", []):
-            image_ids = {
-                image.get("id")
-                for area in product.get("print_areas", [])
-                for placeholder in area.get("placeholders", [])
-                for image in placeholder.get("images", [])
-            }
-            if product.get("title") == listing_title and artwork_upload_id in image_ids:
-                matches.append(product)
+        matches: list[dict[str, Any]] = []
+        matched_ids: set[str] = set()
+        page_number = 1
+        while True:
+            page = await self._request("GET", f"/shops/{shop_id}/products.json?page={page_number}")
+            for product in page.get("data", []):
+                image_ids = {
+                    image.get("id")
+                    for area in product.get("print_areas", [])
+                    for placeholder in area.get("placeholders", [])
+                    for image in placeholder.get("images", [])
+                }
+                product_id = str(product.get("id") or "")
+                if (
+                    product.get("title") == listing_title
+                    and artwork_upload_id in image_ids
+                    and product_id not in matched_ids
+                ):
+                    matches.append(product)
+                    matched_ids.add(product_id)
+            current_page = int(page.get("current_page") or page_number)
+            last_page = int(page.get("last_page") or current_page)
+            if last_page < current_page or last_page > 1000:
+                raise RuntimeError("Printify product pagination is invalid")
+            if current_page >= last_page:
+                break
+            page_number = current_page + 1
         return matches
 
     async def publish(self, shop_id: str, product_id: str) -> dict[str, Any]:
@@ -390,6 +692,24 @@ class PrintifyClient:
                 "PUT",
                 f"/shops/{shop_id}/products/{product_id}.json",
                 json={"title": title, "description": description, "tags": tags},
+            ),
+        )
+
+    async def update_catalog_product(
+        self, shop_id: str, product_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Idempotently replace mutable catalog product fields."""
+        mutable = {
+            key: payload[key]
+            for key in ("title", "description", "tags", "variants", "print_areas")
+            if key in payload
+        }
+        return cast(
+            dict[str, Any],
+            await self._request(
+                "PUT",
+                f"/shops/{shop_id}/products/{product_id}.json",
+                json=mutable,
             ),
         )
 

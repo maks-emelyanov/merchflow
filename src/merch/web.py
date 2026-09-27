@@ -80,6 +80,7 @@ from merch.security import (
     safe_json,
 )
 from merch.services.analytics import parse_etsy_stats_csv
+from merch.services.catalog import get_catalog_refresh, list_catalog_refreshes
 from merch.services.credentials import CredentialCipher, CredentialStore
 from merch.services.openai_costs import summarize_costs
 from merch.services.storage import ArtifactStorage
@@ -89,6 +90,7 @@ from merch.temporal import (
     MerchWorkflow,
     RetryPublishWorkflow,
     retry_failed_artwork_run,
+    start_catalog_refresh,
     start_manual_run,
     temporal_client,
 )
@@ -113,14 +115,12 @@ def configure_logging() -> None:
 
 
 def _run_payload(record: RunRecord) -> dict[str, Any]:
-    production = [
-        item for item in record.artifacts
-        if item.kind == f"production-v{record.version}"
-    ]
+    production = [item for item in record.artifacts if item.kind == f"production-v{record.version}"]
     latest_production = max(production, key=lambda item: item.revision) if production else None
     featured_color_selection = (
         latest_production.metadata_json.get("featured_color_selection")
-        if latest_production else None
+        if latest_production
+        else None
     )
     payload = {
         "id": record.id,
@@ -135,12 +135,10 @@ def _run_payload(record: RunRecord) -> dict[str, Any]:
         "selected_concept": record.selected_concept,
         "creative_brief": record.creative_brief,
         "typography_spec": (
-            latest_production.metadata_json.get("typography_spec")
-            if latest_production else None
+            latest_production.metadata_json.get("typography_spec") if latest_production else None
         ),
         "artwork_effects": (
-            latest_production.metadata_json.get("artwork_effects")
-            if latest_production else None
+            latest_production.metadata_json.get("artwork_effects") if latest_production else None
         ),
         "ip_report": record.ip_report,
         "qa_report": record.qa_report,
@@ -158,8 +156,16 @@ def _run_payload(record: RunRecord) -> dict[str, Any]:
         "price_decisions": record.price_decisions,
         "featured_color_selection": featured_color_selection,
         "replacement_shirt_colors": sorted(
-            {item["color"] for item in (record.publication_template_snapshot or {}).get("variants", []) if item.get("enabled", True)}
-            - {item["color"] for item in (record.template_snapshot or {}).get("variants", []) if item.get("enabled", True)}
+            {
+                item["color"]
+                for item in (record.publication_template_snapshot or {}).get("variants", [])
+                if item.get("enabled", True)
+            }
+            - {
+                item["color"]
+                for item in (record.template_snapshot or {}).get("variants", [])
+                if item.get("enabled", True)
+            }
         ),
         "provider_calls": record.provider_calls,
         "openai_cost": summarize_costs(record.provider_calls or []),
@@ -173,9 +179,9 @@ def _run_payload(record: RunRecord) -> dict[str, Any]:
                 "weighted_score": item.weighted_score,
                 "selected": item.selected,
                 "data": item.data,
-                "score_breakdown": (record.selection or {}).get("score_breakdowns", {}).get(
-                    item.data.get("concept_name", "")
-                ),
+                "score_breakdown": (record.selection or {})
+                .get("score_breakdowns", {})
+                .get(item.data.get("concept_name", "")),
             }
             for item in record.concepts
         ],
@@ -231,29 +237,44 @@ def _run_payload(record: RunRecord) -> dict[str, Any]:
     return cast(dict[str, Any], jsonable_encoder(payload))
 
 
-def _run_page_payload(record: RunRecord, ip_check_enabled: bool) -> dict[str, Any]:
+def _run_page_payload(
+    record: RunRecord,
+    ip_check_enabled: bool,
+    originality_check_enabled: bool,
+) -> dict[str, Any]:
     payload = _run_payload(record)
-    if ip_check_enabled or record.pipeline_version == 2:
-        return payload
-    payload.pop("ip_report", None)
+    hidden_stages: set[str] = set()
+    if not ip_check_enabled:
+        payload.pop("ip_report", None)
+        hidden_stages.update({"ip_screen", "catalog_ip_screen"})
+        for approval in payload["approvals"]:
+            approval.pop("ip_attested", None)
+        if payload["research_report"]:
+            for candidate in payload["research_report"]["candidates"]:
+                candidate.get("scores", {}).pop("ip_risk", None)
+        if payload["selected_concept"]:
+            payload["selected_concept"].get("scores", {}).pop("ip_risk", None)
+        for concept in payload["concepts"]:
+            concept["data"].get("scores", {}).pop("ip_risk", None)
+            if concept.get("score_breakdown"):
+                concept["score_breakdown"].pop("ip_penalty", None)
+        for breakdown in (payload.get("selection") or {}).get("score_breakdowns", {}).values():
+            breakdown.pop("ip_penalty", None)
+    if not originality_check_enabled:
+        payload.pop("originality_report", None)
+        hidden_stages.update(
+            {
+                "surface_originality",
+                "representative_mockup_originality",
+                "final_printify_mockup_originality",
+            }
+        )
     payload["provider_calls"] = [
-        call for call in payload["provider_calls"] if call.get("stage") != "ip_screen"
+        call for call in payload["provider_calls"] if call.get("stage") not in hidden_stages
     ]
-    for call in payload["provider_calls"]:
-        call.pop("prompt", None)
-    for approval in payload["approvals"]:
-        approval.pop("ip_attested", None)
-    if payload["research_report"]:
-        for candidate in payload["research_report"]["candidates"]:
-            candidate.get("scores", {}).pop("ip_risk", None)
-    if payload["selected_concept"]:
-        payload["selected_concept"].get("scores", {}).pop("ip_risk", None)
-    for concept in payload["concepts"]:
-        concept["data"].get("scores", {}).pop("ip_risk", None)
-        if concept.get("score_breakdown"):
-            concept["score_breakdown"].pop("ip_penalty", None)
-    for breakdown in (payload.get("selection") or {}).get("score_breakdowns", {}).values():
-        breakdown.pop("ip_penalty", None)
+    if not ip_check_enabled:
+        for call in payload["provider_calls"]:
+            call.pop("prompt", None)
     return payload
 
 
@@ -432,8 +453,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             name="run.html",
             context={
                 "run": run,
-                "payload": _run_page_payload(run, settings.ip_check_enabled),
+                "payload": _run_page_payload(
+                    run,
+                    settings.ip_check_enabled,
+                    settings.originality_check_enabled,
+                ),
                 "ip_check_enabled": settings.ip_check_enabled,
+                "originality_check_enabled": settings.originality_check_enabled,
                 "manual_review_required": (
                     settings.manual_approval_enabled
                     or settings.ip_check_enabled
@@ -444,7 +470,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "featured_variant": product_template.featured_variant().title,
                 "mockup_evidence": {
                     item.channel: list(_mockup_evidence(item.response_data).values())
-                    for item in run.publishes if item.channel == Channel.ETSY.value
+                    for item in run.publishes
+                    if item.channel == Channel.ETSY.value
                 },
                 "artwork_replacement_reconciliation_required": any(
                     item.channel == Channel.ETSY.value
@@ -488,7 +515,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if request.session.get("actor") != "admin":
             return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
         return templates.TemplateResponse(
-            request=request, name="copy_refresh.html",
+            request=request,
+            name="copy_refresh.html",
             context={"batch": latest_copy_refresh_batch(), "csrf_token": csrf_token(request)},
         )
 
@@ -512,8 +540,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         client = await temporal_client(settings)
         workflow_id = f"copy-refresh-prepare-{uuid4()}"
         await client.start_workflow(
-            CopyRefreshPrepareWorkflow.run, workflow_id,
-            id=workflow_id, task_queue=settings.temporal_task_queue,
+            CopyRefreshPrepareWorkflow.run,
+            workflow_id,
+            id=workflow_id,
+            task_queue=settings.temporal_task_queue,
         )
         return {"status": "preparing", "workflow_id": workflow_id}
 
@@ -545,8 +575,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         client = await temporal_client(settings)
         workflow_id = f"copy-refresh-apply-{batch_id}-{uuid4()}"
         await client.start_workflow(
-            CopyRefreshApplyWorkflow.run, batch_id,
-            id=workflow_id, task_queue=settings.temporal_task_queue,
+            CopyRefreshApplyWorkflow.run,
+            batch_id,
+            id=workflow_id,
+            task_queue=settings.temporal_task_queue,
         )
         return {"status": "applying", "workflow_id": workflow_id}
 
@@ -563,8 +595,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         client = await temporal_client(settings)
         workflow_id = f"copy-refresh-apply-{batch_id}-{uuid4()}"
         await client.start_workflow(
-            CopyRefreshApplyWorkflow.run, batch_id,
-            id=workflow_id, task_queue=settings.temporal_task_queue,
+            CopyRefreshApplyWorkflow.run,
+            batch_id,
+            id=workflow_id,
+            task_queue=settings.temporal_task_queue,
         )
         return {"status": "applying", "workflow_id": workflow_id}
 
@@ -597,16 +631,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         from merch.repository import CatalogRepository
 
         with session_scope() as session:
-            products = CatalogRepository(session).list_products()
+            products = CatalogRepository(session).list_effective_products()
         return [item.model_dump(mode="json") for item in products]
 
-    @app.post("/api/catalog/sync")
+    @app.post("/api/catalog/sync", status_code=status.HTTP_202_ACCEPTED)
     async def catalog_sync(request: Request) -> dict[str, Any]:
         require_admin(request)
         await require_csrf(request)
-        from merch.services.catalog import sync_catalog
+        result = await start_catalog_refresh(settings, wait=False)
+        result.pop("owner", None)
+        return result
 
-        return await sync_catalog(settings)
+    @app.get("/api/catalog/syncs")
+    async def catalog_syncs(request: Request, limit: int = 20) -> list[dict[str, Any]]:
+        require_admin(request)
+        if not 1 <= limit <= 100:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "limit is invalid")
+        return list_catalog_refreshes(limit)
+
+    @app.get("/api/catalog/syncs/{sync_id}")
+    async def catalog_sync_status(request: Request, sync_id: str) -> dict[str, Any]:
+        require_admin(request)
+        try:
+            return get_catalog_refresh(sync_id)
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
 
     @app.get("/api/research/sources/health")
     async def research_source_health(request: Request) -> dict[str, dict[str, Any]]:
@@ -651,7 +700,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/runs/{run_id}/mockup-evidence/{side}")
     async def mockup_evidence_image(
-        request: Request, run_id: str, side: str, db: DatabaseSession, color: str = "",
+        request: Request,
+        run_id: str,
+        side: str,
+        db: DatabaseSession,
+        color: str = "",
     ) -> Response:
         require_admin(request)
         if side not in {"source", "actual"}:
@@ -670,9 +723,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         digest = hashlib.sha256(data).hexdigest()
         if digest != entry.get(f"{side}_sha256"):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Mockup evidence not found")
-        return Response(data, media_type=content_type, headers={
-            "ETag": f'"{digest}"', "Cache-Control": "private, no-store",
-        })
+        return Response(
+            data,
+            media_type=content_type,
+            headers={
+                "ETag": f'"{digest}"',
+                "Cache-Control": "private, no-store",
+            },
+        )
 
     @app.put("/api/runs/{run_id}/package")
     async def edit_package(
@@ -692,7 +750,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 else ConfigurationRepository(db).get_template()
             )
             template = publication_template(
-                template, run_record.excluded_shirt_colors or [],
+                template,
+                run_record.excluded_shirt_colors or [],
                 run_record.publication_template_snapshot,
             )
             configured = {
@@ -809,7 +868,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "reconcile-published-artwork command",
                 )
             if (
-                run.status not in {
+                run.status
+                not in {
                     RunStatus.PARTIALLY_PUBLISHED.value,
                     RunStatus.FAILED.value,
                     RunStatus.VERIFICATION_REQUIRED.value,

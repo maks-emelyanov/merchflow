@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
@@ -16,15 +17,18 @@ from sqlalchemy import select
 from merch.config import Settings, get_settings
 from merch.database import session_scope
 from merch.domain.etsy_inventory import verify_generic_etsy_inventory
+from merch.domain.ip_screening import ip_report_eligible
 from merch.domain.originality import (
     evaluate_originality,
     make_contact_sheet,
     perceptual_hash_distance,
 )
 from merch.models import RunRecord
-from merch.repository import CatalogRepository, ConfigurationRepository, RunRepository
+from merch.repository import ConfigurationRepository, RunRepository
 from merch.schemas import (
+    CatalogProduct,
     Channel,
+    IPScreeningReport,
     MarketplaceListing,
     OriginalityReport,
     PriceDecision,
@@ -35,12 +39,14 @@ from merch.schemas import (
     SEOEvidence,
 )
 from merch.services.browser_session import collect_printify_costs
+from merch.services.catalog import CatalogProductUnavailable, refresh_catalog_product
 from merch.services.etsy_auth import etsy_access_token
 from merch.services.etsy_catalog_publisher import publish_direct_catalog_etsy
 from merch.services.openai_service import OpenAIService
 from merch.services.printify import (
     AmbiguousCreateError,
     PrintifyClient,
+    PrintifyHTTPError,
     channel_shop,
 )
 from merch.services.storage import ArtifactStorage
@@ -58,8 +64,6 @@ def _package_digest(record: RunRecord) -> str:
             record.selected_opportunity,
             record.product_plan,
             record.reference_analysis,
-            record.ip_report,
-            record.originality_report,
             record.seo_evidence,
             record.price_decisions,
             record.listings,
@@ -101,6 +105,31 @@ def _verify_printify_catalog_product(
     defaults = {key for key, item in enabled.items() if item.get("is_default")}
     if defaults != {plan.featured_variant_id}:
         raise StorefrontVerificationError("Printify catalog default variant changed")
+
+
+def _catalog_plan_drift(product: CatalogProduct, plan: ProductPlanV2) -> str | None:
+    current = {item.variant_id: item for item in product.variants}
+    for planned in plan.variants:
+        remote = current.get(planned.variant_id)
+        if remote is None or not remote.available:
+            return f"Printify variant {planned.variant_id} is no longer available"
+        if remote.options != planned.options:
+            return f"Printify variant {planned.variant_id} options changed"
+        current_surfaces = {item.signature for item in remote.surfaces if item.required}
+        planned_surfaces = {item.signature for item in planned.surfaces if item.required}
+        if not planned_surfaces.issubset(current_surfaces):
+            return f"Printify variant {planned.variant_id} print surfaces changed"
+        if remote.shipping_cost_cents != planned.shipping_cost_cents:
+            return f"Printify variant {planned.variant_id} shipping cost changed"
+    return None
+
+
+def _reject_catalog_drift(run_id: str, opportunity_id: str, reason: str) -> str:
+    with session_scope() as session:
+        repository = RunRepository(session)
+        repository.reject_opportunity(run_id, opportunity_id, reason)
+        repository.status(run_id, RunStatus.RANKING, reason)
+    return "hard_gate_failed"
 
 
 async def _etsy_image(url: str, http: httpx.AsyncClient) -> bytes:
@@ -160,6 +189,15 @@ async def _verify_served_image(
     }
 
 
+def _clear_catalog_create_intent(run_id: str) -> None:
+    with session_scope() as session:
+        session.scalar(select(RunRecord.id).where(RunRecord.id == run_id).with_for_update())
+        publish = RunRepository(session).publish_record(run_id, Channel.ETSY.value, "pending")
+        progress = dict(publish.response_data or {})
+        progress.pop("product_create_started", None)
+        publish.response_data = progress
+
+
 async def publish_catalog_run(run_id: str, settings: Settings | None = None) -> str:
     settings = settings or get_settings()
     storage = ArtifactStorage(settings)
@@ -184,9 +222,18 @@ async def publish_catalog_run(run_id: str, settings: Settings | None = None) -> 
             raise ValueError("catalog package digest changed after system approval")
         if not all((run.qa_report or {}).get("gates", {}).values()):
             raise ValueError("one or more catalog publication gates did not pass")
-        originality = OriginalityReport.model_validate(run.originality_report)
-        if not originality.passed or originality.copying_risk > 20:
-            raise ValueError("originality package is not eligible for publication")
+        if settings.ip_check_enabled:
+            ip_report = IPScreeningReport.model_validate(run.ip_report)
+            if not ip_report_eligible(ip_report, settings.ip_risk_threshold):
+                raise ValueError("IP package is not eligible for publication")
+        if settings.originality_check_enabled:
+            originality = OriginalityReport.model_validate(run.originality_report)
+            if (
+                not originality.passed
+                or originality.originality_score < settings.originality_min_score
+                or originality.copying_risk > settings.originality_max_copying_risk
+            ):
+                raise ValueError("originality package is not eligible for publication")
         opportunity = ProductOpportunity.model_validate(run.selected_opportunity)
         plan = ProductPlanV2.model_validate(run.product_plan)
         prices = [PriceDecision.model_validate(item) for item in run.price_decisions or []]
@@ -195,7 +242,6 @@ async def publish_catalog_run(run_id: str, settings: Settings | None = None) -> 
         listing = MarketplaceListing.model_validate(listings["listings"][0])
         SEOEvidence.model_validate(run.seo_evidence)
         template = ConfigurationRepository(session).get_template()
-        product = CatalogRepository(session).get(plan.blueprint_id, plan.print_provider_id)
         artifacts = {
             item.id: item
             for item in run.artifacts
@@ -223,24 +269,24 @@ async def publish_catalog_run(run_id: str, settings: Settings | None = None) -> 
     if set(artifacts) != {item.artifact_id for item in plan.surface_artworks}:
         raise ValueError("approved surface artwork is missing")
 
+    try:
+        product = await refresh_catalog_product(plan.blueprint_id, plan.print_provider_id, settings)
+    except CatalogProductUnavailable as exc:
+        return _reject_catalog_drift(run_id, opportunity.opportunity_id, str(exc))
+    drift = _catalog_plan_drift(product, plan)
+    if drift is not None:
+        return _reject_catalog_drift(run_id, opportunity.opportunity_id, drift)
+
     # This is intentionally recollected at the publication boundary. Search or API
     # estimates never substitute for the authenticated account dashboard.
     current_costs = await collect_printify_costs(product, settings)
     approved_costs = {item.variant_id: item.production_cost_cents for item in prices}
     if any(current_costs.get(key) != value for key, value in approved_costs.items()):
-        with session_scope() as session:
-            repository = RunRepository(session)
-            repository.reject_opportunity(
-                run_id,
-                opportunity.opportunity_id,
-                "Printify costs changed at the prepublication refresh",
-            )
-            repository.status(
-                run_id,
-                RunStatus.RANKING,
-                "Printify costs changed at the prepublication refresh",
-            )
-        return "hard_gate_failed"
+        return _reject_catalog_drift(
+            run_id,
+            opportunity.opportunity_id,
+            "Printify costs changed at the prepublication refresh",
+        )
 
     printify = PrintifyClient(settings)
     try:
@@ -277,6 +323,29 @@ async def publish_catalog_run(run_id: str, settings: Settings | None = None) -> 
         product_result: dict[str, Any]
         if existing_product_id:
             product_result = {"id": existing_product_id}
+            if progress.get("product_payload_fingerprint") != fingerprint:
+                remote_product = await printify.product(shop_id, existing_product_id)
+                payload = printify.catalog_product_update_payload(
+                    plan,
+                    listing,
+                    prices,
+                    upload_ids,
+                    remote_product,
+                )
+                await printify.update_catalog_product(
+                    shop_id,
+                    existing_product_id,
+                    payload,
+                )
+                with session_scope() as session:
+                    publish = RunRepository(session).publish_record(
+                        run_id, Channel.ETSY.value, fingerprint
+                    )
+                    progress = {
+                        **dict(publish.response_data or {}),
+                        "product_payload_fingerprint": fingerprint,
+                    }
+                    publish.response_data = progress
         elif progress.get("product_create_started"):
             matches = await printify.reconcile_product(
                 shop_id, next(iter(upload_ids.values())), listing.title
@@ -300,6 +369,9 @@ async def publish_catalog_run(run_id: str, settings: Settings | None = None) -> 
             payload = printify.catalog_product_payload(plan, listing, prices, upload_ids)
             try:
                 product_result = await printify.create_product(shop_id, payload)
+            except PrintifyHTTPError:
+                _clear_catalog_create_intent(run_id)
+                raise
             except AmbiguousCreateError:
                 matches = await printify.reconcile_product(
                     shop_id, next(iter(upload_ids.values())), listing.title
@@ -318,7 +390,11 @@ async def publish_catalog_run(run_id: str, settings: Settings | None = None) -> 
             publish = RunRepository(session).publish_record(run_id, Channel.ETSY.value, fingerprint)
             publish.printify_product_id = str(product_result["id"])
             publish.status = PublishStatus.PUBLISHING.value
-            progress = {**dict(publish.response_data or {}), "product": product_result}
+            progress = {
+                **dict(publish.response_data or {}),
+                "product": product_result,
+                "product_payload_fingerprint": fingerprint,
+            }
             publish.response_data = progress
 
         if settings.publish_mode == "dry_run":
@@ -369,50 +445,55 @@ async def publish_catalog_run(run_id: str, settings: Settings | None = None) -> 
             _verify_printify_catalog_product(draft_product, plan, prices)
             token = await etsy_access_token(settings)
             etsy = EtsyStorefrontClient(settings, access_token=token)
-            reference_images = [
-                (
-                    str(item.metadata_json["reference_listing_id"]),
-                    storage.get(item.object_key),
-                )
-                for item in reference_artifacts[:3]
-            ]
-            if len(reference_images) != 3:
-                raise StorefrontVerificationError(
-                    "final mockup originality requires three immutable references"
-                )
-            title_by_id = {
-                item.external_listing_id: item.title for item in opportunity.comparable_listings
-            }
-            ai = OpenAIService(settings)
-
-            async def final_mockup_gate(mockup: bytes) -> dict[str, Any]:
-                comparison = make_contact_sheet(
-                    [("FINAL PRINTIFY MOCKUP", mockup), *reference_images]
-                )
-                vision = await ai.originality_assessment(
-                    comparison, [item[0] for item in reference_images]
-                )
-                with session_scope() as session:
-                    RunRepository(session).provider_call(
-                        run_id, "final_printify_mockup_originality", vision.metadata
+            final_mockup_gate: Callable[[bytes], Awaitable[dict[str, Any]]] | None = None
+            if settings.originality_check_enabled:
+                reference_images = [
+                    (
+                        str(item.metadata_json["reference_listing_id"]),
+                        storage.get(item.object_key),
                     )
-                report = evaluate_originality(
-                    generated_image=mockup,
-                    generated_wording="",
-                    references=[
-                        (reference_id, image, title_by_id.get(reference_id, ""))
-                        for reference_id, image in reference_images
-                    ],
-                    vision=vision.value,
-                    perceptual_block_distance=settings.perceptual_hash_block_distance,
-                    minimum_originality_score=settings.originality_min_score,
-                    maximum_copying_risk=settings.originality_max_copying_risk,
-                )
-                if not report.passed:
+                    for item in reference_artifacts[:3]
+                ]
+                if len(reference_images) != 3:
                     raise StorefrontVerificationError(
-                        "final Printify mockup failed originality comparison"
+                        "final mockup originality requires three immutable references"
                     )
-                return report.model_dump(mode="json")
+                title_by_id = {
+                    item.external_listing_id: item.title
+                    for item in opportunity.comparable_listings
+                }
+                ai = OpenAIService(settings)
+
+                async def check_final_mockup(mockup: bytes) -> dict[str, Any]:
+                    comparison = make_contact_sheet(
+                        [("FINAL PRINTIFY MOCKUP", mockup), *reference_images]
+                    )
+                    vision = await ai.originality_assessment(
+                        comparison, [item[0] for item in reference_images]
+                    )
+                    with session_scope() as session:
+                        RunRepository(session).provider_call(
+                            run_id, "final_printify_mockup_originality", vision.metadata
+                        )
+                    report = evaluate_originality(
+                        generated_image=mockup,
+                        generated_wording="",
+                        references=[
+                            (reference_id, image, title_by_id.get(reference_id, ""))
+                            for reference_id, image in reference_images
+                        ],
+                        vision=vision.value,
+                        perceptual_block_distance=settings.perceptual_hash_block_distance,
+                        minimum_originality_score=settings.originality_min_score,
+                        maximum_copying_risk=settings.originality_max_copying_risk,
+                    )
+                    if not report.passed:
+                        raise StorefrontVerificationError(
+                            "final Printify mockup failed originality comparison"
+                        )
+                    return report.model_dump(mode="json")
+
+                final_mockup_gate = check_final_mockup
 
             async def draft_gallery_gate(
                 gallery: list[dict[str, Any]], etsy_images: list[dict[str, Any]]

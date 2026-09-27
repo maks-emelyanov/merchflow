@@ -118,7 +118,12 @@ def build_seo_evidence(opportunity: ProductOpportunity) -> SEOEvidence:
     )
 
 
-def validate_seo_listing(listing: MarketplaceListing, evidence: SEOEvidence) -> None:
+def validate_seo_listing(
+    listing: MarketplaceListing,
+    evidence: SEOEvidence,
+    *,
+    check_competitor_terms: bool = True,
+) -> None:
     if listing.channel.value != "etsy":
         raise ValueError("catalog listing must target Etsy")
     if not 1 <= len(listing.title) <= 140:
@@ -137,9 +142,10 @@ def validate_seo_listing(listing: MarketplaceListing, evidence: SEOEvidence) -> 
             *listing.tags,
         ]
     ).casefold()
-    for term in evidence.prohibited_terms:
-        if term and re.search(rf"\b{re.escape(term)}\b", searchable):
-            raise ValueError(f"listing contains prohibited competitor term: {term}")
+    if check_competitor_terms:
+        for term in evidence.prohibited_terms:
+            if term and re.search(rf"\b{re.escape(term)}\b", searchable):
+                raise ValueError(f"listing contains prohibited competitor term: {term}")
     normalized = " ".join(_words(searchable))
     unsupported = next((claim for claim in _UNSUPPORTED_CLAIMS if claim in normalized), None)
     if unsupported:

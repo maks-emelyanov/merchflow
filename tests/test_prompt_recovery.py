@@ -119,8 +119,13 @@ async def test_visual_qa_receives_full_deterministic_report_with_color_profile()
     report, _ = json.JSONDecoder().raw_decode(prompt.split("Deterministic QA report: ", 1)[1])
     assert report == deterministic.model_dump(mode="json")
     assert json.dumps(effects) in prompt
+    assert "protected content" not in prompt
     assert result.value == deterministic
     assert captured["input"][0]["content"][1]["detail"] == service.settings.openai_visual_qa_detail
+
+    service.settings = service.settings.model_copy(update={"ip_check_enabled": True})
+    await service.visual_qa(b"fixture-image", brief, deterministic, effects=effects)
+    assert "protected content" in captured["input"][0]["content"][0]["text"]
 
 
 @pytest.mark.asyncio

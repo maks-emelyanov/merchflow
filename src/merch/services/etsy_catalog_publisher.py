@@ -79,6 +79,29 @@ def _gallery_sources(product: dict[str, Any], plan: ProductPlanV2) -> list[dict[
     return list(unique.values())[:20]
 
 
+def _variation_value_images(
+    gallery: list[dict[str, Any]],
+    image_ids: list[int],
+    variants: dict[int, Any],
+    axis: str,
+) -> dict[str, int]:
+    values = sorted({variant.options[axis] for variant in variants.values()})
+    mapped: dict[str, int] = {}
+    for index, value in enumerate(values):
+        compatible = [
+            image_id
+            for mockup, image_id in zip(gallery, image_ids, strict=True)
+            if any(
+                (variant := variants.get(int(raw_variant_id))) is not None
+                and variant.options.get(axis) == value
+                for raw_variant_id in mockup.get("variant_ids", [])
+            )
+        ]
+        if compatible:
+            mapped[value] = compatible[index % len(compatible)]
+    return mapped
+
+
 async def publish_direct_catalog_etsy(
     *,
     etsy: EtsyStorefrontClient,
@@ -249,13 +272,7 @@ async def publish_direct_catalog_etsy(
                 ):
                     value_ids[str(values[0])] = int(ids[0])
         variants = {item.variant_id: item for item in plan.variants}
-        value_images: dict[str, int] = {}
-        for mockup, image_id in zip(gallery, image_ids, strict=True):
-            for raw_variant_id in mockup.get("variant_ids", []):
-                variant = variants.get(int(raw_variant_id))
-                if variant is not None and axis in variant.options:
-                    value_images.setdefault(variant.options[axis], image_id)
-                    break
+        value_images = _variation_value_images(gallery, image_ids, variants, axis)
         expected_values = {item.options[axis] for item in plan.variants}
         if set(value_ids) != expected_values or set(value_images) != expected_values:
             raise StorefrontVerificationError(

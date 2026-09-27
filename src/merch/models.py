@@ -192,7 +192,9 @@ class CopyRefreshBatchRecord(Base):
     approved_by: Mapped[str | None] = mapped_column(String(128))
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
     items: Mapped[list[CopyRefreshItemRecord]] = relationship(
         back_populates="batch", cascade="all, delete-orphan"
     )
@@ -200,11 +202,17 @@ class CopyRefreshBatchRecord(Base):
 
 class CopyRefreshItemRecord(Base):
     __tablename__ = "copy_refresh_items"
-    __table_args__ = (UniqueConstraint("batch_id", "run_id", "channel", name="uq_copy_batch_run_channel"),)
+    __table_args__ = (
+        UniqueConstraint("batch_id", "run_id", "channel", name="uq_copy_batch_run_channel"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
-    batch_id: Mapped[str] = mapped_column(ForeignKey("copy_refresh_batches.id", ondelete="CASCADE"), index=True)
-    run_id: Mapped[str] = mapped_column(ForeignKey("workflow_runs.id", ondelete="CASCADE"), index=True)
+    batch_id: Mapped[str] = mapped_column(
+        ForeignKey("copy_refresh_batches.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_runs.id", ondelete="CASCADE"), index=True
+    )
     channel: Mapped[str] = mapped_column(String(32))
     printify_product_id: Mapped[str] = mapped_column(String(128))
     marketplace_listing_id: Mapped[str] = mapped_column(String(128))
@@ -217,7 +225,9 @@ class CopyRefreshItemRecord(Base):
     stage: Mapped[str | None] = mapped_column(String(64))
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
     batch: Mapped[CopyRefreshBatchRecord] = relationship(back_populates="items")
 
 
@@ -278,6 +288,31 @@ class BrowserSessionRecord(Base):
     )
 
 
+class CatalogRefreshRecord(Base):
+    __tablename__ = "catalog_refreshes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    workflow_id: Mapped[str] = mapped_column(String(128), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    active_lease: Mapped[str | None] = mapped_column(String(32), unique=True)
+    manifest: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    cursor: Mapped[int] = mapped_column(Integer, default=0)
+    blueprint_count: Mapped[int] = mapped_column(Integer, default=0)
+    provider_count: Mapped[int] = mapped_column(Integer, default=0)
+    total_pairs: Mapped[int] = mapped_column(Integer, default=0)
+    refreshed_products: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_products: Mapped[int] = mapped_column(Integer, default=0)
+    retired_products: Mapped[int] = mapped_column(Integer, default=0)
+    warning_count: Mapped[int] = mapped_column(Integer, default=0)
+    warning_samples: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class CatalogProductRecord(Base):
     __tablename__ = "catalog_products"
 
@@ -288,15 +323,34 @@ class CatalogProductRecord(Base):
     data: Mapped[dict[str, Any]] = mapped_column(JSON)
     source_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    printify_rank: Mapped[int | None] = mapped_column(Integer, index=True)
+    last_seen_refresh_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    refresh_error: Mapped[str | None] = mapped_column(Text)
     variants: Mapped[list[CatalogVariantRecord]] = relationship(
         back_populates="product", cascade="all, delete-orphan"
     )
 
     __table_args__ = (
-        UniqueConstraint(
-            "blueprint_id", "print_provider_id", name="uq_catalog_blueprint_provider"
-        ),
+        UniqueConstraint("blueprint_id", "print_provider_id", name="uq_catalog_blueprint_provider"),
     )
+
+
+class CatalogCurationRecord(Base):
+    __tablename__ = "catalog_curations"
+
+    category: Mapped[str] = mapped_column(String(64), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(128))
+    product_key: Mapped[str] = mapped_column(
+        ForeignKey("catalog_products.key", ondelete="CASCADE"), unique=True, index=True
+    )
+    quality_score: Mapped[int] = mapped_column(Integer)
+    reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
+    research_priority: Mapped[int | None] = mapped_column(Integer, index=True)
+    popularity_reason: Mapped[str | None] = mapped_column(Text)
+    algorithm_version: Mapped[str] = mapped_column(String(32))
+    curated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class CatalogVariantRecord(Base):

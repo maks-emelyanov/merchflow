@@ -86,6 +86,63 @@ class OpenAINonRetryableError(RuntimeError):
     """An OpenAI billing, credential, or request error that a retry cannot fix."""
 
 
+IMAGE_API_MIN_PIXELS = 655_360
+IMAGE_API_MAX_PIXELS = 8_294_400
+IMAGE_API_MAX_EDGE = 3_840
+IMAGE_API_SIZE_STEP = 16
+
+
+def _catalog_generation_size(width: int, height: int) -> tuple[int, int]:
+    """Choose the largest valid Image API size nearest the print-surface aspect ratio."""
+    if width <= 0 or height <= 0:
+        raise ValueError("catalog artwork dimensions must be positive")
+    target_ratio = width / height
+    if not 1 / 3 <= target_ratio <= 3:
+        raise ValueError("catalog artwork aspect ratio exceeds the Image API limit")
+    best: tuple[float, int, int, int] | None = None
+    for candidate_width in range(
+        IMAGE_API_SIZE_STEP,
+        IMAGE_API_MAX_EDGE + 1,
+        IMAGE_API_SIZE_STEP,
+    ):
+        ideal_height = candidate_width / target_ratio
+        rounded_height = round(ideal_height / IMAGE_API_SIZE_STEP) * IMAGE_API_SIZE_STEP
+        for candidate_height in {
+            rounded_height - IMAGE_API_SIZE_STEP,
+            rounded_height,
+            rounded_height + IMAGE_API_SIZE_STEP,
+        }:
+            if not IMAGE_API_SIZE_STEP <= candidate_height <= IMAGE_API_MAX_EDGE:
+                continue
+            pixels = candidate_width * candidate_height
+            if not IMAGE_API_MIN_PIXELS <= pixels <= IMAGE_API_MAX_PIXELS:
+                continue
+            ratio = candidate_width / candidate_height
+            if not 1 / 3 <= ratio <= 3:
+                continue
+            score = (
+                abs(ratio - target_ratio) / target_ratio,
+                -pixels,
+                candidate_width,
+                candidate_height,
+            )
+            if best is None or score < best:
+                best = score
+    if best is None:
+        raise ValueError("catalog artwork has no valid Image API generation size")
+    return best[2], best[3]
+
+
+def _resize_catalog_artwork(data: bytes, width: int, height: int) -> bytes:
+    with Image.open(io.BytesIO(data)) as source:
+        image = source.convert("RGBA")
+        if image.size != (width, height):
+            image = image.resize((width, height), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        image.save(output, format="PNG")
+    return output.getvalue()
+
+
 def _canonical_line_breaks(slogan: str, proposed: list[str]) -> list[str]:
     """Keep valid soft wraps without allowing one to cross an approved hard break."""
     if not proposed or any(not line.strip() for line in proposed):
@@ -234,8 +291,11 @@ class OpenAIService:
         )
 
     async def research(
-        self, current_date: date, performance_summary: str,
-        *, product_context: dict[str, Any] | None = None,
+        self,
+        current_date: date,
+        performance_summary: str,
+        *,
+        product_context: dict[str, Any] | None = None,
         recent_concepts: list[dict[str, Any]] | None = None,
     ) -> ModelResult[ResearchReport]:
         prompt = RESEARCH_PROMPT.format(
@@ -251,38 +311,191 @@ class OpenAIService:
         )
         if self.client:
             result = await self._parse(
-                prompt, NewResearchReport, web_search=True, model=self.settings.openai_research_model
+                prompt,
+                NewResearchReport,
+                web_search=True,
+                model=self.settings.openai_research_model,
             )
             # Validate the fresh contract even when a mocked/custom provider bypasses parsing.
             report = NewResearchReport.model_validate(result.value.model_dump())
             return ModelResult(report, result.metadata)
         # These are fictional development fixtures, not claimed market findings.
         ideas = [
-            ("Trail Ritual 1", "quiet morning hikers", "The early trail is a quiet commuter route", "A sunrise nested inside a simple switchback trail silhouette", "TAKE THE SCENIC ROUTE"),
-            ("Trail Ritual 2", "hikers who pack more snacks than gear", "Trail maintenance is mostly snack breaks", "A tiny backpack overflowing with trail snacks beside a mountain", None),
-            ("Pigeon Lunch Bureau", "city walkers who share snacks with birds", "Pigeons conduct solemn lunch inspections", "A dignified pigeon guarding a single pretzel", "PIGEON LUNCH BUREAU"),
-            ("After Hours Reading", "readers with overdue library books", "A skeleton librarian works the never-ending late shift", "A skeleton reading behind a stack of library returns", "AFTER HOURS READING DEPT."),
-            ("Raccoon Night Inventory", "night owls who love convenience-store snacks", "A raccoon takes snack inventory far too seriously", "A raccoon examining a paper snack bag with a small clipboard", None),
-            ("Moss Inspection Club", "gardeners who admire things growing slowly", "A snail is the chief inspector of moss", "A snail studying a patch of moss through a magnifying glass", "MOSS INSPECTION CLUB"),
-            ("Lunar Coffee Watch", "amateur astronomers fueled by coffee", "A coffee cup serves as a miniature lunar observatory", "A telescope beside a coffee mug beneath a crescent moon", None),
-            ("Desktop Cat Archives", "programmers whose cats interrupt work", "A cat supervises an obsolete computer archive", "A cat asleep on a chunky retro computer monitor", "DESKTOP CAT ARCHIVES"),
-            ("Cardio Exemption Office", "lifters who dislike cardio", "A tortoise issues official cardio exemptions", "A serious tortoise holding a small dumbbell", "CARDIO EXEMPTION OFFICE"),
-            ("Solo Cast Society", "fly fishers who prefer quiet company", "The club has room for exactly one chair", "A fishing rod beside one folding chair at a calm river", "SOLO CAST SOCIETY"),
-            ("Botanical Night Shift", "plant lovers drawn to gothic illustration", "Moths tend an imaginary moonlit greenhouse", "Two broad-winged moths hovering over a night-blooming flower", None),
-            ("Desert Book Courier", "readers with a Western sense of humor", "A pack mule delivers an unreasonable number of books", "A mule carrying two neatly stacked book panniers", "DESERT BOOK COURIER"),
-            ("Failed Parking Club", "drivers who love tiny old hatchbacks", "An insignificant hatchback receives grand racing treatment", "A small boxy hatchback next to an oversized traffic cone", "FAILED PARKING CLUB"),
-            ("Midnight Stitch Union", "crocheters who promise one last row", "An owl runs the night shift at a yarn workshop", "An owl holding a crochet hook beside a ball of yarn", "MIDNIGHT STITCH UNION"),
-            ("Low Stakes Bowling", "casual bowlers who enjoy the social ritual", "A bowling trophy celebrates simply showing up", "A humble bowling pin resting on a tiny trophy pedestal", None),
-            ("Sourdough Field Station", "home bakers scheduling life around starter", "A jar of starter receives expedition-level attention", "A starter jar beside a kitchen timer and small field notebook", "SOURDOUGH FIELD STATION"),
-            ("Urban Pond Committee", "birdwatchers delighted by ordinary ducks", "Ducks hold a very important puddle meeting", "Three ducks gathered around a small puddle", "URBAN POND COMMITTEE"),
-            ("Weekend Repair Society", "motorcycle tinkerers with unfinished projects", "A patient possum manages an endless repair queue", "A possum examining one loose motorcycle wheel", None),
-            ("Small Hill Expedition", "runners who dramatically dislike hills", "A tiny incline is treated as an alpine expedition", "One running shoe atop a modest rounded hill", "SMALL HILL EXPEDITION"),
-            ("Mushroom Records Office", "foragers who keep meticulous nature notes", "Mushrooms form a tiny botanical archive", "A broad mushroom cap sheltering a field notebook", "MUSHROOM RECORDS OFFICE"),
-            ("Unhurried Pickleball", "recreational pickleball players between snack breaks", "A sloth is the club's most composed player", "A sloth resting a paddle on one shoulder", None),
-            ("Lost Dice Department", "tabletop gamers who lose dice under furniture", "A mouse operates the lost-and-found for runaway dice", "A mouse pushing an oversized plain six-sided die", "LOST DICE DEPARTMENT"),
-            ("Cowboy Compost Crew", "gardeners who like Western imagery", "A worm works a very small ranch", "A worm in a plain cowboy hat beside a compost leaf", "COWBOY COMPOST CREW"),
-            ("Early Exit Social", "introverts who leave parties for their dog", "A dog proudly manages its human's departure schedule", "A dog holding a leash beside a small clock", None),
-            ("Sunday Cloud Survey", "campers who prefer resting to conquering peaks", "A hammock is an official cloud-observation station", "A hammock below one generous cloud", "SUNDAY CLOUD SURVEY"),
+            (
+                "Trail Ritual 1",
+                "quiet morning hikers",
+                "The early trail is a quiet commuter route",
+                "A sunrise nested inside a simple switchback trail silhouette",
+                "TAKE THE SCENIC ROUTE",
+            ),
+            (
+                "Trail Ritual 2",
+                "hikers who pack more snacks than gear",
+                "Trail maintenance is mostly snack breaks",
+                "A tiny backpack overflowing with trail snacks beside a mountain",
+                None,
+            ),
+            (
+                "Pigeon Lunch Bureau",
+                "city walkers who share snacks with birds",
+                "Pigeons conduct solemn lunch inspections",
+                "A dignified pigeon guarding a single pretzel",
+                "PIGEON LUNCH BUREAU",
+            ),
+            (
+                "After Hours Reading",
+                "readers with overdue library books",
+                "A skeleton librarian works the never-ending late shift",
+                "A skeleton reading behind a stack of library returns",
+                "AFTER HOURS READING DEPT.",
+            ),
+            (
+                "Raccoon Night Inventory",
+                "night owls who love convenience-store snacks",
+                "A raccoon takes snack inventory far too seriously",
+                "A raccoon examining a paper snack bag with a small clipboard",
+                None,
+            ),
+            (
+                "Moss Inspection Club",
+                "gardeners who admire things growing slowly",
+                "A snail is the chief inspector of moss",
+                "A snail studying a patch of moss through a magnifying glass",
+                "MOSS INSPECTION CLUB",
+            ),
+            (
+                "Lunar Coffee Watch",
+                "amateur astronomers fueled by coffee",
+                "A coffee cup serves as a miniature lunar observatory",
+                "A telescope beside a coffee mug beneath a crescent moon",
+                None,
+            ),
+            (
+                "Desktop Cat Archives",
+                "programmers whose cats interrupt work",
+                "A cat supervises an obsolete computer archive",
+                "A cat asleep on a chunky retro computer monitor",
+                "DESKTOP CAT ARCHIVES",
+            ),
+            (
+                "Cardio Exemption Office",
+                "lifters who dislike cardio",
+                "A tortoise issues official cardio exemptions",
+                "A serious tortoise holding a small dumbbell",
+                "CARDIO EXEMPTION OFFICE",
+            ),
+            (
+                "Solo Cast Society",
+                "fly fishers who prefer quiet company",
+                "The club has room for exactly one chair",
+                "A fishing rod beside one folding chair at a calm river",
+                "SOLO CAST SOCIETY",
+            ),
+            (
+                "Botanical Night Shift",
+                "plant lovers drawn to gothic illustration",
+                "Moths tend an imaginary moonlit greenhouse",
+                "Two broad-winged moths hovering over a night-blooming flower",
+                None,
+            ),
+            (
+                "Desert Book Courier",
+                "readers with a Western sense of humor",
+                "A pack mule delivers an unreasonable number of books",
+                "A mule carrying two neatly stacked book panniers",
+                "DESERT BOOK COURIER",
+            ),
+            (
+                "Failed Parking Club",
+                "drivers who love tiny old hatchbacks",
+                "An insignificant hatchback receives grand racing treatment",
+                "A small boxy hatchback next to an oversized traffic cone",
+                "FAILED PARKING CLUB",
+            ),
+            (
+                "Midnight Stitch Union",
+                "crocheters who promise one last row",
+                "An owl runs the night shift at a yarn workshop",
+                "An owl holding a crochet hook beside a ball of yarn",
+                "MIDNIGHT STITCH UNION",
+            ),
+            (
+                "Low Stakes Bowling",
+                "casual bowlers who enjoy the social ritual",
+                "A bowling trophy celebrates simply showing up",
+                "A humble bowling pin resting on a tiny trophy pedestal",
+                None,
+            ),
+            (
+                "Sourdough Field Station",
+                "home bakers scheduling life around starter",
+                "A jar of starter receives expedition-level attention",
+                "A starter jar beside a kitchen timer and small field notebook",
+                "SOURDOUGH FIELD STATION",
+            ),
+            (
+                "Urban Pond Committee",
+                "birdwatchers delighted by ordinary ducks",
+                "Ducks hold a very important puddle meeting",
+                "Three ducks gathered around a small puddle",
+                "URBAN POND COMMITTEE",
+            ),
+            (
+                "Weekend Repair Society",
+                "motorcycle tinkerers with unfinished projects",
+                "A patient possum manages an endless repair queue",
+                "A possum examining one loose motorcycle wheel",
+                None,
+            ),
+            (
+                "Small Hill Expedition",
+                "runners who dramatically dislike hills",
+                "A tiny incline is treated as an alpine expedition",
+                "One running shoe atop a modest rounded hill",
+                "SMALL HILL EXPEDITION",
+            ),
+            (
+                "Mushroom Records Office",
+                "foragers who keep meticulous nature notes",
+                "Mushrooms form a tiny botanical archive",
+                "A broad mushroom cap sheltering a field notebook",
+                "MUSHROOM RECORDS OFFICE",
+            ),
+            (
+                "Unhurried Pickleball",
+                "recreational pickleball players between snack breaks",
+                "A sloth is the club's most composed player",
+                "A sloth resting a paddle on one shoulder",
+                None,
+            ),
+            (
+                "Lost Dice Department",
+                "tabletop gamers who lose dice under furniture",
+                "A mouse operates the lost-and-found for runaway dice",
+                "A mouse pushing an oversized plain six-sided die",
+                "LOST DICE DEPARTMENT",
+            ),
+            (
+                "Cowboy Compost Crew",
+                "gardeners who like Western imagery",
+                "A worm works a very small ranch",
+                "A worm in a plain cowboy hat beside a compost leaf",
+                "COWBOY COMPOST CREW",
+            ),
+            (
+                "Early Exit Social",
+                "introverts who leave parties for their dog",
+                "A dog proudly manages its human's departure schedule",
+                "A dog holding a leash beside a small clock",
+                None,
+            ),
+            (
+                "Sunday Cloud Survey",
+                "campers who prefer resting to conquering peaks",
+                "A hammock is an official cloud-observation station",
+                "A hammock below one generous cloud",
+                "SUNDAY CLOUD SURVEY",
+            ),
         ]
         concepts = []
         for index, (name, audience, premise, visual, slogan) in enumerate(ideas):
@@ -302,7 +515,9 @@ class OpenAIService:
                     seasonality="year-round with spring and fall peaks",
                     estimated_trend_window="12 weeks",
                     competitive_advantage="Readable one-second silhouette with a specific ritual cue",
-                    risks=["Fixture scores are synthetic; real demand and competition remain unverified"],
+                    risks=[
+                        "Fixture scores are synthetic; real demand and competition remain unverified"
+                    ],
                     strategy=ConceptStrategy(
                         micro_niche=audience,
                         premise=premise,
@@ -331,7 +546,9 @@ class OpenAIService:
                             kind="inference",
                             supports=["demand"],
                             excerpt="Synthetic development fixture; no measured demand or competition.",
-                            limitations=["Fixture only: not evidence of real marketplace performance"],
+                            limitations=[
+                                "Fixture only: not evidence of real marketplace performance"
+                            ],
                         )
                     ],
                 )
@@ -387,9 +604,7 @@ class OpenAIService:
             for index in range(1, 4)
         ]
         return ModelResult(
-            MarketplaceSearchFallback(
-                marketplace=marketplace, query=query, listings=listings
-            ),
+            MarketplaceSearchFallback(marketplace=marketplace, query=query, listings=listings),
             self._fake_metadata("marketplace_fallback", prompt),
         )
 
@@ -418,8 +633,8 @@ class OpenAIService:
                 "5% trend velocity and 5% longevity. Evidence discounts demand, "
                 "competition and velocity toward neutral 50. Choose the strongest premise "
                 "among these close alternatives and explain your choice."
-                if strategy_ranking else
-                "Legacy weights: 25% demand, 20% trend acceleration, 15% purchase intent, "
+                if strategy_ranking
+                else "Legacy weights: 25% demand, 20% trend acceleration, 15% purchase intent, "
                 "15% originality, 10% low saturation, 10% print quality potential, and 5% longevity."
             ),
             selection_penalties=(
@@ -435,40 +650,53 @@ class OpenAIService:
             if not strategy_ranking:
                 return result
             selected = next(
-                (item for item in shortlist if item.concept_name == result.value.selected_concept_name),
+                (
+                    item
+                    for item in shortlist
+                    if item.concept_name == result.value.selected_concept_name
+                ),
                 shortlist[0],
             )
             valid_choice = selected.concept_name == result.value.selected_concept_name
-            decision = result.value.model_copy(update={
-                "selected_concept_name": selected.concept_name,
-                "weighted_score": weighted_concept_score(selected, include_ip_risk),
-                "rationale": (
-                    result.value.rationale if valid_choice else
-                    "Model selected outside the eligible shortlist; used the canonical leader."
-                ),
-                "rejected_concepts": [
-                    RejectedConcept(
-                        concept_name=item.concept_name,
-                        reason=(
-                            "Not chosen after comparing the leading premises"
-                            if item in shortlist else "Below the commercial shortlist"
-                        ),
-                    )
-                    for item in concepts if item.concept_name != selected.concept_name
-                ],
-            })
-            return ModelResult(decision, {
-                **result.metadata,
-                "selection_shortlist": [item.concept_name for item in shortlist],
-                "selection_fallback": not valid_choice,
-            })
+            decision = result.value.model_copy(
+                update={
+                    "selected_concept_name": selected.concept_name,
+                    "weighted_score": weighted_concept_score(selected, include_ip_risk),
+                    "rationale": (
+                        result.value.rationale
+                        if valid_choice
+                        else "Model selected outside the eligible shortlist; used the canonical leader."
+                    ),
+                    "rejected_concepts": [
+                        RejectedConcept(
+                            concept_name=item.concept_name,
+                            reason=(
+                                "Not chosen after comparing the leading premises"
+                                if item in shortlist
+                                else "Below the commercial shortlist"
+                            ),
+                        )
+                        for item in concepts
+                        if item.concept_name != selected.concept_name
+                    ],
+                }
+            )
+            return ModelResult(
+                decision,
+                {
+                    **result.metadata,
+                    "selection_shortlist": [item.concept_name for item in shortlist],
+                    "selection_fallback": not valid_choice,
+                },
+            )
 
         def score(item: CandidateConcept) -> float:
             return weighted_concept_score(item, self.settings.ip_check_enabled)
 
         ranked = (
             sorted(concepts, key=lambda item: (-score(item), item.concept_name.casefold()))
-            if strategy_ranking else sorted(concepts, key=score, reverse=True)
+            if strategy_ranking
+            else sorted(concepts, key=score, reverse=True)
         )
         decision = SelectionDecision(
             selected_concept_name=ranked[0].concept_name,
@@ -504,9 +732,7 @@ class OpenAIService:
     async def analyze_references(
         self, opportunity: ProductOpportunity, reference_sheet: bytes
     ) -> ModelResult[ReferenceAnalysis]:
-        reference_ids = [
-            item.external_listing_id for item in opportunity.comparable_listings[:3]
-        ]
+        reference_ids = [item.external_listing_id for item in opportunity.comparable_listings[:3]]
         prompt = REFERENCE_ANALYSIS_PROMPT.format(
             opportunity=opportunity.model_dump_json(indent=2),
             reference_ids=json.dumps(reference_ids),
@@ -552,16 +778,18 @@ class OpenAIService:
             upload = io.BytesIO(reference_sheet)
             upload.name = "marketplace-references.png"
             background: Literal["transparent", "opaque"] = (
-                "transparent"
-                if surface.placement in {"placed", "restricted_palette"}
-                else "opaque"
+                "transparent" if surface.placement in {"placed", "restricted_palette"} else "opaque"
+            )
+            generation_width, generation_height = _catalog_generation_size(
+                surface.width,
+                surface.height,
             )
             try:
                 result = await self.client.images.edit(
                     model=self.settings.openai_image_model,
                     image=upload,
                     prompt=prompt,
-                    size=f"{surface.width}x{surface.height}",
+                    size=f"{generation_width}x{generation_height}",
                     quality=self.settings.openai_image_quality,
                     background=background,
                     output_format="png",
@@ -572,18 +800,22 @@ class OpenAIService:
             if not result.data or not result.data[0].b64_json:
                 raise RuntimeError("OpenAI returned no catalog artwork")
             usage = result.usage.model_dump() if result.usage else None
-            return base64.b64decode(result.data[0].b64_json), {
+            artwork = _resize_catalog_artwork(
+                base64.b64decode(result.data[0].b64_json),
+                surface.width,
+                surface.height,
+            )
+            return artwork, {
                 "model": self.settings.openai_image_model,
                 "quality": result.quality or self.settings.openai_image_quality,
-                "size": result.size or f"{surface.width}x{surface.height}",
+                "generation_size": result.size or f"{generation_width}x{generation_height}",
+                "size": f"{surface.width}x{surface.height}",
                 "usage": usage,
-                "estimated_cost_usd": estimate_image_cost(
-                    self.settings.openai_image_model, usage
-                ),
+                "estimated_cost_usd": estimate_image_cost(self.settings.openai_image_model, usage),
                 "prompt": prompt,
                 "prompt_version": PROMPT_VERSION,
                 "schema_name": "CatalogRasterArtwork",
-                "schema_version": "2",
+                "schema_version": "3",
             }
         fixture = make_fixture_art(surface.width, surface.height)
         if surface.placement in {"full_bleed", "repeat"}:
@@ -598,9 +830,7 @@ class OpenAIService:
     async def originality_assessment(
         self, comparison_sheet: bytes, reference_ids: list[str]
     ) -> ModelResult[OriginalityVisionAssessment]:
-        prompt = ORIGINALITY_ASSESSMENT_PROMPT.format(
-            reference_ids=json.dumps(reference_ids)
-        )
+        prompt = ORIGINALITY_ASSESSMENT_PROMPT.format(reference_ids=json.dumps(reference_ids))
         if self.client:
             return await self._parse(
                 prompt,
@@ -640,8 +870,7 @@ class OpenAIService:
         tags = [item[:20] for item in included[:13]] or ["original gift"]
         title = f"{opportunity.concept_name} {plan.product_title}"[:140]
         disclosure = (
-            "Seller-prompted AI assisted the original artwork; "
-            "Printify is the production partner."
+            "Seller-prompted AI assisted the original artwork; Printify is the production partner."
         )
         listing = MarketplaceListing(
             channel=Channel.ETSY,
@@ -680,10 +909,12 @@ class OpenAIService:
                 reasoning_effort=self.settings.openai_creative_reasoning_effort,
             )
             return ModelResult(
-                result.value.model_copy(update={
-                    "strategy": concept.strategy,
-                    "slogan": concept.slogan_if_any,
-                }),
+                result.value.model_copy(
+                    update={
+                        "strategy": concept.strategy,
+                        "slogan": concept.slogan_if_any,
+                    }
+                ),
                 result.metadata,
             )
         brief = CreativeBrief(
@@ -704,9 +935,13 @@ class OpenAIService:
         return ModelResult(brief, self._fake_metadata("creative", prompt))
 
     async def revise_brief(
-        self, concept: CandidateConcept, brief: CreativeBrief, issues: list[QAIssue],
+        self,
+        concept: CandidateConcept,
+        brief: CreativeBrief,
+        issues: list[QAIssue],
         shirt_colors: list[str],
-        *, recovery_context: RecoveryContext | None = None,
+        *,
+        recovery_context: RecoveryContext | None = None,
     ) -> ModelResult[CreativeBrief]:
         context = recovery_context or RecoveryContext(attempt=1, strategy="targeted")
         prompt = BRIEF_REWRITE_PROMPT.format(
@@ -718,11 +953,14 @@ class OpenAIService:
         )
         if self.client:
             result = await self._parse(
-                prompt, CreativeBrief,
+                prompt,
+                CreativeBrief,
                 reasoning_effort=self.settings.openai_creative_reasoning_effort,
             )
             return ModelResult(
-                result.value.model_copy(update={"strategy": brief.strategy, "slogan": brief.slogan}),
+                result.value.model_copy(
+                    update={"strategy": brief.strategy, "slogan": brief.slogan}
+                ),
                 {**result.metadata, "recovery_context": context.to_dict()},
             )
         if context.strategy == "structural_simplification":
@@ -881,8 +1119,12 @@ class OpenAIService:
         return image, self._fake_metadata("revision", prompt)
 
     async def visual_qa(
-        self, image: bytes, brief: CreativeBrief, deterministic: QAReport,
-        *, effects: dict[str, Any] | None = None,
+        self,
+        image: bytes,
+        brief: CreativeBrief,
+        deterministic: QAReport,
+        *,
+        effects: dict[str, Any] | None = None,
     ) -> ModelResult[QAReport]:
         prompt = QA_PROMPT.format(
             brief=brief.model_dump_json(indent=2),
@@ -890,6 +1132,7 @@ class OpenAIService:
             effects=json.dumps(effects or {}),
             shirt_colors=brief.shirt_colors,
             deterministic=deterministic.model_dump_json(indent=2),
+            ip_review_scope="protected content, " if self.settings.ip_check_enabled else "",
         )
         if self.client:
             return await self._parse(prompt, QAReport, image=image)
@@ -903,7 +1146,9 @@ class OpenAIService:
             return await self._parse(prompt, ShirtColorRanking, image=preview)
         ranking = ShirtColorRanking(
             scores=[
-                ShirtColorScore(candidate_id=int(item["candidate_id"]), score=50, reason="Fixture score")
+                ShirtColorScore(
+                    candidate_id=int(item["candidate_id"]), score=50, reason="Fixture score"
+                )
                 for item in candidates
             ]
         )

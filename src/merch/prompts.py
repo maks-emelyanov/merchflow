@@ -295,7 +295,7 @@ Creative brief:
 QA_PROMPT = PIPELINE_CAPABILITIES + """
 Perform prepress visual QA for this T-shirt artwork. Check immediate readability,
 coherence, apparel suitability, exact visible slogan, artifacts, pseudo-text, fine
-detail, contrast, muddy colors, negative space, protected content, and brief match.
+detail, contrast, muddy colors, negative space, {ip_review_scope}and brief match.
 Pass only if production ready. Technical correctness alone is not enough. Treat
 commercial design quality as blocking: require confident print presence, a clear
 focal hierarchy, intentional spacing, polished line breaks, and a distinctive

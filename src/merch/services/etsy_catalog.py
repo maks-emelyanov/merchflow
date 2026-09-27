@@ -7,6 +7,7 @@ from typing import Any
 
 from merch.config import Settings
 from merch.schemas import CatalogProduct, Channel, EtsyProductProfile, ProductTemplate
+from merch.services.etsy_auth import etsy_access_token
 from merch.services.storefront import EtsyStorefrontClient
 
 CUSTOM_VARIATION_IDS = (513, 514, 516)
@@ -116,7 +117,8 @@ async def resolve_etsy_profile(
             "Etsy shipping, return, readiness, and production-partner profiles must be "
             "imported before catalog publication"
         )
-    client = EtsyStorefrontClient(settings)
+    token = await etsy_access_token(settings)
+    client = EtsyStorefrontClient(settings, access_token=token)
     try:
         nodes = _flatten_nodes(await client.seller_taxonomy_nodes())
         product_tokens = _tokens(" ".join([product.title, product.description, *product.tags]))

@@ -6,8 +6,10 @@ import asyncio
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import quote
 
 from merch.config import Settings, get_settings
 from merch.database import session_scope
@@ -16,6 +18,7 @@ from merch.schemas import CatalogProduct
 from merch.services.credentials import CredentialCipher
 
 PRINTIFY_SESSION = "printify"
+_PRINTIFY_AUTH_COOKIES = {"connect.sid", "fyul_sess"}
 _PRICE = re.compile(r"(?:US\s*)?\$\s*(\d[\d,]*)(?:\.(\d{2}))?")
 
 
@@ -98,8 +101,93 @@ def embedded_product_identities(payloads: list[Any]) -> set[tuple[int, int]]:
     return identities
 
 
+def extract_designer_variant_costs(
+    payload: Mapping[str, Any], variant_ids: set[int]
+) -> dict[int, int]:
+    """Extract account-specific production costs from Printify's designer payload.
+
+    Each cost entry represents one print placement. ``result`` is the suggested
+    retail price; the actual production cost is the blank, printing, and fee
+    components. The lowest placement cost preserves the existing one-surface
+    catalog comparison contract. Publication separately validates the selected
+    surfaces before any external mutation.
+    """
+    provider = payload.get("print_provider")
+    if not isinstance(provider, Mapping):
+        return {}
+    variants = provider.get("variants")
+    if not isinstance(variants, list):
+        return {}
+    result: dict[int, int] = {}
+    for variant in variants:
+        if not isinstance(variant, Mapping) or not variant.get("available", False):
+            continue
+        try:
+            variant_id = int(variant["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if variant_id not in variant_ids:
+            continue
+        placement_costs: list[int] = []
+        for cost in variant.get("costs", []):
+            if not isinstance(cost, Mapping):
+                continue
+            components: list[int] = []
+            for key in ("blank", "printing", "fee"):
+                value = cost.get(key, 0)
+                if not isinstance(value, (int, float)) or value < 0:
+                    components = []
+                    break
+                components.append(round(value))
+            if components:
+                placement_costs.append(sum(components))
+        if placement_costs:
+            result[variant_id] = min(placement_costs)
+    return result
+
+
+def designer_product_identity(payload: Mapping[str, Any]) -> tuple[int, int] | None:
+    provider = payload.get("print_provider")
+    if not isinstance(provider, Mapping):
+        return None
+    try:
+        return int(payload["blueprint_id"]), int(provider["id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _designer_decoration_method(product: CatalogProduct) -> str:
+    methods = {
+        surface.decoration_method
+        for variant in product.variants
+        if variant.available
+        for surface in variant.surfaces
+        if surface.decoration_method
+    }
+    if not methods:
+        raise RuntimeError("Printify catalog product has no available decoration method")
+    return "dtg" if "dtg" in methods else sorted(methods)[0]
+
+
 def _cipher(settings: Settings) -> CredentialCipher:
     return CredentialCipher(settings.credential_encryption_key.get_secret_value())
+
+
+def printify_session_expiry(state: Mapping[str, Any]) -> datetime | None:
+    cookies = state.get("cookies", [])
+    auth_expiries = [
+        float(cookie["expires"])
+        for cookie in cookies
+        if cookie.get("name") in _PRINTIFY_AUTH_COOKIES
+        and isinstance(cookie.get("expires"), (int, float))
+        and cookie["expires"] > 0
+    ]
+    expiries = auth_expiries or [
+        float(cookie["expires"])
+        for cookie in cookies
+        if isinstance(cookie.get("expires"), (int, float)) and cookie["expires"] > 0
+    ]
+    return datetime.fromtimestamp(min(expiries), UTC) if expiries else None
 
 
 async def connect_printify_browser(settings: Settings | None = None) -> dict[str, Any]:
@@ -124,12 +212,7 @@ async def connect_printify_browser(settings: Settings | None = None) -> dict[str
         await browser.close()
     serialized = json.dumps(state, separators=(",", ":"))
     encrypted = _cipher(settings).encrypt(serialized)
-    expiries = [
-        float(cookie["expires"])
-        for cookie in state.get("cookies", [])
-        if isinstance(cookie.get("expires"), (int, float)) and cookie["expires"] > 0
-    ]
-    expires_at = datetime.fromtimestamp(min(expiries), UTC) if expiries else None
+    expires_at = printify_session_expiry(state)
     with session_scope() as session:
         BrowserSessionRepository(session).save(PRINTIFY_SESSION, encrypted, expires_at=expires_at)
     return {"source": PRINTIFY_SESSION, "connected": True, "expires_at": expires_at}
@@ -195,13 +278,18 @@ async def collect_printify_costs(
             raise RuntimeError("Printify browser session has expired")
         storage_state = json.loads(_cipher(settings).decrypt(record.encrypted_state))
 
-    from playwright.async_api import async_playwright
-
+    method = quote(_designer_decoration_method(product), safe="-")
+    dashboard_base = settings.printify_dashboard_base_url.rstrip("/")
     url = (
-        f"{settings.printify_dashboard_base_url.rstrip('/')}/app/products/"
-        f"{product.blueprint_id}?print_provider_id={product.print_provider_id}"
+        f"{dashboard_base}/app/editor/{product.blueprint_id}/"
+        f"{product.print_provider_id}/{method}"
+    )
+    designer_path = (
+        f"/designer-api/api/v2/blueprints/{product.blueprint_id}/"
+        f"{product.print_provider_id}?salesChannel=etsy"
     )
     variant_ids = {item.variant_id for item in product.variants if item.available}
+    from playwright.async_api import async_playwright
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=settings.browser_headless)
@@ -231,31 +319,38 @@ async def collect_printify_costs(
                 raise RuntimeError(
                     "Printify browser session requires authentication or a challenge"
                 )
-            rows = await page.locator("[data-variant-id]").evaluate_all(
-                """elements => elements.map(element => ({
-                    variant_id: element.getAttribute('data-variant-id'),
-                    cost: element.getAttribute('data-cost') || element.innerText
-                }))"""
+            payload = await page.evaluate(
+                """async path => {
+                    const response = await fetch(path, {
+                        credentials: "include",
+                        headers: {"Accept": "application/json"}
+                    });
+                    if (!response.ok) {
+                        return {__http_status: response.status};
+                    }
+                    return await response.json();
+                }""",
+                designer_path,
             )
-            script_texts = await page.locator(
-                "script[type='application/json'], script#__NEXT_DATA__"
-            ).all_text_contents()
-            content_fingerprint = hashlib.sha256((await page.content()).encode()).hexdigest()
-            embedded_payloads = []
-            for text in script_texts:
-                try:
-                    embedded_payloads.append(json.loads(text))
-                except json.JSONDecodeError:
-                    continue
-            identities = embedded_product_identities(embedded_payloads)
+            if not isinstance(payload, dict):
+                raise RuntimeError("Printify designer returned an invalid response")
+            if payload.get("__http_status"):
+                raise RuntimeError(
+                    "Printify designer request failed with status "
+                    f"{payload['__http_status']}"
+                )
+            content_fingerprint = hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
             expected_identity = (product.blueprint_id, product.print_provider_id)
-            if expected_identity not in identities:
+            if designer_product_identity(payload) != expected_identity:
                 raise RuntimeError(
                     "Printify dashboard did not confirm the selected blueprint/provider identity"
                 )
-            costs = extract_variant_costs(
-                variant_ids, rows=rows, embedded_payloads=embedded_payloads
-            )
+            provider = payload.get("print_provider", {})
+            if not provider.get("available", False):
+                raise RuntimeError("Printify dashboard reports the selected provider unavailable")
+            costs = extract_designer_variant_costs(payload, variant_ids)
             await browser.close()
     except Exception as exc:
         with session_scope() as session:

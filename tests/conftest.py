@@ -17,6 +17,7 @@ def fake_providers_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MERCH_MANUAL_APPROVAL_ENABLED", "false")
     monkeypatch.setenv("MERCH_ETSY_PRODUCTION_PARTNER_CHECK_ENABLED", "false")
     monkeypatch.setenv("MERCH_IP_CHECK_ENABLED", "false")
+    monkeypatch.setenv("MERCH_ORIGINALITY_CHECK_ENABLED", "false")
     # The production image installs the full Noto/Roboto registry.  Keep the
     # host-side fixture pipeline deterministic on lean developer images too,
     # without weakening production's fail-closed font resolution.

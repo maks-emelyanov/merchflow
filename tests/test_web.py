@@ -13,6 +13,7 @@ from merch.defaults import fixture_product_template
 from merch.models import Base, CopyRefreshBatchRecord, CopyRefreshItemRecord
 from merch.repository import ConfigurationRepository, RunRepository
 from merch.schemas import ApprovalRequest, PublishStatus, RunInput, RunStatus
+from merch.services.catalog import claim_catalog_refresh
 from merch.web import create_app
 
 
@@ -99,6 +100,45 @@ def test_featured_listing_photo_is_explicit_in_catalog_ui(isolated_app) -> None:
         assert page.status_code == 200
         assert "Featured listing photo" in page.text
         assert '<option value="1001" selected>' in page.text
+
+
+def test_catalog_sync_api_starts_background_job_and_exposes_status(
+    isolated_app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    Base.metadata.create_all(get_engine())
+    persisted = claim_catalog_refresh("catalog-api-workflow")
+
+    async def start(settings, *, wait=False):  # type: ignore[no-untyped-def]
+        assert not wait
+        return {
+            **persisted,
+            "status": "pending",
+            "resumed": False,
+            "owner": True,
+        }
+
+    monkeypatch.setattr("merch.web.start_catalog_refresh", start)
+    with TestClient(create_app(get_settings())) as client:
+        assert client.get("/api/catalog/syncs").status_code == 401
+        login = client.get("/login")
+        assert client.post(
+            "/login", data={"password": "test-password", "csrf_token": _csrf(login.text)}
+        ).status_code == 200
+        page = client.get("/connectors")
+        response = client.post(
+            "/api/catalog/sync", headers={"X-CSRF-Token": _csrf(page.text)}
+        )
+        assert response.status_code == 202
+        assert response.json()["sync_id"] == persisted["sync_id"]
+        assert "owner" not in response.json()
+
+        statuses = client.get("/api/catalog/syncs")
+        assert statuses.status_code == 200
+        assert statuses.json()[0]["sync_id"] == persisted["sync_id"]
+        detail = client.get(f"/api/catalog/syncs/{persisted['sync_id']}")
+        assert detail.status_code == 200
+        assert "manifest" not in detail.json()
+        assert client.get("/api/catalog/syncs/missing").status_code == 404
 
 
 def test_run_page_and_api_show_saved_featured_color_choice(isolated_app) -> None:

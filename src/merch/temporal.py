@@ -35,6 +35,7 @@ from temporalio.worker import Worker
 from merch.config import Settings, get_settings
 from merch.schemas import (
     ApprovalSignal,
+    Channel,
     CreativeBrief,
     ProductTemplate,
     PublishInput,
@@ -50,6 +51,7 @@ with workflow.unsafe.imports_passed_through():
         attempt_catalog_opportunity,
         finish_no_qualified_opportunity,
         research_catalog_run,
+        resume_catalog_research,
     )
     from merch.catalog_publisher import publish_catalog_run
     from merch.copy_refresh import apply_copy_refresh_batch, prepare_copy_refresh_batch
@@ -71,6 +73,14 @@ with workflow.unsafe.imports_passed_through():
         set_status,
         sync_analytics,
     )
+    from merch.services.catalog import (
+        claim_catalog_refresh,
+        discover_catalog_refresh,
+        fail_catalog_refresh,
+        finalize_catalog_refresh,
+        get_catalog_refresh,
+        refresh_catalog_batch,
+    )
 
 
 ACTIVITY_RETRY = RetryPolicy(
@@ -88,14 +98,18 @@ ACTIVITY_RETRY = RetryPolicy(
 
 DAILY_DESIGN_SCHEDULE_ID = "merch-daily-design"
 DAILY_ANALYTICS_SCHEDULE_ID = "merch-daily-analytics"
+CATALOG_REFRESH_SCHEDULE_ID = "merch-catalog-refresh"
 DAILY_SCHEDULE_POLICY = SchedulePolicy(
     overlap=ScheduleOverlapPolicy.BUFFER_ONE,
     catchup_window=timedelta(hours=24),
     pause_on_failure=False,
 )
-TEMPORAL_SCHEDULED_START_TIME = SearchAttributeKey.for_datetime(
-    "TemporalScheduledStartTime"
+CATALOG_REFRESH_SCHEDULE_POLICY = SchedulePolicy(
+    overlap=ScheduleOverlapPolicy.SKIP,
+    catchup_window=timedelta(hours=24),
+    pause_on_failure=False,
 )
+TEMPORAL_SCHEDULED_START_TIME = SearchAttributeKey.for_datetime("TemporalScheduledStartTime")
 SCHEDULE_REPAIR_RETRY_SECONDS = 60
 
 
@@ -117,6 +131,11 @@ async def research_activity(run_id: str) -> None:
 @activity.defn(name="research_catalog_run")
 async def research_catalog_activity(run_id: str) -> int:
     return await research_catalog_run(run_id)
+
+
+@activity.defn(name="resume_catalog_research")
+async def resume_catalog_research_activity(run_id: str) -> int:
+    return resume_catalog_research(run_id)
 
 
 @activity.defn(name="attempt_catalog_opportunity")
@@ -183,6 +202,46 @@ async def rejection_activity(input: dict[str, str]) -> None:
 @activity.defn(name="publish_channel")
 async def publish_activity(input: PublishInput) -> PublishStatus:
     try:
+        from merch.database import session_scope
+        from merch.repository import RunRepository
+
+        with session_scope() as session:
+            repository = RunRepository(session)
+            run = repository.get(str(input.run_id), full=True)
+            pipeline_version = run.pipeline_version
+            if pipeline_version == 2:
+                if input.channel != Channel.ETSY:
+                    raise RuntimeError("Catalog v2 publication supports Etsy only")
+                existing = next(
+                    (item for item in run.publishes if item.channel == input.channel.value),
+                    None,
+                )
+                if run.status not in {
+                    RunStatus.PUBLISHING.value,
+                    RunStatus.FAILED.value,
+                    RunStatus.VERIFICATION_REQUIRED.value,
+                    RunStatus.PARTIALLY_PUBLISHED.value,
+                }:
+                    raise RuntimeError("Catalog run is not eligible for a publication retry")
+                if existing is None or existing.status not in {
+                    PublishStatus.FAILED.value,
+                    PublishStatus.RECONCILIATION_REQUIRED.value,
+                    PublishStatus.CREATING.value,
+                    PublishStatus.PUBLISHING.value,
+                }:
+                    raise RuntimeError("Catalog run has no retryable publication checkpoint")
+                run.status = RunStatus.PUBLISHING.value
+                run.error = None
+        if pipeline_version == 2:
+            outcome = await publish_catalog_run(str(input.run_id))
+            if outcome == "hard_gate_failed":
+                raise RuntimeError("Catalog publication hard gate failed during retry")
+            try:
+                return PublishStatus(outcome)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Unexpected catalog publication outcome during retry: {outcome}"
+                ) from exc
         return await publish_channel_run(str(input.run_id), input.channel)
     except Exception as exc:
         record_publish_failure(str(input.run_id), input.channel, str(exc))
@@ -218,6 +277,31 @@ async def mark_cancelled_activity(run_id: str) -> None:
 @activity.defn(name="sync_analytics")
 async def analytics_activity(_: str) -> dict[str, str]:
     return await sync_analytics()
+
+
+@activity.defn(name="claim_catalog_refresh")
+async def claim_catalog_refresh_activity(workflow_id: str) -> dict[str, object]:
+    return claim_catalog_refresh(workflow_id)
+
+
+@activity.defn(name="discover_catalog_refresh")
+async def discover_catalog_refresh_activity(refresh_id: str) -> dict[str, object]:
+    return await discover_catalog_refresh(refresh_id)
+
+
+@activity.defn(name="refresh_catalog_batch")
+async def refresh_catalog_batch_activity(refresh_id: str) -> dict[str, object]:
+    return await refresh_catalog_batch(refresh_id)
+
+
+@activity.defn(name="finalize_catalog_refresh")
+async def finalize_catalog_refresh_activity(refresh_id: str) -> dict[str, object]:
+    return finalize_catalog_refresh(refresh_id)
+
+
+@activity.defn(name="fail_catalog_refresh")
+async def fail_catalog_refresh_activity(input: dict[str, str]) -> dict[str, object]:
+    return fail_catalog_refresh(input["sync_id"], input["error"])
 
 
 async def _start_daily_workflow(
@@ -271,22 +355,32 @@ async def apply_copy_refresh_activity(batch_id: str) -> str:
 class CopyRefreshPrepareWorkflow:
     @workflow.run
     async def run(self, request_id: str) -> str:
-        return cast(str, await workflow.execute_activity(
-            "prepare_copy_refresh", request_id,
-            start_to_close_timeout=timedelta(minutes=30), retry_policy=ACTIVITY_RETRY,
-            result_type=str,
-        ))
+        return cast(
+            str,
+            await workflow.execute_activity(
+                "prepare_copy_refresh",
+                request_id,
+                start_to_close_timeout=timedelta(minutes=30),
+                retry_policy=ACTIVITY_RETRY,
+                result_type=str,
+            ),
+        )
 
 
 @workflow.defn
 class CopyRefreshApplyWorkflow:
     @workflow.run
     async def run(self, batch_id: str) -> str:
-        return cast(str, await workflow.execute_activity(
-            "apply_copy_refresh", batch_id,
-            start_to_close_timeout=timedelta(minutes=30), retry_policy=ACTIVITY_RETRY,
-            result_type=str,
-        ))
+        return cast(
+            str,
+            await workflow.execute_activity(
+                "apply_copy_refresh",
+                batch_id,
+                start_to_close_timeout=timedelta(minutes=30),
+                retry_policy=ACTIVITY_RETRY,
+                result_type=str,
+            ),
+        )
 
 
 @workflow.defn
@@ -500,10 +594,13 @@ class MerchWorkflow:
                         for item in statuses
                     ):
                         return RunStatus.PUBLISHED.value
-                    if not any(
-                        item in {PublishStatus.SUCCEEDED, PublishStatus.DRY_RUN}
-                        for item in statuses
-                    ) and PublishStatus.RECONCILIATION_REQUIRED in statuses:
+                    if (
+                        not any(
+                            item in {PublishStatus.SUCCEEDED, PublishStatus.DRY_RUN}
+                            for item in statuses
+                        )
+                        and PublishStatus.RECONCILIATION_REQUIRED in statuses
+                    ):
                         return RunStatus.VERIFICATION_REQUIRED.value
                     return RunStatus.PARTIALLY_PUBLISHED.value
         except Exception as exc:
@@ -527,9 +624,9 @@ class CatalogMerchWorkflow:
             count = cast(
                 int,
                 await workflow.execute_activity(
-                    "research_catalog_run",
+                    ("resume_catalog_research" if input.reuse_research else "research_catalog_run"),
                     run_id,
-                    start_to_close_timeout=timedelta(hours=4),
+                    start_to_close_timeout=timedelta(minutes=5 if input.reuse_research else 240),
                     retry_policy=ACTIVITY_RETRY,
                     result_type=int,
                 ),
@@ -562,7 +659,8 @@ class CatalogMerchWorkflow:
                 if outcome == PublishStatus.RECONCILIATION_REQUIRED.value:
                     return RunStatus.VERIFICATION_REQUIRED.value
                 if outcome in {
-                    PublishStatus.SUCCEEDED.value, PublishStatus.DRY_RUN.value,
+                    PublishStatus.SUCCEEDED.value,
+                    PublishStatus.DRY_RUN.value,
                 }:
                     return RunStatus.PUBLISHED.value
                 raise RuntimeError(f"unexpected catalog publication outcome: {outcome}")
@@ -619,14 +717,75 @@ class AnalyticsWorkflow:
 
 
 @workflow.defn
+class CatalogRefreshWorkflow:
+    @workflow.run
+    async def run(self, refresh_id: str | None = None) -> str:
+        owner = True
+        if refresh_id is None:
+            claim = cast(
+                dict[str, object],
+                await workflow.execute_activity(
+                    "claim_catalog_refresh",
+                    workflow.info().workflow_id,
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=ACTIVITY_RETRY,
+                    result_type=dict[str, object],
+                ),
+            )
+            refresh_id = str(claim["sync_id"])
+            owner = bool(claim["owner"])
+        if not owner:
+            return refresh_id
+        try:
+            state = cast(
+                dict[str, object],
+                await workflow.execute_activity(
+                    "discover_catalog_refresh",
+                    refresh_id,
+                    start_to_close_timeout=timedelta(hours=1),
+                    retry_policy=ACTIVITY_RETRY,
+                    result_type=dict[str, object],
+                ),
+            )
+            while cast(int, state["cursor"]) < cast(int, state["total_pairs"]):
+                state = cast(
+                    dict[str, object],
+                    await workflow.execute_activity(
+                        "refresh_catalog_batch",
+                        refresh_id,
+                        start_to_close_timeout=timedelta(minutes=10),
+                        retry_policy=ACTIVITY_RETRY,
+                        result_type=dict[str, object],
+                    ),
+                )
+            await workflow.execute_activity(
+                "finalize_catalog_refresh",
+                refresh_id,
+                start_to_close_timeout=timedelta(minutes=2),
+                retry_policy=ACTIVITY_RETRY,
+                result_type=dict[str, object],
+            )
+            return refresh_id
+        except Exception as exc:
+            reason = str(exc.__cause__) if exc.__cause__ else str(exc)
+            await workflow.execute_activity(
+                "fail_catalog_refresh",
+                {"sync_id": refresh_id, "error": reason},
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            raise
+
+
+@workflow.defn
 class DailyLauncherWorkflow:
     @workflow.run
     async def run(self) -> str:
         scheduled = workflow.now()
         if workflow.patched("daily-launcher-nominal-schedule-time-v1"):
-            scheduled = workflow.info().typed_search_attributes.get(
-                TEMPORAL_SCHEDULED_START_TIME
-            ) or scheduled
+            scheduled = (
+                workflow.info().typed_search_attributes.get(TEMPORAL_SCHEDULED_START_TIME)
+                or scheduled
+            )
         return cast(
             str,
             await workflow.execute_activity(
@@ -637,6 +796,44 @@ class DailyLauncherWorkflow:
                 result_type=str,
             ),
         )
+
+
+async def start_catalog_refresh(
+    settings: Settings | None = None,
+    *,
+    wait: bool = False,
+) -> dict[str, object]:
+    settings = settings or get_settings()
+    client = await temporal_client(settings)
+    requested_workflow_id = f"merch-catalog-refresh-{uuid4().hex}"
+    claim = claim_catalog_refresh(requested_workflow_id)
+    refresh_id = str(claim["sync_id"])
+    workflow_id = str(claim["workflow_id"])
+    if bool(claim["owner"]):
+        try:
+            await client.start_workflow(
+                CatalogRefreshWorkflow.run,
+                refresh_id,
+                id=workflow_id,
+                task_queue=settings.temporal_task_queue,
+                id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+            )
+        except WorkflowAlreadyStartedError:
+            pass
+        except Exception as exc:
+            fail_catalog_refresh(refresh_id, f"Temporal start failed: {exc}")
+            raise
+    if wait:
+        try:
+            await client.get_workflow_handle(workflow_id).result()
+        except Exception:
+            # The persisted refresh record contains the actionable failure and
+            # permits the next trigger to resume from its committed cursor.
+            pass
+        result = get_catalog_refresh(refresh_id)
+        result["resumed"] = bool(claim["resumed"])
+        return result
+    return claim
 
 
 async def start_manual_run(settings: Settings | None = None) -> RunInput:
@@ -671,17 +868,21 @@ async def resume_researched_run(run_id: str, settings: Settings | None = None) -
         lock_active_template(session)
         repository = RunRepository(session)
         record = repository.get(run_id, full=True)
+        catalog_resume = record.pipeline_version == 2 and bool(record.opportunities)
+        legacy_resume = bool(record.research_report)
         if (
             record.status != RunStatus.FAILED.value
-            or not record.research_report
-            or record.artifacts
+            or not (catalog_resume or legacy_resume)
+            or (record.artifacts and not catalog_resume)
             or record.approvals
             or record.publishes
         ):
             raise ValueError(
                 "Only a failed run with completed research and no review package can resume"
             )
-        previous_selected = (record.selected_concept or {}).get("concept_name")
+        previous_selected = ((record.selected_concept or record.selected_opportunity) or {}).get(
+            "concept_name"
+        )
         record.selection = None
         record.selected_concept = None
         record.creative_brief = None
@@ -700,6 +901,8 @@ async def resume_researched_run(run_id: str, settings: Settings | None = None) -
             scheduled_for=record.scheduled_for,
             manual=record.manual,
             reuse_research=True,
+            pipeline_version=record.pipeline_version,
+            max_opportunity_attempts=settings.max_opportunity_attempts,
         )
         workflow_id = f"merch-resume-{record.id}-{uuid4().hex[:8]}"
         record.workflow_id = workflow_id
@@ -712,7 +915,7 @@ async def resume_researched_run(run_id: str, settings: Settings | None = None) -
         )
     client = await temporal_client(settings)
     await client.start_workflow(
-        MerchWorkflow.run,
+        (CatalogMerchWorkflow.run if value.pipeline_version == 2 else MerchWorkflow.run),
         value,
         id=workflow_id,
         task_queue=settings.temporal_task_queue,
@@ -747,7 +950,8 @@ async def retry_failed_artwork_run(
                 raise ValueError("Run has no valid IP screening report") from exc
             ip_eligible = ip_report_eligible(report, settings.ip_risk_threshold)
         if (
-            record.status not in {
+            record.status
+            not in {
                 RunStatus.FAILED.value,
                 RunStatus.AWAITING_BRIEF_REVISION.value,
             }
@@ -766,19 +970,26 @@ async def retry_failed_artwork_run(
                 raise ValueError("Revised brief must retain the selected concept")
             selected = CandidateConcept.model_validate(record.selected_concept)
             previous_brief = (
-                CreativeBrief.model_validate(record.creative_brief) if record.creative_brief else None
+                CreativeBrief.model_validate(record.creative_brief)
+                if record.creative_brief
+                else None
             )
             if selected.strategy is not None:
                 if revised_brief.slogan != selected.slogan_if_any:
-                    raise ValueError("Revised brief must preserve the selected concept's exact printed slogan")
+                    raise ValueError(
+                        "Revised brief must preserve the selected concept's exact printed slogan"
+                    )
                 revised_brief = revised_brief.model_copy(update={"strategy": selected.strategy})
                 if previous_brief is not None:
-                    previous_brief = previous_brief.model_copy(update={"strategy": selected.strategy})
+                    previous_brief = previous_brief.model_copy(
+                        update={"strategy": selected.strategy}
+                    )
             if previous_brief is not None and revised_brief == previous_brief:
                 raise ValueError("Revise the creative brief before retrying artwork")
             template = (
                 ProductTemplate.model_validate(record.template_snapshot)
-                if record.template_snapshot else ConfigurationRepository(session).get_template()
+                if record.template_snapshot
+                else ConfigurationRepository(session).get_template()
             )
             allowed_colors = {item.color for item in template.variants if item.enabled}
             if not set(revised_brief.shirt_colors).issubset(allowed_colors):
@@ -847,6 +1058,22 @@ async def reconcile_schedules(
             ),
             policy=DAILY_SCHEDULE_POLICY,
             state=ScheduleState(note="Daily marketplace analytics synchronization"),
+        ),
+        CATALOG_REFRESH_SCHEDULE_ID: Schedule(
+            action=ScheduleActionStartWorkflow(
+                CatalogRefreshWorkflow.run,
+                id="merch-catalog-refresh",
+                task_queue=settings.temporal_task_queue,
+            ),
+            spec=ScheduleSpec(
+                cron_expressions=[
+                    f"{settings.catalog_refresh_minute} {settings.catalog_refresh_hour} "
+                    f"* * {settings.catalog_refresh_weekday}"
+                ],
+                time_zone_name=settings.schedule_timezone,
+            ),
+            policy=CATALOG_REFRESH_SCHEDULE_POLICY,
+            state=ScheduleState(note="Weekly resumable Printify catalog refresh"),
         ),
     }
     for schedule_id, schedule in schedules.items():
@@ -922,11 +1149,20 @@ async def run_worker(settings: Settings | None = None) -> None:
     worker = Worker(
         client,
         task_queue=settings.temporal_task_queue,
-        workflows=[MerchWorkflow, CatalogMerchWorkflow, RetryPublishWorkflow, AnalyticsWorkflow, DailyLauncherWorkflow,
-                   CopyRefreshPrepareWorkflow, CopyRefreshApplyWorkflow],
+        workflows=[
+            MerchWorkflow,
+            CatalogMerchWorkflow,
+            RetryPublishWorkflow,
+            AnalyticsWorkflow,
+            CatalogRefreshWorkflow,
+            DailyLauncherWorkflow,
+            CopyRefreshPrepareWorkflow,
+            CopyRefreshApplyWorkflow,
+        ],
         activities=[
             research_activity,
             research_catalog_activity,
+            resume_catalog_research_activity,
             attempt_catalog_activity,
             publish_catalog_activity,
             finish_no_qualified_activity,
@@ -943,6 +1179,11 @@ async def run_worker(settings: Settings | None = None) -> None:
             mark_failed_activity,
             mark_cancelled_activity,
             analytics_activity,
+            claim_catalog_refresh_activity,
+            discover_catalog_refresh_activity,
+            refresh_catalog_batch_activity,
+            finalize_catalog_refresh_activity,
+            fail_catalog_refresh_activity,
             launch_daily_activity,
             prepare_copy_refresh_activity,
             apply_copy_refresh_activity,

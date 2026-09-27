@@ -7,6 +7,8 @@ import re
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from itertools import cycle
+from itertools import product as cartesian_product
+from math import prod
 
 from merch.schemas import (
     CatalogProduct,
@@ -265,4 +267,48 @@ def reduce_variation_axes(
             item.variant_id,
         ),
     )
-    return ranked[:maximum_products]
+    if not ranked:
+        return []
+    matrix_axes = sorted({key for item in ranked for key in item.options})
+    if not matrix_axes:
+        return ranked[:maximum_products]
+    combinations: dict[tuple[str, ...], CatalogVariant] = {}
+    for item in ranked:
+        if all(axis in item.options for axis in matrix_axes):
+            combinations.setdefault(tuple(item.options[axis] for axis in matrix_axes), item)
+    if not combinations:
+        return []
+    values_by_axis: list[list[str]] = []
+    for index, _axis in enumerate(matrix_axes):
+        counts = Counter(key[index] for key in combinations)
+        first_rank = {
+            value: min(
+                position
+                for position, item in enumerate(ranked)
+                if item.options.get(matrix_axes[index]) == value
+            )
+            for value in counts
+        }
+        values_by_axis.append(
+            sorted(counts, key=lambda value: (-counts[value], first_rank[value], value))
+        )
+    best_keys: list[tuple[str, ...]] = []
+    best_score: tuple[int, int, tuple[int, ...]] = (0, 0, ())
+    ranges = [range(1, min(len(values), maximum_products) + 1) for values in values_by_axis]
+    for lengths in cartesian_product(*ranges):
+        count = prod(lengths)
+        if count > maximum_products:
+            continue
+        keys = list(
+            cartesian_product(
+                *(values[:length] for values, length in zip(values_by_axis, lengths, strict=True))
+            )
+        )
+        if not all(key in combinations for key in keys):
+            continue
+        score = (count, sum(lengths), lengths)
+        if score > best_score:
+            best_score = score
+            best_keys = keys
+    selected_ids = {combinations[key].variant_id for key in best_keys}
+    return [item for item in ranked if item.variant_id in selected_ids]

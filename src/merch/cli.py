@@ -40,6 +40,7 @@ from merch.temporal import (
     resume_researched_run,
     retry_failed_artwork_run,
     run_worker,
+    start_catalog_refresh,
     start_manual_run,
 )
 
@@ -75,7 +76,7 @@ def init_db() -> None:
 
 @app.command("schedule")
 def schedule() -> None:
-    """Create or update the daily analytics and production schedules at 09:30."""
+    """Reconcile daily production/analytics and weekly catalog schedules."""
     asyncio.run(reconcile_schedules())
     typer.echo("schedules reconciled")
 
@@ -138,11 +139,64 @@ def connections() -> None:
 
 
 @app.command("catalog-sync")
-def catalog_sync() -> None:
-    """Synchronize the complete supported Printify blueprint/provider catalog."""
-    from merch.services.catalog import sync_catalog
+def catalog_sync(
+    no_wait: Annotated[bool, typer.Option("--no-wait")] = False,
+) -> None:
+    """Start or resume the complete Printify catalog refresh."""
+    result = asyncio.run(start_catalog_refresh(wait=not no_wait))
+    result.pop("owner", None)
+    typer.echo(json.dumps(result, indent=2, default=str))
+    if not no_wait and result.get("status") == "failed":
+        raise typer.Exit(1)
 
-    typer.echo(json.dumps(asyncio.run(sync_catalog()), indent=2, default=str))
+
+@app.command("catalog-sync-status")
+def catalog_sync_status(sync_id: str | None = None) -> None:
+    """Show one catalog refresh, or the latest refresh when no ID is supplied."""
+    from merch.services.catalog import get_catalog_refresh, list_catalog_refreshes
+
+    try:
+        if sync_id is not None:
+            result: dict[str, object] | list[dict[str, object]] = get_catalog_refresh(sync_id)
+        else:
+            rows = list_catalog_refreshes(limit=1)
+            if not rows:
+                raise ValueError("no catalog refresh has been started")
+            result = rows[0]
+    except (KeyError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(result, indent=2, default=str))
+
+
+@app.command("catalog-recover-providers")
+def catalog_recover_providers(
+    sync_id: Annotated[str | None, typer.Option("--sync-id")] = None,
+) -> None:
+    """Retry unresolved providers and add only missing catalog products."""
+    from merch.services.catalog import (
+        recover_catalog_providers,
+        unresolved_catalog_provider_ids,
+    )
+
+    try:
+        provider_ids = unresolved_catalog_provider_ids(sync_id)
+        result = asyncio.run(recover_catalog_providers(provider_ids))
+    except (KeyError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(result, indent=2, default=str))
+
+
+@app.command("catalog-curate")
+def catalog_curate(
+    apply: Annotated[bool, typer.Option("--apply")] = False,
+) -> None:
+    """Select one high-quality synced product per broad product category."""
+    from merch.catalog_curation import curate_synced_catalog
+
+    result = curate_synced_catalog(apply=apply)
+    typer.echo(json.dumps(result, indent=2, default=str))
 
 
 @app.command("connect-browser")
@@ -152,9 +206,7 @@ def connect_browser(provider: str) -> None:
         raise typer.BadParameter("the only browser session currently supported is printify")
     from merch.services.browser_session import connect_printify_browser
 
-    typer.echo(
-        json.dumps(asyncio.run(connect_printify_browser()), indent=2, default=str)
-    )
+    typer.echo(json.dumps(asyncio.run(connect_printify_browser()), indent=2, default=str))
 
 
 @app.command("session-health")
@@ -195,9 +247,7 @@ def replace_published_artwork_command(
     artwork_file: Annotated[Path, typer.Option("--artwork-file")],
     apply: Annotated[bool, typer.Option("--apply")] = False,
     confirm: Annotated[str | None, typer.Option("--confirm")] = None,
-    quality_attestation: Annotated[
-        Path | None, typer.Option("--quality-attestation")
-    ] = None,
+    quality_attestation: Annotated[Path | None, typer.Option("--quality-attestation")] = None,
     mockup_timeout_seconds: Annotated[
         float, typer.Option("--mockup-timeout-seconds", min=30, max=3600)
     ] = 600,

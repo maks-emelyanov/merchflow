@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
+import time
 from datetime import date
+from itertools import pairwise
 from types import SimpleNamespace
 
 import httpx
@@ -15,10 +18,17 @@ from PIL import Image
 from merch.config import Settings
 from merch.defaults import fixture_product_template
 from merch.schemas import DesignMode, ResearchReport, TypographyProposal, TypographySpec
-from merch.services.openai_service import ModelResult, OpenAINonRetryableError, OpenAIService
+from merch.services.openai_service import (
+    ModelResult,
+    OpenAINonRetryableError,
+    OpenAIService,
+    _catalog_generation_size,
+    _resize_catalog_artwork,
+)
 from merch.services.printify import (
     AmbiguousCreateError,
     PrintifyClient,
+    PrintifyHTTPError,
     ProviderConfigurationError,
 )
 
@@ -109,6 +119,38 @@ async def test_openai_image_quality_defaults_to_medium() -> None:
     assert metadata["estimated_cost_usd"] == 0.01525
 
 
+@pytest.mark.parametrize(
+    ("surface_size"),
+    [(4500, 5100), (3909, 4431), (3319, 3761), (898, 898), (750, 750)],
+)
+def test_catalog_generation_size_satisfies_image_api_contract(
+    surface_size: tuple[int, int],
+) -> None:
+    width, height = _catalog_generation_size(*surface_size)
+
+    assert width % 16 == height % 16 == 0
+    assert max(width, height) <= 3840
+    assert 655_360 <= width * height <= 8_294_400
+    assert max(width / height, height / width) <= 3
+    target_ratio = surface_size[0] / surface_size[1]
+    assert abs(width / height - target_ratio) / target_ratio < 0.01
+
+
+def test_catalog_artwork_resampling_preserves_alpha_and_exact_dimensions() -> None:
+    source = Image.new("RGBA", (16, 16), (0, 0, 0, 0))
+    for x in range(8, 16):
+        for y in range(16):
+            source.putpixel((x, y), (255, 0, 0, 255))
+    encoded = io.BytesIO()
+    source.save(encoded, "PNG")
+
+    resized = _resize_catalog_artwork(encoded.getvalue(), 32, 48)
+
+    with Image.open(io.BytesIO(resized)) as output:
+        assert output.size == (32, 48)
+        assert output.convert("RGBA").getchannel("A").getextrema() == (0, 255)
+
+
 @pytest.mark.asyncio
 async def test_openai_image_edit_preserves_requested_source_size() -> None:
     fixture = OpenAIService(Settings())
@@ -184,10 +226,12 @@ async def test_typography_canonicalization_repairs_malformed_transport_fields(
     fixture = OpenAIService(Settings())
     concept = (await fixture.research(date.today(), "none")).value.candidates[0]
     slogan = " KILN WEATHER BUREAU\r\n\r\n HEAT ADVISORY IN EFFECT "
-    brief = (await fixture.creative(concept, {})).value.model_copy(update={
-        "slogan": slogan,
-        "palette": ["Cream (#F4E6CC)", "Midnight blue (#1A1F35)"],
-    })
+    brief = (await fixture.creative(concept, {})).value.model_copy(
+        update={
+            "slogan": slogan,
+            "palette": ["Cream (#F4E6CC)", "Midnight blue (#1A1F35)"],
+        }
+    )
     parsed = TypographyProposal(
         exact_text="WRONG WORDS",
         line_breaks=[""],
@@ -213,9 +257,7 @@ async def test_typography_canonicalization_repairs_malformed_transport_fields(
     result = await service.typography(slogan, brief)
 
     assert result.value.exact_text == "KILN WEATHER BUREAU\nHEAT ADVISORY IN EFFECT"
-    assert result.value.line_breaks == [
-        "KILN WEATHER BUREAU", "HEAT ADVISORY IN EFFECT"
-    ]
+    assert result.value.line_breaks == ["KILN WEATHER BUREAU", "HEAT ADVISORY IN EFFECT"]
     assert result.value.primary_color == "#F4E6CC"
     assert result.value.outline is None
     assert result.value.shadow is None
@@ -250,18 +292,14 @@ async def test_typography_preserves_soft_wraps_and_enforces_hard_breaks(
         )
 
     soft_slogan = "KILN WEATHER BUREAU HEAT ADVISORY IN EFFECT"
-    parsed = typography(
-        soft_slogan, ["KILN WEATHER BUREAU", "HEAT ADVISORY IN EFFECT"]
-    )
+    parsed = typography(soft_slogan, ["KILN WEATHER BUREAU", "HEAT ADVISORY IN EFFECT"])
 
     async def parse(*args, **kwargs):  # type: ignore[no-untyped-def]
         return ModelResult(parsed, {"model": "fixture"})
 
     monkeypatch.setattr(service, "_parse", parse)
     result = await service.typography(soft_slogan, brief)
-    assert result.value.line_breaks == [
-        "KILN WEATHER BUREAU", "HEAT ADVISORY IN EFFECT"
-    ]
+    assert result.value.line_breaks == ["KILN WEATHER BUREAU", "HEAT ADVISORY IN EFFECT"]
     assert result.value.vertical_placement == "bottom"
 
     hard_slogan = "KILN WEATHER BUREAU\nHEAT ADVISORY IN EFFECT"
@@ -273,9 +311,7 @@ async def test_typography_preserves_soft_wraps_and_enforces_hard_breaks(
         hard_slogan, brief.model_copy(update={"design_mode": DesignMode.TYPOGRAPHY})
     )
     assert result.value.exact_text == hard_slogan
-    assert result.value.line_breaks == [
-        "KILN WEATHER BUREAU", "HEAT ADVISORY IN EFFECT"
-    ]
+    assert result.value.line_breaks == ["KILN WEATHER BUREAU", "HEAT ADVISORY IN EFFECT"]
     assert result.value.vertical_placement == "center"
 
 
@@ -327,6 +363,257 @@ async def test_printify_ambiguous_create_is_not_blindly_retried() -> None:
 
 
 @pytest.mark.asyncio
+async def test_printify_get_honors_retry_after_on_rate_limit(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls = 0
+    delays: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "3"},
+                request=request,
+            )
+        return httpx.Response(200, json=[], request=request)
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("merch.services.printify.asyncio.sleep", sleep)
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.printify.com/v1"
+    )
+    client = PrintifyClient(
+        Settings(
+            printify_api_token="token",
+            printify_request_interval_seconds=0,
+            printify_catalog_request_interval_seconds=0,
+        ),
+        client=http,
+    )
+    try:
+        assert await client.blueprints() == []
+        assert calls == 2
+        assert delays == [3.0]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_printify_ranked_blueprints_use_public_bestsellers_without_auth() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/product-catalog-service/api/v1/blueprints/search"
+        assert request.url.params.get("tags[]") == "Bestsellers"
+        assert "authorization" not in request.headers
+        return httpx.Response(
+            200,
+            json={
+                "total": 2,
+                "data": [
+                    {"blueprintId": 706, "name": "Garment-Dyed T-shirt"},
+                    {"blueprintId": 440, "name": "Staple Tee"},
+                ],
+            },
+            request=request,
+        )
+
+    public_http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://printify.com",
+    )
+    api_http = httpx.AsyncClient(base_url="https://api.printify.com/v1")
+    client = PrintifyClient(
+        Settings(printify_api_token="private-token"),
+        client=api_http,
+        public_client=public_http,
+    )
+    try:
+        assert [item["blueprintId"] for item in await client.ranked_blueprints()] == [
+            706,
+            440,
+        ]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_printify_get_honors_retry_after_on_server_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls = 0
+    delays: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                503,
+                headers={"Retry-After": "4"},
+                request=request,
+            )
+        return httpx.Response(200, json={}, request=request)
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("merch.services.printify.asyncio.sleep", sleep)
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.printify.com/v1"
+    )
+    client = PrintifyClient(
+        Settings(
+            printify_api_token="token",
+            printify_catalog_request_interval_seconds=0,
+        ),
+        client=http,
+    )
+    try:
+        assert await client.blueprint(6) == {}
+        assert calls == 2
+        assert delays == [4.0]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_printify_get_retries_transient_invalid_scope_response(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls = 0
+    delays: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                403,
+                json={"error": "Invalid scope(s) provided."},
+                request=request,
+            )
+        return httpx.Response(200, json=[], request=request)
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("merch.services.printify.asyncio.sleep", sleep)
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.printify.com/v1"
+    )
+    client = PrintifyClient(
+        Settings(
+            printify_api_token="token",
+            printify_catalog_request_interval_seconds=0,
+        ),
+        client=http,
+    )
+    try:
+        assert await client.catalog_print_providers() == []
+        assert calls == 2
+        assert delays == [1.0]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_printify_get_does_not_retry_other_forbidden_response(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls = 0
+    delays: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(403, json={"error": "Forbidden"}, request=request)
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("merch.services.printify.asyncio.sleep", sleep)
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.printify.com/v1"
+    )
+    client = PrintifyClient(
+        Settings(
+            printify_api_token="token",
+            printify_catalog_request_interval_seconds=0,
+        ),
+        client=http,
+    )
+    try:
+        with pytest.raises(PrintifyHTTPError, match="status 403"):
+            await client.catalog_print_providers()
+        assert calls == 1
+        assert delays == []
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_printify_catalog_failure_is_typed() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(410, request=request)
+
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.printify.com/v1"
+    )
+    client = PrintifyClient(
+        Settings(
+            printify_api_token="token",
+            printify_catalog_request_interval_seconds=0,
+        ),
+        client=http,
+    )
+    try:
+        with pytest.raises(PrintifyHTTPError) as captured:
+            await client.blueprint(5811)
+        assert captured.value.method == "GET"
+        assert captured.value.path == "/catalog/blueprints/5811.json"
+        assert captured.value.status == captured.value.status_code == 410
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_printify_catalog_pacer_is_shared_and_bounds_concurrency() -> None:
+    active = 0
+    maximum_active = 0
+    starts: list[float] = []
+    first_four_started = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        starts.append(time.monotonic())
+        if len(starts) == 4:
+            first_four_started.set()
+        await first_four_started.wait()
+        await asyncio.sleep(0.015)
+        active -= 1
+        return httpx.Response(200, json=[], request=request)
+
+    settings = Settings(
+        printify_api_token="token",
+        printify_catalog_request_interval_seconds=0.01,
+    )
+    clients = [
+        PrintifyClient(
+            settings,
+            client=httpx.AsyncClient(
+                transport=httpx.MockTransport(handler),
+                base_url="https://api.printify.com/v1",
+            ),
+        )
+        for _ in range(2)
+    ]
+    try:
+        await asyncio.gather(*(client.blueprints() for client in clients for _ in range(4)))
+        assert maximum_active == 4
+        assert all(later - earlier >= 0.007 for earlier, later in pairwise(starts))
+    finally:
+        await asyncio.gather(*(client.close() for client in clients))
+
+
+@pytest.mark.asyncio
 async def test_printify_orders_uses_supported_page_parameter_only() -> None:
     paths = []
 
@@ -344,42 +631,105 @@ async def test_printify_orders_uses_supported_page_parameter_only() -> None:
 
 
 @pytest.mark.asyncio
+async def test_printify_product_reconciliation_uses_page_pagination() -> None:
+    paths: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(str(request.url))
+        page = int(request.url.params["page"])
+        product = {
+            "id": "product-7",
+            "title": "Approved listing title",
+            "print_areas": [
+                {
+                    "placeholders": [
+                        {
+                            "images": [
+                                {"id": "upload-9"},
+                            ]
+                        }
+                    ]
+                }
+            ],
+        }
+        return httpx.Response(
+            200,
+            json={
+                "data": [] if page == 1 else [product],
+                "current_page": page,
+                "last_page": 2,
+                "per_page": 50,
+            },
+            request=request,
+        )
+
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://api.printify.com/v1",
+    )
+    client = PrintifyClient(
+        Settings(
+            provider_mode="live",
+            publish_mode="live",
+            printify_api_token="token",
+        ),
+        client=http,
+    )
+    try:
+        matches = await client.reconcile_product("shop-3", "upload-9", "Approved listing title")
+    finally:
+        await client.close()
+
+    assert [item["id"] for item in matches] == ["product-7"]
+    assert paths == [
+        "https://api.printify.com/v1/shops/shop-3/products.json?page=1",
+        "https://api.printify.com/v1/shops/shop-3/products.json?page=2",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_printify_template_validation_refreshes_and_checks_print_area() -> None:
     incompatible = False
 
     async def handler(request: httpx.Request) -> httpx.Response:
         second_width = 4000 if incompatible else 4494
-        return httpx.Response(200, json={
-            "variants": [
-                {
-                    "id": 1001,
-                    "cost": 975,
-                    "placeholders": [{
-                        "position": "front",
-                        "decoration_method": "dtg",
-                        "width": 3703,
-                        "height": 4200,
-                    }],
-                },
-                {
-                    "id": 1002,
-                    "cost": 1075,
-                    "placeholders": [{
-                        "position": "front",
-                        "decoration_method": "dtg",
-                        "width": second_width,
-                        "height": 5097,
-                    }],
-                },
-            ]
-        }, request=request)
+        return httpx.Response(
+            200,
+            json={
+                "variants": [
+                    {
+                        "id": 1001,
+                        "cost": 975,
+                        "placeholders": [
+                            {
+                                "position": "front",
+                                "decoration_method": "dtg",
+                                "width": 3703,
+                                "height": 4200,
+                            }
+                        ],
+                    },
+                    {
+                        "id": 1002,
+                        "cost": 1075,
+                        "placeholders": [
+                            {
+                                "position": "front",
+                                "decoration_method": "dtg",
+                                "width": second_width,
+                                "height": 5097,
+                            }
+                        ],
+                    },
+                ]
+            },
+            request=request,
+        )
 
     http = httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="https://api.printify.com/v1"
     )
-    client = PrintifyClient(
-        Settings(provider_mode="live", printify_api_token="token"), client=http
-    )
+    client = PrintifyClient(Settings(provider_mode="live", printify_api_token="token"), client=http)
     try:
         current = await client.validate_template(fixture_product_template())
         assert (current.print_width, current.print_height) == (4494, 5097)
@@ -403,13 +753,17 @@ async def test_printify_updates_only_print_areas_on_existing_product() -> None:
         transport=httpx.MockTransport(handler), base_url="https://api.printify.com/v1"
     )
     client = PrintifyClient(Settings(printify_api_token="token"), client=http)
-    print_areas = [{
-        "variant_ids": [101, 102],
-        "placeholders": [{
-            "position": "front",
-            "images": [{"id": "new-upload", "x": 0.5, "y": 0.5, "scale": 1.0, "angle": 0}],
-        }],
-    }]
+    print_areas = [
+        {
+            "variant_ids": [101, 102],
+            "placeholders": [
+                {
+                    "position": "front",
+                    "images": [{"id": "new-upload", "x": 0.5, "y": 0.5, "scale": 1.0, "angle": 0}],
+                }
+            ],
+        }
+    ]
     try:
         assert await client.update_product_print_areas("shop-3", "product-7", print_areas) == {
             "id": "product-7"
@@ -418,6 +772,38 @@ async def test_printify_updates_only_print_areas_on_existing_product() -> None:
         assert requests[0].method == "PUT"
         assert requests[0].url.path == "/v1/shops/shop-3/products/product-7.json"
         assert json.loads(requests[0].content) == {"print_areas": print_areas}
+    finally:
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_printify_updates_mutable_catalog_product_fields() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "product-7"}, request=request)
+
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.printify.com/v1"
+    )
+    client = PrintifyClient(Settings(printify_api_token="token"), client=http)
+    payload = {
+        "title": "Updated",
+        "description": "Updated description",
+        "tags": ["updated"],
+        "blueprint_id": 5,
+        "print_provider_id": 99,
+        "variants": [{"id": 101, "price": 1999, "is_enabled": True}],
+        "print_areas": [{"variant_ids": [101], "placeholders": []}],
+    }
+    try:
+        assert await client.update_catalog_product("shop-3", "product-7", payload) == {
+            "id": "product-7"
+        }
+        sent = json.loads(requests[0].content)
+        assert set(sent) == {"title", "description", "tags", "variants", "print_areas"}
+        assert requests[0].method == "PUT"
     finally:
         await http.aclose()
 

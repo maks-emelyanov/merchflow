@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from merch.domain.concept_ranking import concept_score_breakdown
@@ -15,7 +16,9 @@ from merch.models import (
     ArtifactRecord,
     AuditEvent,
     BrowserSessionRecord,
+    CatalogCurationRecord,
     CatalogProductRecord,
+    CatalogRefreshRecord,
     CatalogVariantRecord,
     CompetitorListingRecord,
     ConceptRecord,
@@ -325,7 +328,7 @@ class RunRepository:
         opportunity: ProductOpportunity,
         reference_analysis: ReferenceAnalysis,
         plan: ProductPlanV2,
-        originality: OriginalityReport,
+        originality: OriginalityReport | None,
         seo: SEOEvidence,
         prices: list[PriceDecision],
         listings: dict[str, Any],
@@ -335,7 +338,9 @@ class RunRepository:
         record.selected_opportunity = opportunity.model_dump(mode="json")
         record.reference_analysis = reference_analysis.model_dump(mode="json")
         record.product_plan = plan.model_dump(mode="json")
-        record.originality_report = originality.model_dump(mode="json")
+        record.originality_report = (
+            originality.model_dump(mode="json") if originality is not None else None
+        )
         record.seo_evidence = seo.model_dump(mode="json")
         record.price_decisions = [item.model_dump(mode="json") for item in prices]
         record.listings = listings
@@ -599,6 +604,145 @@ class ConfigurationRepository:
         return record
 
 
+class CatalogRefreshRepository:
+    ACTIVE_LEASE = "active"
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    @staticmethod
+    def payload(record: CatalogRefreshRecord) -> dict[str, Any]:
+        return {
+            "sync_id": record.id,
+            "workflow_id": record.workflow_id,
+            "status": record.status,
+            "cursor": record.cursor,
+            "blueprint_count": record.blueprint_count,
+            "provider_count": record.provider_count,
+            "total_pairs": record.total_pairs,
+            "refreshed_products": record.refreshed_products,
+            "skipped_products": record.skipped_products,
+            "retired_products": record.retired_products,
+            "warning_count": record.warning_count,
+            "warning_samples": list(record.warning_samples or []),
+            "error": record.error,
+            "started_at": record.started_at,
+            "updated_at": record.updated_at,
+            "completed_at": record.completed_at,
+        }
+
+    def get(self, refresh_id: str) -> CatalogRefreshRecord:
+        record = self.session.get(CatalogRefreshRecord, refresh_id)
+        if record is None:
+            raise KeyError(f"catalog refresh {refresh_id} not found")
+        return record
+
+    def list_refreshes(self, limit: int = 20) -> list[CatalogRefreshRecord]:
+        return list(
+            self.session.scalars(
+                select(CatalogRefreshRecord)
+                .order_by(CatalogRefreshRecord.started_at.desc())
+                .limit(limit)
+            )
+        )
+
+    def claim(self, workflow_id: str) -> tuple[CatalogRefreshRecord, bool, bool]:
+        existing = self.session.scalar(
+            select(CatalogRefreshRecord)
+            .where(CatalogRefreshRecord.active_lease == self.ACTIVE_LEASE)
+            .with_for_update()
+        )
+        if existing is not None:
+            resumed = True
+            if existing.status == "failed":
+                existing.workflow_id = workflow_id
+                existing.status = "pending"
+                existing.error = None
+                existing.updated_at = datetime.now(UTC)
+                return existing, resumed, True
+            return existing, resumed, existing.workflow_id == workflow_id
+        record = CatalogRefreshRecord(
+            id=str(uuid4()),
+            workflow_id=workflow_id,
+            status="pending",
+            active_lease=self.ACTIVE_LEASE,
+            warning_samples=[],
+        )
+        self.session.add(record)
+        try:
+            self.session.flush()
+        except IntegrityError:
+            self.session.rollback()
+            winner = self.session.scalar(
+                select(CatalogRefreshRecord).where(
+                    CatalogRefreshRecord.active_lease == self.ACTIVE_LEASE
+                )
+            )
+            if winner is None:
+                raise
+            return winner, True, False
+        return record, False, True
+
+    def store_manifest(
+        self,
+        refresh_id: str,
+        manifest: dict[str, Any],
+        *,
+        warnings: list[dict[str, Any]],
+    ) -> CatalogRefreshRecord:
+        record = self.get(refresh_id)
+        record.manifest = manifest
+        record.status = "running"
+        record.blueprint_count = len(manifest.get("blueprints", {}))
+        record.provider_count = len(manifest.get("providers", {}))
+        record.total_pairs = len(manifest.get("pairs", []))
+        record.warning_count += len(warnings)
+        record.warning_samples = [*(record.warning_samples or []), *warnings][:100]
+        record.error = None
+        record.updated_at = datetime.now(UTC)
+        return record
+
+    def record_batch(
+        self,
+        refresh_id: str,
+        *,
+        cursor: int,
+        refreshed: int,
+        skipped: int,
+        warnings: list[dict[str, Any]],
+    ) -> CatalogRefreshRecord:
+        record = self.get(refresh_id)
+        record.status = "running"
+        record.cursor = max(record.cursor, cursor)
+        record.refreshed_products += refreshed
+        record.skipped_products += skipped
+        record.warning_count += len(warnings)
+        record.warning_samples = [*(record.warning_samples or []), *warnings][:100]
+        record.updated_at = datetime.now(UTC)
+        return record
+
+    def fail(self, refresh_id: str, error: str) -> CatalogRefreshRecord:
+        record = self.get(refresh_id)
+        if record.status in {"completed", "completed_with_warnings"}:
+            return record
+        record.status = "failed"
+        record.error = error[:4000]
+        record.updated_at = datetime.now(UTC)
+        return record
+
+    def complete(self, refresh_id: str, retired: int) -> CatalogRefreshRecord:
+        record = self.get(refresh_id)
+        record.status = "completed_with_warnings" if record.warning_count else "completed"
+        record.retired_products = retired
+        record.cursor = record.total_pairs
+        record.manifest = None
+        record.active_lease = None
+        record.error = None
+        record.completed_at = datetime.now(UTC)
+        record.updated_at = record.completed_at
+        return record
+
+
 class CatalogRepository:
     def __init__(self, session: Session):
         self.session = session
@@ -607,7 +751,13 @@ class CatalogRepository:
     def product_key(blueprint_id: int, print_provider_id: int) -> str:
         return f"{blueprint_id}:{print_provider_id}"
 
-    def upsert_product(self, product: CatalogProduct) -> CatalogProductRecord:
+    def upsert_product(
+        self,
+        product: CatalogProduct,
+        *,
+        refresh_id: str | None = None,
+        printify_rank: int | None = None,
+    ) -> CatalogProductRecord:
         key = self.product_key(product.blueprint_id, product.print_provider_id)
         record = self.session.get(CatalogProductRecord, key)
         if record is None:
@@ -619,6 +769,10 @@ class CatalogRepository:
                 data=product.model_dump(mode="json"),
                 source_fingerprint=product.source_fingerprint,
                 synced_at=product.synced_at,
+                active=True,
+                printify_rank=printify_rank,
+                last_seen_refresh_id=refresh_id,
+                last_checked_at=product.synced_at,
             )
             self.session.add(record)
         else:
@@ -626,6 +780,13 @@ class CatalogRepository:
             record.data = product.model_dump(mode="json")
             record.source_fingerprint = product.source_fingerprint
             record.synced_at = product.synced_at
+            record.active = True
+            if printify_rank is not None:
+                record.printify_rank = printify_rank
+            if refresh_id is not None:
+                record.last_seen_refresh_id = refresh_id
+            record.last_checked_at = product.synced_at
+            record.refresh_error = None
             self.session.query(CatalogVariantRecord).filter(
                 CatalogVariantRecord.product_key == key
             ).delete()
@@ -643,24 +804,246 @@ class CatalogRepository:
         self.session.flush()
         return record
 
-    def get(self, blueprint_id: int, print_provider_id: int) -> CatalogProduct:
+    def get(
+        self, blueprint_id: int, print_provider_id: int, *, include_inactive: bool = False
+    ) -> CatalogProduct:
+        record = self.session.get(
+            CatalogProductRecord, self.product_key(blueprint_id, print_provider_id)
+        )
+        if record is None or (not include_inactive and not record.active):
+            raise KeyError(f"catalog product {blueprint_id}/{print_provider_id} not found")
+        return CatalogProduct.model_validate(record.data)
+
+    def list_products(self, *, include_inactive: bool = False) -> list[CatalogProduct]:
+        statement = select(CatalogProductRecord)
+        if not include_inactive:
+            statement = statement.where(CatalogProductRecord.active.is_(True))
+        statement = statement.order_by(
+            CatalogProductRecord.blueprint_id,
+            CatalogProductRecord.print_provider_id,
+        )
+        return [
+            CatalogProduct.model_validate(item.data) for item in self.session.scalars(statement)
+        ]
+
+    def list_curated_products(self, *, popular_only: bool = False) -> list[CatalogProduct]:
+        statement = (
+            select(CatalogProductRecord)
+            .join(
+                CatalogCurationRecord,
+                CatalogCurationRecord.product_key == CatalogProductRecord.key,
+            )
+            .where(CatalogProductRecord.active.is_(True))
+        )
+        if popular_only:
+            statement = statement.where(
+                CatalogProductRecord.printify_rank.is_not(None)
+            ).order_by(
+                CatalogProductRecord.printify_rank,
+                CatalogCurationRecord.display_name,
+            )
+        else:
+            statement = statement.order_by(CatalogCurationRecord.display_name)
+        return [
+            CatalogProduct.model_validate(item.data) for item in self.session.scalars(statement)
+        ]
+
+    def list_effective_products(self) -> list[CatalogProduct]:
+        """Return curated options when configured, otherwise the full active catalog."""
+        if not self.has_curations():
+            return self.list_products()
+        return self.list_curated_products()
+
+    def list_research_products(self) -> list[CatalogProduct]:
+        """Return only exact Printify-ranked products for marketplace research."""
+        if not self.has_curations():
+            return self.list_ranked_products()
+        return self.list_curated_products(popular_only=True)
+
+    def list_ranked_products(self) -> list[CatalogProduct]:
+        statement = (
+            select(CatalogProductRecord)
+            .where(
+                CatalogProductRecord.active.is_(True),
+                CatalogProductRecord.printify_rank.is_not(None),
+            )
+            .order_by(
+                CatalogProductRecord.printify_rank,
+                CatalogProductRecord.blueprint_id,
+                CatalogProductRecord.print_provider_id,
+            )
+        )
+        return [
+            CatalogProduct.model_validate(item.data) for item in self.session.scalars(statement)
+        ]
+
+    def rank_by_blueprint(self) -> dict[int, int]:
+        rows = self.session.execute(
+            select(CatalogProductRecord.blueprint_id, CatalogProductRecord.printify_rank).where(
+                CatalogProductRecord.active.is_(True),
+                CatalogProductRecord.printify_rank.is_not(None),
+            )
+        )
+        return {int(blueprint_id): int(rank) for blueprint_id, rank in rows if rank is not None}
+
+    def apply_blueprint_ranks(self, ranks: dict[int, int]) -> int:
+        if not ranks:
+            return 0
+        records = self.session.scalars(
+            select(CatalogProductRecord).where(
+                CatalogProductRecord.active.is_(True),
+                CatalogProductRecord.blueprint_id.in_(ranks),
+            )
+        )
+        updated = 0
+        for record in records:
+            rank = ranks[record.blueprint_id]
+            if record.printify_rank != rank:
+                record.printify_rank = rank
+                updated += 1
+        return updated
+
+    def has_curations(self) -> bool:
+        return self.session.scalar(select(CatalogCurationRecord.category).limit(1)) is not None
+
+    def replace_curations(self, selections: list[dict[str, Any]]) -> None:
+        product_keys = [str(item["product_key"]) for item in selections]
+        if len(product_keys) != len(set(product_keys)):
+            raise ValueError("one catalog product cannot represent multiple categories")
+        active_keys = set(
+            self.session.scalars(
+                select(CatalogProductRecord.key).where(
+                    CatalogProductRecord.key.in_(product_keys),
+                    CatalogProductRecord.active.is_(True),
+                )
+            )
+        )
+        missing = sorted(set(product_keys) - active_keys)
+        if missing:
+            raise ValueError(f"curation contains inactive or missing products: {missing}")
+        self.session.query(CatalogCurationRecord).delete()
+        curated_at = datetime.now(UTC)
+        for item in selections:
+            self.session.add(
+                CatalogCurationRecord(
+                    category=str(item["category"]),
+                    display_name=str(item["display_name"]),
+                    product_key=str(item["product_key"]),
+                    quality_score=int(item["quality_score"]),
+                    reasons=[str(reason) for reason in item["reasons"]],
+                    research_priority=(
+                        int(item["research_priority"])
+                        if item.get("research_priority") is not None
+                        else None
+                    ),
+                    popularity_reason=(
+                        str(item["popularity_reason"])
+                        if item.get("popularity_reason") is not None
+                        else None
+                    ),
+                    algorithm_version=str(item["algorithm_version"]),
+                    curated_at=curated_at,
+                )
+            )
+        self.session.flush()
+
+    def curation_rows(self) -> list[dict[str, Any]]:
+        statement = (
+            select(CatalogCurationRecord, CatalogProductRecord)
+            .join(
+                CatalogProductRecord,
+                CatalogProductRecord.key == CatalogCurationRecord.product_key,
+            )
+            .order_by(CatalogCurationRecord.display_name)
+        )
+        return [
+            {
+                "category": curation.category,
+                "display_name": curation.display_name,
+                "product_key": curation.product_key,
+                "quality_score": curation.quality_score,
+                "reasons": curation.reasons,
+                "research_priority": curation.research_priority,
+                "popularity_reason": curation.popularity_reason,
+                "algorithm_version": curation.algorithm_version,
+                "curated_at": curation.curated_at,
+                "product": CatalogProduct.model_validate(product.data),
+                "active": product.active,
+            }
+            for curation, product in self.session.execute(statement)
+        ]
+
+    def active_count(self) -> int:
+        return len(self.active_keys())
+
+    def active_keys(self) -> set[str]:
+        return set(
+            self.session.scalars(
+                select(CatalogProductRecord.key).where(CatalogProductRecord.active.is_(True))
+            )
+        )
+
+    def tags_by_blueprint(self, blueprint_ids: set[int]) -> dict[int, list[str]]:
+        if not blueprint_ids:
+            return {}
+        result: dict[int, list[str]] = {}
+        records = self.session.scalars(
+            select(CatalogProductRecord).where(CatalogProductRecord.blueprint_id.in_(blueprint_ids))
+        )
+        for record in records:
+            tags = record.data.get("tags") or []
+            if tags and record.blueprint_id not in result:
+                result[record.blueprint_id] = [str(item) for item in tags]
+        return result
+
+    def mark_unavailable(self, blueprint_id: int, print_provider_id: int, error: str) -> bool:
         record = self.session.get(
             CatalogProductRecord, self.product_key(blueprint_id, print_provider_id)
         )
         if record is None:
-            raise KeyError(f"catalog product {blueprint_id}/{print_provider_id} not found")
-        return CatalogProduct.model_validate(record.data)
+            return False
+        record.active = False
+        record.last_checked_at = datetime.now(UTC)
+        record.refresh_error = error[:4000]
+        return True
 
-    def list_products(self) -> list[CatalogProduct]:
-        return [
-            CatalogProduct.model_validate(item.data)
-            for item in self.session.scalars(
-                select(CatalogProductRecord).order_by(
-                    CatalogProductRecord.blueprint_id,
-                    CatalogProductRecord.print_provider_id,
-                )
+    def retire_not_seen(
+        self,
+        refresh_id: str,
+        *,
+        preserve_provider_ids: set[int] | None = None,
+        preserve_blueprint_ids: set[int] | None = None,
+        allowed_blueprint_ids: set[int] | None = None,
+    ) -> int:
+        preserve_provider_ids = preserve_provider_ids or set()
+        preserve_blueprint_ids = preserve_blueprint_ids or set()
+        active = list(
+            self.session.scalars(
+                select(CatalogProductRecord).where(CatalogProductRecord.active.is_(True))
             )
-        ]
+        )
+        stale: list[CatalogProductRecord] = []
+        for record in active:
+            is_allowed = (
+                allowed_blueprint_ids is None
+                or record.blueprint_id in allowed_blueprint_ids
+            )
+            was_seen = record.last_seen_refresh_id == refresh_id
+            is_preserved = (
+                record.print_provider_id in preserve_provider_ids
+                or record.blueprint_id in preserve_blueprint_ids
+            )
+            if not is_allowed or (not was_seen and not is_preserved):
+                stale.append(record)
+        for record in stale:
+            record.active = False
+            record.last_checked_at = datetime.now(UTC)
+            if allowed_blueprint_ids is not None and record.blueprint_id not in allowed_blueprint_ids:
+                record.printify_rank = None
+                record.refresh_error = "not present in current Printify Bestsellers ranking"
+            else:
+                record.refresh_error = "not present in completed Printify provider snapshot"
+        return len(stale)
 
     def prune_products(self, active_keys: set[str]) -> int:
         if not active_keys:
@@ -671,7 +1054,9 @@ class CatalogRepository:
             )
         )
         for record in stale:
-            self.session.delete(record)
+            record.active = False
+            record.last_checked_at = datetime.now(UTC)
+            record.refresh_error = "not present in active catalog snapshot"
         return len(stale)
 
     def observe_cost(

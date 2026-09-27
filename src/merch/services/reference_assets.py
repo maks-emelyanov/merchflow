@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import httpx
 from PIL import Image, ImageDraw
 
-from merch.schemas import MarketplaceSource, ProductOpportunity
+from merch.schemas import CompetitorListingSnapshot, MarketplaceSource, ProductOpportunity
 
 IMAGE_HOST_SUFFIXES = {
     MarketplaceSource.ETSY: ("etsy.com", "etsystatic.com", "etsycdn.com"),
@@ -56,12 +56,29 @@ def _fixture_reference(label: str, index: int) -> bytes:
     return output.getvalue()
 
 
+def select_reference_listings(
+    opportunity: ProductOpportunity,
+    *,
+    fake: bool,
+) -> list[CompetitorListingSnapshot]:
+    selected = (
+        opportunity.comparable_listings[:3]
+        if fake
+        else [item for item in opportunity.comparable_listings if item.image_urls][:3]
+    )
+    if len(selected) < 3:
+        raise RuntimeError(
+            "opportunity has fewer than three comparable listings with image evidence"
+        )
+    return selected
+
+
 async def acquire_reference_images(
     opportunity: ProductOpportunity,
     *,
     fake: bool,
 ) -> list[tuple[str, bytes]]:
-    selected = opportunity.comparable_listings[:3]
+    selected = select_reference_listings(opportunity, fake=fake)
     if fake:
         return [
             (item.external_listing_id, _fixture_reference(item.product_type, index))

@@ -25,7 +25,7 @@ from merch.domain.originality import evaluate_originality, make_contact_sheet
 from merch.domain.pricing import comparable_median_delivered, competitive_price
 from merch.domain.seo import build_seo_evidence, copied_listing_wording, validate_seo_listing
 from merch.models import ArtifactRecord, OpportunityRecord, ProductTemplateRecord
-from merch.repository import CatalogRepository, ConfigurationRepository, RunRepository
+from merch.repository import ConfigurationRepository, RunRepository
 from merch.schemas import (
     ApprovalSignal,
     CandidateConcept,
@@ -43,16 +43,64 @@ from merch.schemas import (
     SurfaceArtwork,
 )
 from merch.services.browser_session import collect_printify_costs
-from merch.services.catalog import sync_catalog
+from merch.services.catalog import (
+    CatalogProductUnavailable,
+    refresh_catalog_candidates,
+    refresh_catalog_product,
+)
 from merch.services.etsy_catalog import resolve_etsy_profile
 from merch.services.marketplace_research import collect_marketplace_evidence
 from merch.services.openai_service import OpenAIService
-from merch.services.reference_assets import acquire_reference_images
+from merch.services.printify import PRINTIFY_MAX_ENABLED_VARIANTS
+from merch.services.reference_assets import (
+    acquire_reference_images,
+    select_reference_listings,
+)
 from merch.services.storage import ArtifactStorage
 
 
 class OpportunityRejected(RuntimeError):
     """A candidate failed a hard gate and the workflow should try the next one."""
+
+
+def _reusable_ip_report(
+    payload: dict[str, Any] | None,
+    provider_calls: list[dict[str, Any]] | None,
+    opportunity_id: str,
+) -> IPScreeningReport | None:
+    if payload is None:
+        return None
+    latest = next(
+        (
+            call
+            for call in reversed(provider_calls or [])
+            if call.get("stage") == "catalog_ip_screen"
+        ),
+        None,
+    )
+    if latest is None or str(latest.get("opportunity_id") or "") != opportunity_id:
+        return None
+    return IPScreeningReport.model_validate(payload)
+
+
+def _reusable_reference_analysis(
+    payload: dict[str, Any] | None,
+    provider_calls: list[dict[str, Any]] | None,
+    opportunity_id: str,
+) -> ReferenceAnalysis | None:
+    if payload is None:
+        return None
+    latest = next(
+        (
+            call
+            for call in reversed(provider_calls or [])
+            if call.get("stage") == "reference_analysis"
+        ),
+        None,
+    )
+    if latest is None or str(latest.get("opportunity_id") or "") != opportunity_id:
+        return None
+    return ReferenceAnalysis.model_validate(payload)
 
 
 def _ensure_template(settings: Settings) -> None:
@@ -68,11 +116,11 @@ async def research_catalog_run(run_id: str, settings: Settings | None = None) ->
     _ensure_template(settings)
     with session_scope() as session:
         RunRepository(session).status(run_id, RunStatus.RESEARCHING)
-    await sync_catalog(settings)
-    with session_scope() as session:
-        catalog = CatalogRepository(session).list_products()
+    candidate_catalog, catalog_refresh = await refresh_catalog_candidates(
+        settings.research_query_limit, settings
+    )
     costed_catalog = []
-    for product in catalog:
+    for product in candidate_catalog:
         costs = await collect_printify_costs(product, settings)
         costed_catalog.append(
             product.model_copy(
@@ -86,9 +134,9 @@ async def research_catalog_run(run_id: str, settings: Settings | None = None) ->
                 }
             )
         )
-    catalog = costed_catalog
+    candidate_catalog = costed_catalog
     evidence_by_product: dict[tuple[int, int], list[Any]] = {}
-    for product in catalog[: settings.research_query_limit]:
+    for product in candidate_catalog:
         snapshots = await collect_marketplace_evidence(product.title, settings)
         now = datetime.now(UTC)
         fresh = [
@@ -102,7 +150,7 @@ async def research_catalog_run(run_id: str, settings: Settings | None = None) ->
             )
         ]
         evidence_by_product[(product.blueprint_id, product.print_provider_id)] = fresh
-    opportunities = build_opportunities(catalog, evidence_by_product, count=25)
+    opportunities = build_opportunities(candidate_catalog, evidence_by_product, count=25)
     with session_scope() as session:
         repository = RunRepository(session)
         repository.store_opportunities(run_id, opportunities)
@@ -111,7 +159,11 @@ async def research_catalog_run(run_id: str, settings: Settings | None = None) ->
             "worker",
             "catalog.researched",
             {
-                "catalog_products": len(catalog),
+                "catalog_products": catalog_refresh["active_products"],
+                "researched_products": len(candidate_catalog),
+                "catalog_refreshed_products": catalog_refresh["refreshed_products"],
+                "catalog_skipped_products": catalog_refresh["skipped_products"],
+                "oldest_catalog_age_hours": catalog_refresh["oldest_catalog_age_hours"],
                 "opportunities": len(opportunities),
                 "listing_evidence": sum(len(items) for items in evidence_by_product.values()),
                 "sources": ["etsy", "amazon_us", "tiktok_shop", "walmart", "ebay"],
@@ -126,6 +178,27 @@ async def research_catalog_run(run_id: str, settings: Settings | None = None) ->
         else:
             repository.status(run_id, RunStatus.RANKING)
     return len(opportunities)
+
+
+def resume_catalog_research(run_id: str) -> int:
+    """Reuse a failed v2 run's committed opportunities without recollecting evidence."""
+    with session_scope() as session:
+        repository = RunRepository(session)
+        record = repository.get(run_id, full=True)
+        count = len(record.opportunities)
+        if count == 0:
+            raise ValueError("Catalog research cannot resume without saved opportunities")
+        repository.status(run_id, RunStatus.RANKING)
+        repository.audit(
+            run_id,
+            "worker",
+            "catalog.research_reused",
+            {
+                "opportunities": count,
+                "eligible_opportunities": sum(item.eligible for item in record.opportunities),
+            },
+        )
+        return count
 
 
 def _ip_concept(opportunity: ProductOpportunity) -> CandidateConcept:
@@ -267,25 +340,65 @@ async def _prepare_opportunity(
         repository = RunRepository(session)
         repository.select_opportunity(run_id, opportunity)
         repository.status(run_id, RunStatus.SCREENING)
-        product = CatalogRepository(session).get(
-            opportunity.matched_blueprint_id, opportunity.matched_print_provider_id
-        )
+        record = repository.get(run_id)
+        if not settings.ip_check_enabled:
+            record.ip_report = None
+        if not settings.originality_check_enabled:
+            record.originality_report = None
         template = ConfigurationRepository(session).get_template()
 
+    try:
+        product = await refresh_catalog_product(
+            opportunity.matched_blueprint_id,
+            opportunity.matched_print_provider_id,
+            settings,
+        )
+    except CatalogProductUnavailable as exc:
+        raise OpportunityRejected(str(exc)) from exc
+
+    fake_references = settings.provider_mode == "fake"
+    reference_listings = select_reference_listings(
+        opportunity,
+        fake=fake_references,
+    )
+    reference_keys = {(item.marketplace, item.external_listing_id) for item in reference_listings}
+    opportunity = opportunity.model_copy(
+        update={
+            "comparable_listings": reference_listings
+            + [
+                item
+                for item in opportunity.comparable_listings
+                if (item.marketplace, item.external_listing_id) not in reference_keys
+            ]
+        }
+    )
     ai = OpenAIService(settings)
-    with session_scope() as session:
-        saved_ip = RunRepository(session).get(run_id).ip_report
-    if saved_ip is not None:
-        ip_report = IPScreeningReport.model_validate(saved_ip)
-    else:
-        ip_result = await ai.ip_screen(_ip_concept(opportunity))
-        ip_report = ip_result.value
+    ip_report: IPScreeningReport | None = None
+    if settings.ip_check_enabled:
         with session_scope() as session:
-            repository = RunRepository(session)
-            repository.get(run_id).ip_report = ip_report.model_dump(mode="json")
-            repository.provider_call(run_id, "catalog_ip_screen", ip_result.metadata)
-    if ip_report.status != "pass" or ip_report.risk_score > 20:
-        raise OpportunityRejected("mandatory IP screen did not return pass at risk 20 or below")
+            record = RunRepository(session).get(run_id)
+            saved_ip = _reusable_ip_report(
+                record.ip_report,
+                record.provider_calls,
+                opportunity.opportunity_id,
+            )
+        if saved_ip is not None:
+            ip_report = saved_ip
+        else:
+            ip_result = await ai.ip_screen(_ip_concept(opportunity))
+            ip_report = ip_result.value
+            with session_scope() as session:
+                repository = RunRepository(session)
+                repository.get(run_id).ip_report = ip_report.model_dump(mode="json")
+                repository.provider_call(
+                    run_id,
+                    "catalog_ip_screen",
+                    {"opportunity_id": opportunity.opportunity_id, **ip_result.metadata},
+                )
+        if ip_report.status != "pass" or ip_report.risk_score > settings.ip_risk_threshold:
+            raise OpportunityRejected(
+                "IP screen did not return pass within the configured risk threshold"
+            )
 
     costs = await collect_printify_costs(product, settings)
     costed_variants = [
@@ -300,7 +413,10 @@ async def _prepare_opportunity(
     selected = reduce_variation_axes(
         costed_variants,
         max_axes=maximum_axes,
-        maximum_products=inventory_product_limit(min(len(axes_before), maximum_axes)),
+        maximum_products=min(
+            PRINTIFY_MAX_ENABLED_VARIANTS,
+            inventory_product_limit(min(len(axes_before), maximum_axes)),
+        ),
     )
     axes = sorted({key for item in selected for key in item.options})
     if not selected or len(axes) > maximum_axes:
@@ -339,7 +455,7 @@ async def _prepare_opportunity(
                     raise RuntimeError("saved reference identity changed during activity replay")
                 saved_references[index] = (reference_id, storage.get(artifact.object_key))
     acquired = (
-        await acquire_reference_images(opportunity, fake=settings.provider_mode == "fake")
+        await acquire_reference_images(opportunity, fake=fake_references)
         if len(saved_references) < len(expected_reference_ids)
         else []
     )
@@ -384,9 +500,14 @@ async def _prepare_opportunity(
                 storage=storage,
             )
     with session_scope() as session:
-        saved_analysis = RunRepository(session).get(run_id).reference_analysis
+        record = RunRepository(session).get(run_id)
+        saved_analysis = _reusable_reference_analysis(
+            record.reference_analysis,
+            record.provider_calls,
+            opportunity.opportunity_id,
+        )
     if saved_analysis is not None:
-        analysis = ReferenceAnalysis.model_validate(saved_analysis)
+        analysis = saved_analysis
     else:
         reference_analysis_result = await ai.analyze_references(opportunity, reference_sheet)
         analysis = reference_analysis_result.value
@@ -394,7 +515,12 @@ async def _prepare_opportunity(
             repository = RunRepository(session)
             repository.get(run_id).reference_analysis = analysis.model_dump(mode="json")
             repository.provider_call(
-                run_id, "reference_analysis", reference_analysis_result.metadata
+                run_id,
+                "reference_analysis",
+                {
+                    "opportunity_id": opportunity.opportunity_id,
+                    **reference_analysis_result.metadata,
+                },
             )
 
     surface_by_signature = {
@@ -482,64 +608,68 @@ async def _prepare_opportunity(
         generated_at=datetime.now(UTC),
     )
 
-    originality_reports: list[OriginalityReport] = []
-    reference_lookup = {
-        listing.external_listing_id: image
-        for (reference_id, image), listing in zip(
-            references, opportunity.comparable_listings[:3], strict=True
+    originality: OriginalityReport | None = None
+    if settings.originality_check_enabled:
+        originality_reports: list[OriginalityReport] = []
+        reference_lookup = {
+            listing.external_listing_id: image
+            for (reference_id, image), listing in zip(
+                references, opportunity.comparable_listings[:3], strict=True
+            )
+            if reference_id == listing.external_listing_id
+        }
+        originality_references = [
+            (
+                item.external_listing_id,
+                reference_lookup.get(item.external_listing_id),
+                item.title,
+            )
+            for item in opportunity.comparable_listings[:3]
+        ]
+        for signature, artwork in artwork_bytes.items():
+            comparison = make_contact_sheet([(f"PROPOSED {signature}", artwork), *references])
+            vision = await ai.originality_assessment(comparison, analysis.reference_listing_ids)
+            with session_scope() as session:
+                RunRepository(session).provider_call(
+                    run_id, "surface_originality", vision.metadata
+                )
+            originality_reports.append(
+                evaluate_originality(
+                    generated_image=artwork,
+                    generated_wording="",
+                    references=originality_references,
+                    vision=vision.value,
+                    perceptual_block_distance=settings.perceptual_hash_block_distance,
+                    minimum_originality_score=settings.originality_min_score,
+                    maximum_copying_risk=settings.originality_max_copying_risk,
+                )
+            )
+        first_art = next(iter(artwork_bytes.values()))
+        representative_mockup = _representative_mockup(first_art)
+        mockup_comparison = make_contact_sheet(
+            [("PROPOSED PRODUCT MOCKUP", representative_mockup), *references]
         )
-        if reference_id == listing.external_listing_id
-    }
-    originality_references = [
-        (
-            item.external_listing_id,
-            reference_lookup.get(item.external_listing_id),
-            item.title,
+        mockup_vision = await ai.originality_assessment(
+            mockup_comparison, analysis.reference_listing_ids
         )
-        for item in opportunity.comparable_listings[:3]
-    ]
-    for signature, artwork in artwork_bytes.items():
-        comparison = make_contact_sheet([(f"PROPOSED {signature}", artwork), *references])
-        vision = await ai.originality_assessment(comparison, analysis.reference_listing_ids)
         with session_scope() as session:
-            RunRepository(session).provider_call(run_id, "surface_originality", vision.metadata)
+            RunRepository(session).provider_call(
+                run_id, "representative_mockup_originality", mockup_vision.metadata
+            )
         originality_reports.append(
             evaluate_originality(
-                generated_image=artwork,
+                generated_image=representative_mockup,
                 generated_wording="",
                 references=originality_references,
-                vision=vision.value,
+                vision=mockup_vision.value,
                 perceptual_block_distance=settings.perceptual_hash_block_distance,
                 minimum_originality_score=settings.originality_min_score,
                 maximum_copying_risk=settings.originality_max_copying_risk,
             )
         )
-    first_art = next(iter(artwork_bytes.values()))
-    representative_mockup = _representative_mockup(first_art)
-    mockup_comparison = make_contact_sheet(
-        [("PROPOSED PRODUCT MOCKUP", representative_mockup), *references]
-    )
-    mockup_vision = await ai.originality_assessment(
-        mockup_comparison, analysis.reference_listing_ids
-    )
-    with session_scope() as session:
-        RunRepository(session).provider_call(
-            run_id, "representative_mockup_originality", mockup_vision.metadata
-        )
-    originality_reports.append(
-        evaluate_originality(
-            generated_image=representative_mockup,
-            generated_wording="",
-            references=originality_references,
-            vision=mockup_vision.value,
-            perceptual_block_distance=settings.perceptual_hash_block_distance,
-            minimum_originality_score=settings.originality_min_score,
-            maximum_copying_risk=settings.originality_max_copying_risk,
-        )
-    )
-    originality = _merge_originality(originality_reports)
-    if not originality.passed:
-        raise OpportunityRejected("flat artwork or final mockup failed originality gates")
+        originality = _merge_originality(originality_reports)
+        if not originality.passed:
+            raise OpportunityRejected("flat artwork or final mockup failed originality gates")
 
     benchmark = comparable_median_delivered(opportunity.comparable_listings)
     prices = []
@@ -568,19 +698,30 @@ async def _prepare_opportunity(
             run_id, "etsy_catalog_listing", listing_result.metadata
         )
     listing = listing_result.value.listings[0]
-    validate_seo_listing(listing, seo)
-    copied_reference = copied_listing_wording(listing, opportunity)
-    if copied_reference is not None:
-        raise OpportunityRejected(
-            f"listing wording is too similar to competitor reference {copied_reference}"
-        )
+    validate_seo_listing(
+        listing,
+        seo,
+        check_competitor_terms=settings.originality_check_enabled,
+    )
+    if settings.originality_check_enabled:
+        copied_reference = copied_listing_wording(listing, opportunity)
+        if copied_reference is not None:
+            raise OpportunityRejected(
+                f"listing wording is too similar to competitor reference {copied_reference}"
+            )
+
+    optional_gates: dict[str, bool] = {}
+    if settings.ip_check_enabled:
+        optional_gates["ip"] = True
+    if settings.originality_check_enabled:
+        optional_gates.update(originality_flat=True, originality_mockup=True)
 
     package = {
         "opportunity": opportunity.model_dump(mode="json"),
         "product_plan": plan.model_dump(mode="json"),
         "reference_analysis": analysis.model_dump(mode="json"),
-        "ip_report": ip_report.model_dump(mode="json"),
-        "originality": originality.model_dump(mode="json"),
+        "ip_report": ip_report.model_dump(mode="json") if ip_report is not None else None,
+        "originality": originality.model_dump(mode="json") if originality is not None else None,
         "seo": seo.model_dump(mode="json"),
         "prices": [item.model_dump(mode="json") for item in prices],
         "listing": listing.model_dump(mode="json"),
@@ -589,9 +730,7 @@ async def _prepare_opportunity(
             "catalog_match": True,
             "current_costs": True,
             "production_feasibility": True,
-            "ip": True,
-            "originality_flat": True,
-            "originality_mockup": True,
+            **optional_gates,
             "margin": all(item.contribution_margin >= settings.target_margin for item in prices),
             "seo": True,
             "etsy_only": listing.channel == Channel.ETSY,
@@ -603,7 +742,7 @@ async def _prepare_opportunity(
     with session_scope() as session:
         repository = RunRepository(session)
         record = repository.get(run_id)
-        record.ip_report = ip_report.model_dump(mode="json")
+        record.ip_report = ip_report.model_dump(mode="json") if ip_report is not None else None
         record.qa_report = {
             "passed": True,
             "method_aware": True,
@@ -638,7 +777,7 @@ async def _prepare_opportunity(
             ApprovalSignal(
                 channels=[Channel.ETSY],
                 expected_version=record.version,
-                ip_attested=True,
+                ip_attested=settings.ip_check_enabled,
                 actor="system",
             ),
         )
@@ -658,7 +797,7 @@ async def attempt_catalog_opportunity(
                 OpportunityRecord.rank == rank,
             )
         )
-        if item is None:
+        if item is None or not item.eligible:
             return False
         opportunity = ProductOpportunity.model_validate(item.data)
         record = RunRepository(session).get(run_id)
@@ -694,5 +833,5 @@ def finish_no_qualified_opportunity(run_id: str) -> None:
         RunRepository(session).status(
             run_id,
             RunStatus.NO_QUALIFIED_OPPORTUNITY,
-            "The top opportunities exhausted production, originality, IP, pricing, or SEO gates",
+            "The top opportunities exhausted the enabled production, review, pricing, or SEO gates",
         )

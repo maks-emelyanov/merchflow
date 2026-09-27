@@ -1,9 +1,11 @@
 # Catalog v2 operations
 
-Catalog v2 is the default workflow for new scheduled and manual runs. It synchronizes the
-Printify catalog, researches listing-specific marketplace evidence, prepares up to three ranked
-opportunities, and publishes at most one Etsy listing. Historical v1 runs retain their saved
-T-shirt and multi-channel packages.
+Catalog v2 is the default workflow for new scheduled and manual runs. It refreshes only the
+Printify products entering research, researches listing-specific marketplace evidence, prepares
+up to three ranked opportunities, and publishes at most one Etsy listing. A separate resumable
+weekly workflow discovers every accessible provider offering for the blueprints in Printify's
+current public Bestsellers ranking. Historical v1 runs retain their saved T-shirt and multi-channel
+packages.
 
 ## Safety model
 
@@ -17,8 +19,9 @@ Every live v2 release requires all of the following:
   window;
 - a compatible Printify blueprint/provider and supported decoration method;
 - authenticated, account-specific Printify costs for every selected variant;
-- an IP result of `pass` with risk no greater than 20;
-- originality of at least 80 and copying risk no greater than 20 for flat artwork and mockups;
+- when IP screening is enabled, a result of `pass` within the configured risk threshold;
+- when originality screening is enabled, the configured originality and copying-risk thresholds
+  for flat artwork and mockups;
 - a contribution margin of at least 40% for every variant;
 - deterministic Etsy SEO, disclosure, taxonomy, variation, and inventory validation;
 - the unchanged package digest recorded by the system approval; and
@@ -30,10 +33,12 @@ URLs and enough signals. It never supplies Printify costs or Etsy verification. 
 decoration methods, incomplete shipping, expired browser sessions, access challenges, identity
 mismatches, or stale costs fail closed.
 
-V2 IP screening is mandatory regardless of `MERCH_IP_CHECK_ENABLED`. That setting controls the
-optional v1 screening and human-attestation flow only. V2 uses a system approval bound to the
-exact package digest after every hard gate passes; `MERCH_MANUAL_APPROVAL_ENABLED` continues to
-control v1 runs.
+V2 IP and originality screening are optional and off by default. Set
+`MERCH_IP_CHECK_ENABLED=true` and/or `MERCH_ORIGINALITY_CHECK_ENABLED=true` to opt in. A disabled
+screen makes no screening model call, creates no screening report, and adds no corresponding
+package gate; the normal reference-pattern analysis still runs. Enabled results and gate decisions
+are bound into the exact package digest. `MERCH_MANUAL_APPROVAL_ENABLED` continues to control v1
+runs.
 
 ## Initial setup
 
@@ -49,8 +54,15 @@ Configure at minimum:
 MERCH_PIPELINE_VERSION=2
 MERCH_PROVIDER_MODE=live
 MERCH_PUBLISH_MODE=dry_run
+MERCH_IP_CHECK_ENABLED=false
+MERCH_ORIGINALITY_CHECK_ENABLED=false
 MERCH_CREDENTIAL_ENCRYPTION_KEY=<random-secret>
 MERCH_PRINTIFY_API_TOKEN=<token>
+MERCH_PRINTIFY_REQUEST_INTERVAL_SECONDS=0.12
+MERCH_PRINTIFY_CATALOG_REQUEST_INTERVAL_SECONDS=0.65
+MERCH_CATALOG_REFRESH_WEEKDAY=0
+MERCH_CATALOG_REFRESH_HOUR=2
+MERCH_CATALOG_REFRESH_MINUTE=0
 MERCH_PRINTIFY_SHOP_ETSY=<shop-id>
 MERCH_ETSY_API_KEY=<key>
 MERCH_ETSY_SHARED_SECRET=<secret>
@@ -77,6 +89,10 @@ The default is two Etsy variation axes. Set `MERCH_ETSY_MAX_VARIATIONS_SUPPORTED
 connected shop is confirmed to support a third variation. Variant selection still enforces the
 appropriate inventory product limit and collapses additional Printify axes.
 
+Catalog calls share a four-request concurrency limit and start at least
+`MERCH_PRINTIFY_CATALOG_REQUEST_INTERVAL_SECONDS` apart. The 0.65-second default stays below
+Printify's 100 catalog requests/minute limit and all safe reads honor `Retry-After`.
+
 ## Bootstrap and health checks
 
 These commands do not publish a product:
@@ -85,18 +101,43 @@ These commands do not publish a product:
 uv run merch session-health
 uv run merch source-health
 uv run merch catalog-sync
+uv run merch catalog-sync-status
+uv run merch catalog-curate
+uv run merch catalog-recover-providers
 uv run merch research-smoke "ceramic mug"
 ```
 
-`catalog-sync` reads every supported Printify blueprint/provider combination and stores normalized
-products and variants. Unsupported or empty products remain ineligible until an explicit
-capability is added. `research-smoke` stores normal evidence artifacts and snapshots, but does not
-create a run or marketplace listing.
+An empty installation must finish `catalog-sync` before starting a production run. The CLI
+waits by default; pass `--no-wait` to return the sync ID immediately and use
+`catalog-sync-status [SYNC_ID]` to inspect it. Refreshes intersect Printify's full blueprint list
+with the ordered public Bestsellers result, enumerate all accessible provider offerings for those
+ranked blueprints, checkpoint every 50 offerings, and resume after failure. Unranked blueprints are
+retained for history but are inactive and ineligible for research. Only successful completion
+retires products absent from the discovery manifest; a confirmed unavailable offering is recorded
+and soft-deactivated when its batch commits. An isolated `404` is recorded and skipped. Daily runs
+use the cached catalog and live-refresh only enough viable products to research 25 candidates. The
+chosen product is refreshed again before preparation and publication.
+
+After a successful refresh, the worker deterministically selects one high-quality product per broad
+category and uses the exact Printify Bestseller position as its research priority. The curation is
+applied automatically. `catalog-curate` previews the current selection, while
+`catalog-curate --apply` replaces it explicitly. `GET /api/catalog` returns this effective curated
+set once curation exists, not every historical catalog row.
+
+The worker schedules the Bestseller refresh every Sunday at 02:00 America/New_York by default. A
+failed refresh retains its manifest and cursor, and the next manual or scheduled trigger resumes
+it. Products untouched by an incomplete refresh remain active. A provider that remains inaccessible
+after the bounded discovery retries is preserved rather than retired and appears in the refresh
+warnings. After the provider is available again, run
+`catalog-recover-providers [--sync-id SYNC_ID]`; it discovers and fetches only missing ranked
+offerings and does not refresh already active pairs.
 
 Equivalent authenticated endpoints are:
 
 - `GET /api/catalog`
-- `POST /api/catalog/sync` with the session CSRF token
+- `POST /api/catalog/sync` with the session CSRF token; returns `202` and a sync ID
+- `GET /api/catalog/syncs`
+- `GET /api/catalog/syncs/{sync_id}`
 - `GET /api/connectors/printify-browser/health`
 - `GET /api/research/sources/health`
 - `GET /api/research/smoke?query=ceramic%20mug`
@@ -110,8 +151,8 @@ uv run merch run
 ```
 
 The run page exposes ranked opportunities, listing URLs, limitations, match rationale, reference
-analysis, surface artwork, originality/IP results, per-variant pricing, SEO provenance, package
-digest, and publication verification.
+analysis, surface artwork, enabled originality/IP results, per-variant pricing, SEO provenance,
+package digest, and publication verification.
 
 A successful dry run finishes as `published` with an Etsy publication record whose status is
 `dry_run`. It does not create an Etsy listing. Review at least the following before enabling live
@@ -123,7 +164,7 @@ publication:
 - opportunity evidence quality and catalog-match rationale;
 - rejected opportunity reasons;
 - achieved margin and undercut status;
-- flat-artwork and mockup originality findings; and
+- flat-artwork and mockup originality findings, when enabled; and
 - the generated inventory axes, gallery coverage, copy, and disclosures.
 
 ## Live rollout
@@ -135,8 +176,8 @@ performs final listing and inventory readback.
 
 Do not enable unattended scheduled live publication until every decoration method currently
 reported by `catalog-sync` is either covered by a contract fixture or intentionally fails closed.
-Track source confidence, selector failures, cost age, IP/originality rejections, achievable margin,
-undercut rate, opportunity exhaustion, and Etsy verification failures during rollout.
+Track source confidence, selector failures, cost age, enabled IP/originality rejections, achievable
+margin, undercut rate, opportunity exhaustion, and Etsy verification failures during rollout.
 
 ## Recovery and terminal states
 
@@ -168,5 +209,5 @@ uv run pytest
 
 Saved-page contracts live under `tests/fixtures/marketplaces` and `tests/fixtures/printify`.
 `tests/test_catalog_v2.py` covers marketplace extraction, challenges and freshness, cost selector
-drift, pricing, generic inventory, multi-surface payloads, originality/prepress gates, the complete
-fake-provider workflow, and publication replay.
+drift, pricing, generic inventory, multi-surface payloads, optional originality gates and mandatory
+prepress gates, the complete fake-provider workflow, and publication replay.

@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     workflow_hour: int = 9
     analytics_hour: int = 9
     schedule_minute: int = 30
+    catalog_refresh_weekday: int = 0
+    catalog_refresh_hour: int = 2
+    catalog_refresh_minute: int = 0
 
     storage_backend: Literal["local", "s3"] = "local"
     local_storage_path: Path = Path(".data/artifacts")
@@ -73,12 +76,15 @@ class Settings(BaseSettings):
     research_page_cap: int = 250
     comparison_postal_code: str = "10001"
     etsy_max_variations_supported: Literal[2, 3] = 2
+    originality_check_enabled: bool = False
     originality_min_score: int = 80
     originality_max_copying_risk: int = 20
     perceptual_hash_block_distance: int = 8
 
     printify_api_token: SecretStr = SecretStr("")
     printify_user_agent: str = "merch-pod/0.1"
+    printify_request_interval_seconds: float = 0.12
+    printify_catalog_request_interval_seconds: float = 0.65
     printify_webhook_secret: SecretStr = SecretStr("")
     printify_base_url: str = "https://api.printify.com/v1"
     printify_dashboard_base_url: str = "https://printify.com"
@@ -120,18 +126,25 @@ class Settings(BaseSettings):
     ip_check_enabled: bool = False
     ip_risk_threshold: int = 20
 
-    @field_validator("workflow_hour", "analytics_hour")
+    @field_validator("workflow_hour", "analytics_hour", "catalog_refresh_hour")
     @classmethod
     def valid_hour(cls, value: int) -> int:
         if not 0 <= value <= 23:
             raise ValueError("schedule hour must be between 0 and 23")
         return value
 
-    @field_validator("schedule_minute")
+    @field_validator("schedule_minute", "catalog_refresh_minute")
     @classmethod
     def valid_schedule_minute(cls, value: int) -> int:
         if not 0 <= value <= 59:
             raise ValueError("schedule minute must be between 0 and 59")
+        return value
+
+    @field_validator("catalog_refresh_weekday")
+    @classmethod
+    def valid_catalog_weekday(cls, value: int) -> int:
+        if not 0 <= value <= 6:
+            raise ValueError("catalog refresh weekday must be between 0 and 6")
         return value
 
     @field_validator("max_brief_rewrites")
@@ -165,6 +178,16 @@ class Settings(BaseSettings):
     def positive_time_window(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("browser and freshness time windows must be positive")
+        return value
+
+    @field_validator(
+        "printify_request_interval_seconds",
+        "printify_catalog_request_interval_seconds",
+    )
+    @classmethod
+    def nonnegative_printify_request_interval(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("Printify request interval must not be negative")
         return value
 
     @field_validator("browser_max_concurrency_per_domain")
